@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>IFC Occam Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js"
+      }
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #202020;
+      color: #e0e0e0;
+    }
+    #layout {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+    }
+    #sidebar {
+      width: 340px;
+      flex: 0 0 340px;
+      overflow-y: auto;
+      padding: 12px;
+      background: #262626;
+      border-right: 1px solid #3a3a3a;
+    }
+    #viewport {
+      flex: 1 1 auto;
+      position: relative;
+    }
+    #viewport canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    #error-banner {
+      display: none;
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: #b91c1c;
+      color: #fff;
+      padding: 8px 12px;
+      font-size: 13px;
+      z-index: 10;
+    }
+    h1 { font-size: 15px; margin: 0 0 10px; }
+    h2 { font-size: 13px; margin: 16px 0 6px; color: #9aa0a6; }
+    #path-input {
+      width: 100%;
+      padding: 6px;
+      background: #1c1c1c;
+      color: #e0e0e0;
+      border: 1px solid #444;
+      border-radius: 4px;
+    }
+    #load-button {
+      margin-top: 8px;
+      width: 100%;
+      padding: 7px;
+      background: #3b6fd6;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #load-button:disabled { background: #555; cursor: default; }
+    #status-line {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #9aa0a6;
+      min-height: 16px;
+    }
+    #diagnostics-summary {
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    th, td {
+      text-align: right;
+      padding: 2px 4px;
+      border-bottom: 1px solid #3a3a3a;
+      white-space: nowrap;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #333; }
+    tbody tr.selected-row { background: #5a2a2a; }
+    #layer-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+    #layer-list li {
+      padding: 2px 4px;
+      cursor: pointer;
+      border-bottom: 1px solid #3a3a3a;
+    }
+    #layer-list li:hover { background: #333; }
+    #layer-list li.selected-row { background: #5a2a2a; }
+    #duplicates-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+    #duplicates-list li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      padding: 2px 4px;
+      cursor: pointer;
+      border-bottom: 1px solid #3a3a3a;
+    }
+    #duplicates-list li:hover { background: #333; }
+    #duplicates-list li.selected-row { background: #5a2a2a; }
+    #duplicates-note {
+      font-size: 11px;
+      color: #9aa0a6;
+      margin-top: 4px;
+    }
+    .dup-batch-button {
+      flex: 0 0 auto;
+      padding: 2px 6px;
+      background: #444;
+      color: #e0e0e0;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 10px;
+    }
+    .dup-batch-button:hover { background: #3b6fd6; }
+    #ops-controls.flash-highlight,
+    #ops-controls-title.flash-highlight {
+      animation: flash-highlight-anim 1s ease-out;
+    }
+    @keyframes flash-highlight-anim {
+      0% { background: #3b6fd6; }
+      100% { background: transparent; }
+    }
+    #preset-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+    #preset-list li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 4px;
+      border-bottom: 1px solid #3a3a3a;
+    }
+    .preset-name { font-weight: bold; }
+    .preset-desc { color: #9aa0a6; font-size: 10px; }
+    .preset-apply-button, #preset-load-samples-button, #preset-save-button {
+      flex: 0 0 auto;
+      padding: 4px 8px;
+      background: #444;
+      color: #e0e0e0;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .preset-apply-button:hover, #preset-load-samples-button:hover, #preset-save-button:hover {
+      background: #3b6fd6;
+    }
+    #preset-load-samples-button, #preset-save-button {
+      display: block;
+      width: 100%;
+      margin-top: 6px;
+    }
+    #preset-empty-notice {
+      font-size: 11px;
+      color: #9aa0a6;
+    }
+    .rule-count-warning { color: #f0a020; font-weight: bold; }
+    .rule-error { color: #e05252; font-weight: bold; }
+    #clear-button {
+      margin-top: 8px;
+      width: 100%;
+      padding: 6px;
+      background: #444;
+      color: #e0e0e0;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #clear-button:hover { background: #555; }
+    #info-panel {
+      font-size: 12px;
+      line-height: 1.6;
+      word-break: break-all;
+    }
+    #selection-notice {
+      display: none;
+      margin-top: 8px;
+      padding: 6px 8px;
+      font-size: 12px;
+      background: #4a3a1c;
+      color: #f0d9a0;
+      border-radius: 4px;
+    }
+    #excluded-line {
+      color: #9aa0a6;
+    }
+    #ops-controls { display: flex; flex-direction: column; gap: 6px; }
+    #ops-controls button, #op-simplify-row select, #op-simplify-row input {
+      padding: 6px;
+      background: #1c1c1c;
+      color: #e0e0e0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    #op-simplify-row { display: flex; gap: 4px; }
+    #op-simplify-row select { flex: 1 1 auto; cursor: pointer; }
+    #op-simplify-row input { width: 64px; cursor: text; }
+    #op-simplify-row button { flex: 0 0 auto; }
+    #op-delete-button:hover, #op-simplify-button:hover, #op-keep-button:hover { background: #333; }
+    #ops-panel-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+    #ops-panel-list li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      padding: 3px 4px;
+      border-bottom: 1px solid #3a3a3a;
+    }
+    #ops-panel-list li span { overflow: hidden; text-overflow: ellipsis; }
+    .op-cancel-button {
+      flex: 0 0 auto;
+      padding: 2px 6px;
+      background: #444;
+      color: #e0e0e0;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .op-cancel-button:hover { background: #5a2a2a; }
+    #ops-clear-button {
+      margin-top: 6px;
+      width: 100%;
+      padding: 6px;
+      background: #444;
+      color: #e0e0e0;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #ops-clear-button:hover { background: #555; }
+    #export-path-input {
+      width: 100%;
+      padding: 6px;
+      background: #1c1c1c;
+      color: #e0e0e0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      margin-bottom: 6px;
+    }
+    #export-button {
+      width: 100%;
+      padding: 7px;
+      background: #3b6fd6;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #export-button:disabled { background: #555; cursor: default; }
+    #export-result {
+      margin-top: 8px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    .modal-box {
+      background: #262626;
+      color: #e0e0e0;
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 16px;
+      max-width: 420px;
+      max-height: 70vh;
+      overflow-y: auto;
+    }
+    .modal-box h3 { margin: 0 0 10px; font-size: 14px; }
+    .modal-body { font-size: 12px; line-height: 1.5; }
+    .modal-body ul { max-height: 260px; overflow-y: auto; padding-left: 18px; margin: 6px 0; }
+    .modal-warning { color: #f0a020; font-weight: bold; margin-top: 10px; }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .modal-actions button {
+      padding: 6px 14px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      background: #444;
+      color: #e0e0e0;
+    }
+    .modal-actions button.modal-btn-primary { background: #3b6fd6; color: #fff; }
+    .modal-actions button:hover { opacity: 0.9; }
+  </style>
+</head>
+<body>
+  <div id="layout">
+    <div id="sidebar">
+      <h1>IFC Occam Viewer</h1>
+      <input id="path-input" type="text" placeholder="small.ifc" value="small.ifc" />
+      <button id="load-button">読込</button>
+      <div id="status-line"></div>
+
+      <div id="diagnostics-summary"></div>
+      <h2 id="class-table-title" style="display:none;">クラス別ランキング</h2>
+      <div id="class-table-wrap"></div>
+
+      <h2 id="layer-title" style="display:none;">レイヤー</h2>
+      <ul id="layer-list" style="display:none;"></ul>
+
+      <h2 id="duplicates-title" style="display:none;">重複形状グループ</h2>
+      <ul id="duplicates-list" style="display:none;"></ul>
+      <div id="duplicates-note" style="display:none;"></div>
+
+      <h2 id="preset-title">プリセット</h2>
+      <ul id="preset-list"></ul>
+      <div id="preset-empty-notice" style="display:none;">
+        プリセットがまだありません。
+        <button id="preset-load-samples-button" type="button">サンプルを読み込む</button>
+      </div>
+      <button id="preset-save-button" type="button">現在の操作からプリセット保存</button>
+
+      <button id="clear-button">選択をクリア</button>
+      <div id="selection-notice"></div>
+
+      <h2 id="info-title" style="display:none;">選択情報</h2>
+      <div id="info-panel"></div>
+
+      <h2 id="ops-controls-title" style="display:none;">操作</h2>
+      <div id="ops-controls" style="display:none;">
+        <button id="op-delete-button">削除</button>
+        <div id="op-simplify-row">
+          <select id="op-simplify-method">
+            <option value="bbox">bbox</option>
+            <option value="convex_hull">凸包</option>
+            <option value="decimate">間引き</option>
+          </select>
+          <input
+            id="op-simplify-ratio"
+            type="number"
+            min="0.05"
+            max="0.95"
+            step="0.05"
+            value="0.3"
+            style="display:none;"
+          />
+          <button id="op-simplify-button">軽量化</button>
+        </div>
+        <button id="op-keep-button">残す</button>
+      </div>
+
+      <h2 id="ops-panel-title" style="display:none;">操作リスト</h2>
+      <ul id="ops-panel-list" style="display:none;"></ul>
+      <button id="ops-clear-button" style="display:none;">全クリア</button>
+
+      <h2>出力</h2>
+      <input id="export-path-input" type="text" value="output.ifc" />
+      <label id="export-consolidate-label" style="display:block; font-size:12px; margin-bottom:6px;">
+        <input id="export-consolidate-checkbox" type="checkbox" />
+        重複形状を共有化して出力(フラット化されたモデル向け)
+      </label>
+      <button id="export-button">出力</button>
+      <div id="export-result"></div>
+    </div>
+    <div id="viewport">
+      <div id="error-banner"></div>
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

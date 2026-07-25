@@ -1,0 +1,15 @@
+[project]
+name = "ifc-occam"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["ifcopenshell", "numpy", "fastapi", "uvicorn", "scipy", "fast-simplification", "pydantic>=2"]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "pyinstaller"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m \"not slow\""
+markers = [
+    "slow: 実データ全体を per-element フォールバック経路で走らせる遅いテスト(既定では除外、-m slow で実行)",
+]

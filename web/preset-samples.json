@@ -1,0 +1,30 @@
+[
+  {
+    "name": "CFD用",
+    "description": "気流解析向けの軽量化例。照明・衛生器具を削除、配管継手をbbox化します。※small.ifc/large.ifcに実在するクラスで構成(什器=IfcFurnishingElementはこれらのモデルに存在しないため省略。モデルに合わせてルールを調整してください)。これはUI初期テンプレであり、GET /api/presetsが空のときの参考例として提供されます。自動適用はされません。",
+    "rules": [
+      {
+        "match": { "ifc_class": "IfcLightFixture" },
+        "op": { "op": "delete", "targets": [], "scope": "element", "params": {} }
+      },
+      {
+        "match": { "ifc_class": "IfcSanitaryTerminal" },
+        "op": { "op": "delete", "targets": [], "scope": "element", "params": {} }
+      },
+      {
+        "match": { "ifc_class": "IfcPipeFitting" },
+        "op": { "op": "simplify", "targets": [], "scope": "element", "params": { "method": "bbox" } }
+      }
+    ]
+  },
+  {
+    "name": "干渉チェック用",
+    "description": "干渉チェック向けの軽量化例。ボルト等の小物(IfcDiscreteAccessory)を削除します。※phase3実測で採用した用法と同じクラスです。これはUI初期テンプレであり、GET /api/presetsが空のときの参考例として提供されます。自動適用はされません。",
+    "rules": [
+      {
+        "match": { "ifc_class": "IfcDiscreteAccessory" },
+        "op": { "op": "delete", "targets": [], "scope": "element", "params": {} }
+      }
+    ]
+  }
+]

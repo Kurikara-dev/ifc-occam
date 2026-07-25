@@ -1,0 +1,328 @@
+"""cui/session.py — 対話セッション(純粋ロジック層)(cui-design.md §6)。
+
+`ScanResult`(軽量スキャンの集計結果、scan/aggregate.py)を受け取り、対話コマンド
+文字列を解釈してクラス単位の操作意図(`Intent`)を管理する。stdin/stdout・
+ファイルI/O・ifcopenshell へのアクセスは一切行わない(それらは repl.py /
+core/export.py の責務)。
+
+対話コマンド一覧(ifc_occam_cui_requirements.md §5、cui-design.md §6):
+    delete <クラス名>              クラス全要素を削除対象に
+    bbox <クラス名>                クラス全要素をbbox化対象に
+    hull <クラス名>                クラス全要素を凸包化対象に
+    decimate <クラス名> <ratio>    クラス全要素を間引き対象に(ratio: 0.05-0.95)
+    keep <クラス名>                既存の操作指定を解除する(明示的な保持マーカー)
+    undo [番号]                   操作リストから1件除去(番号省略時は直前に
+                                   新規追加した1件。cui-design.md には
+                                   専用メソッドが無いため command() 内で解釈する)
+    list                         現在の操作リスト表示(render_intents と同一)
+    rank                         診断ランキング再表示(render_ranking と同一)
+
+Global Constraint: クラス名の突合は常に upper() で行う(スキャン層のクラス名は
+常に大文字。ユーザー入力は大文字小文字非区別)。
+
+同一クラスへの再指定は上書き(後勝ち)。挿入順(=最初にそのクラスへコマンドを
+発行した順)は再指定によって変わらない — Python dict の「既存キーへの再代入は
+位置を変えない」という素の挙動をそのまま使う。undo(番号省略)はその挿入順で
+「最後に新規追加されたクラス」を取り消す(=直前に再指定しただけの既存クラスは
+対象にならない)。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from ifc_occam.core.ops import Operation
+from ifc_occam.scan.aggregate import ScanResult
+
+__all__ = ["Intent", "CuiSession"]
+
+#: decimate の ratio 許容範囲(cui-design.md §6)。core.ops.validate_operations の
+#: 0<ratio<1 より狭い、CUI入力時点での実用的な安全域(桁違いの誤指定を防ぐ)。
+_RATIO_MIN = 0.05
+_RATIO_MAX = 0.95
+
+#: 不明クラスのエラーメッセージに提示する前方一致候補の最大件数
+#: (IFCクラスは全て"IFC"始まりのため、短い誤入力では候補が膨大になり得る)。
+#: 超過時は `_unknown_class_error` が末尾に `...他N件` を付し、切断されている
+#: ことをユーザーに明示する(持ち越しMinor #1 / 最終レビューM2)。
+_CANDIDATE_LIMIT = 10
+
+#: Intent.op(simplify系) → core.ops.Operation の params["method"] 変換表
+#: (cui-design.md §6: "bbox/hull/decimate → simplify(method=..., scope='element')")。
+_SIMPLIFY_METHOD_BY_OP = {"bbox": "bbox", "hull": "convex_hull", "decimate": "decimate"}
+
+_SET_OP_LABELS = {"delete": "削除", "bbox": "bbox軽量化", "hull": "凸包化"}
+
+
+@dataclass
+class Intent:
+    """1クラスに対する操作意図(cui-design.md §6)。"""
+
+    op: str  # "delete" | "bbox" | "hull" | "decimate" | "keep"
+    ifc_class: str  # スキャン時の大文字クラス名
+    ratio: float | None = None
+
+
+class CuiSession:
+    """スキャン結果 + 操作意図を保持する純粋ロジック層(cui-design.md §6)。"""
+
+    def __init__(self, scan: ScanResult) -> None:
+        self._scan = scan
+        #: クラス名(大文字)→ 要素数。既知クラス集合の唯一の正(command検証・
+        #: 確認メッセージ・render_intentsの要素数表示すべてここを参照する)。
+        self._element_counts: dict[str, int] = {s.ifc_class: s.element_count for s in scan.stats}
+        #: クラス名(大文字)→ Intent。挿入順を保持する(list/undoの番号付けに使う)。
+        self._intents: dict[str, Intent] = {}
+
+    # ------------------------------------------------------------------
+    # コマンド解釈
+    # ------------------------------------------------------------------
+
+    def command(self, line: str) -> str:
+        """1コマンドを解釈し、表示用文字列を返す(印字はしない、cui-design.md §6)。"""
+        tokens = line.split()
+        if not tokens:
+            return ""
+
+        verb = tokens[0].lower()
+        args = tokens[1:]
+
+        if verb == "delete":
+            return self._command_set(args, op="delete")
+        if verb == "bbox":
+            return self._command_set(args, op="bbox")
+        if verb == "hull":
+            return self._command_set(args, op="hull")
+        if verb == "decimate":
+            return self._command_decimate(args)
+        if verb == "keep":
+            return self._command_keep(args)
+        if verb == "undo":
+            return self._command_undo(args)
+        if verb == "list":
+            return self.render_intents()
+        if verb == "rank":
+            return self.render_ranking()
+        return f"不明なコマンドです: {tokens[0]}"
+
+    def intents(self) -> list[Intent]:
+        """現在有効な操作意図の一覧(挿入順)。"""
+        return list(self._intents.values())
+
+    def to_operations(self) -> list[Operation]:
+        """Intent → core.ops.Operation 変換(cui-design.md §6)。
+
+        targets は scan.elements(GlobalId列)から取る。op の対応:
+        bbox/hull/decimate → simplify(method=..., scope="element")、
+        delete → delete、keep → keep。scope は常に "element"。
+        """
+        operations: list[Operation] = []
+        for intent in self.intents():
+            targets = list(self._scan.elements.get(intent.ifc_class, []))
+            if intent.op in _SIMPLIFY_METHOD_BY_OP:
+                params = {"method": _SIMPLIFY_METHOD_BY_OP[intent.op]}
+                if intent.op == "decimate":
+                    params["ratio"] = intent.ratio
+                operations.append(
+                    Operation(op="simplify", targets=targets, scope="element", params=params)
+                )
+            else:  # "delete" | "keep"
+                operations.append(Operation(op=intent.op, targets=targets, scope="element"))
+        return operations
+
+    # ------------------------------------------------------------------
+    # 表示用レンダリング
+    # ------------------------------------------------------------------
+
+    def render_ranking(self) -> str:
+        """rank コマンド用。診断ランキングを整形する(cli.format_report 流儀、
+        cui-design.md §6)。
+
+        末尾に proxy 名称内訳(`_render_proxy_name_breakdown`)を追記する
+        (task-3-brief.md)。`scan.proxy_names` が空の場合は何も追記せず、
+        従来出力と完全一致する(後方互換)。
+        """
+        scan = self._scan
+        total_expanded = sum(s.est_faces_expanded for s in scan.stats)
+
+        lines: list[str] = []
+        lines.append(f"ファイル: {scan.path} ({scan.file_size} bytes)")
+        lines.append(f"スキーマ: {scan.schema}")
+        lines.append(f"総エンティティ行数: {scan.total_entities}")
+        lines.append(f"スキャン時間: {scan.scan_seconds:.2f}秒")
+        lines.append(f"推定フルオープンメモリ: {scan.est_fullopen_bytes} bytes")
+        lines.append("")
+        lines.append("=== クラス別ランキング (推定Face数[展開]降順) ===")
+
+        if not scan.stats:
+            lines.append("(該当クラスなし)")
+        else:
+            # 各列の間に明示的な2スペース区切りを入れる — クラス名や
+            # decimateラベル(ratio埋め込みで可変長)が想定の列幅を超えても、
+            # 幅指定のpadding(overflow時は無視される)だけに頼らず次の列との
+            # 境界が必ず視認できるようにする。
+            lines.append(
+                f"{'#':<4}  {'クラス名':<32}  {'要素数':>10}  {'推定Face数(展開)':>18}"
+                f"  {'推定Face数(共有統合)':>20}  {'パラメトリック件数':>12}  {'寄与率':>8}"
+            )
+            for i, s in enumerate(scan.stats, start=1):
+                share = (s.est_faces_expanded / total_expanded * 100) if total_expanded else 0.0
+                lines.append(
+                    f"{i:<4}  {s.ifc_class:<32}  {s.element_count:>10}  {s.est_faces_expanded:>18}"
+                    f"  {s.est_faces_unique:>20}  {s.parametric_count:>12}  {share:>7.1f}%"
+                )
+
+        lines.extend(self._render_proxy_name_breakdown(scan.proxy_names))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_proxy_name_breakdown(proxy_names: list[tuple[str, int]]) -> list[str]:
+        """rank末尾に追記する proxy 名称内訳セクションの行群(task-3-brief.md)。
+
+        `proxy_names` が空なら空リストを返す(呼び出し側の出力を一切変えない
+        = 従来出力との完全一致を保つ)。非空なら見出し1行 +
+        上位5件(各行 `  <キー>  <件数>`) + 6件目以降があれば
+        `  ...他N種`(N = len(proxy_names) - 5)の1行を返す。
+
+        キーはNameそのもの、またはNameのタグ接頭辞「【カテゴリ】」
+        (`aggregate._compute_proxy_names` 参照。Task 8実測の知見: 連番付き
+        Nameの素朴頻度集計は無力だが、タグ接頭辞での集計は同一カテゴリの
+        個体を束ねる。docs/cui-measurements.md「Task 8」章)。
+        """
+        if not proxy_names:
+            return []
+        lines = ["", "IfcBuildingElementProxy 名称内訳 (上位5)"]
+        for key, count in proxy_names[:5]:
+            lines.append(f"  {key}  {count}")
+        overflow = len(proxy_names) - 5
+        if overflow > 0:
+            lines.append(f"  ...他{overflow}種")
+        return lines
+
+    def render_intents(self) -> str:
+        """list コマンド用。現在の操作意図一覧を整形する(cui-design.md §6)。"""
+        if not self._intents:
+            return "操作はまだありません。"
+
+        # render_rankingと同じ理由(decimateラベルがratio埋め込みで可変長)で
+        # 列の間に明示的な2スペース区切りを入れる。
+        lines: list[str] = ["=== 操作リスト ==="]
+        lines.append(f"{'#':<4}  {'操作':<20}  {'クラス':<32}  {'要素数':>10}")
+        for i, intent in enumerate(self.intents(), start=1):
+            count = self._element_counts.get(intent.ifc_class, 0)
+            lines.append(
+                f"{i:<4}  {self._op_label(intent):<20}  {intent.ifc_class:<32}  {count:>10}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _op_label(intent: Intent) -> str:
+        """list 表示用の操作ラベル(日本語、cui-task-6-brief.md 監督者確定要件2)。
+
+        要件定義§5の list モック例(「削除」「間引き 0.3」等)に合わせる。
+        delete/bbox/hull は _SET_OP_LABELS の既存語彙(削除/bbox軽量化/凸包化)を
+        そのまま使う。decimate/keep はそこに無いため、同じ語彙系(間引き/保持、
+        本モジュール内の他メッセージで既に使っている語)をここで直接返す。
+        """
+        if intent.op == "decimate":
+            return f"間引き {intent.ratio}"
+        if intent.op == "keep":
+            return "保持"
+        return _SET_OP_LABELS.get(intent.op, intent.op)
+
+    # ------------------------------------------------------------------
+    # 内部ヘルパー: クラス名解決
+    # ------------------------------------------------------------------
+
+    def _resolve_class(self, raw: str) -> str | None:
+        """ユーザー入力を大文字化し、既知クラスと突合する(Global Constraint:
+        クラス名の突合は常に upper() で行う)。見つからなければ None。"""
+        cls = raw.upper()
+        return cls if cls in self._element_counts else None
+
+    def _unknown_class_error(self, raw: str) -> str:
+        """不明クラスのエラーメッセージ。前方一致候補を最大 `_CANDIDATE_LIMIT`
+        件まで提示する。候補がそれを超える場合は切断していることが分かるよう
+        末尾に `...他N件`(N=超過件数)を付す(持ち越しMinor #1 / 最終レビュー
+        M2、task-3-brief.md 同梱要件)。"""
+        cls = raw.upper()
+        candidates = sorted(c for c in self._element_counts if c.startswith(cls))
+        if candidates:
+            shown = ", ".join(candidates[:_CANDIDATE_LIMIT])
+            overflow = len(candidates) - _CANDIDATE_LIMIT
+            if overflow > 0:
+                shown += f", ...他{overflow}件"
+            return f"不明なクラスです: {cls} (候補: {shown})"
+        return f"不明なクラスです: {cls} (候補なし)"
+
+    # ------------------------------------------------------------------
+    # 内部ヘルパー: 各コマンドの実装
+    # ------------------------------------------------------------------
+
+    def _command_set(self, args: list[str], *, op: str) -> str:
+        """delete/bbox/hull 共通(いずれも <クラス名> 1個だけを取る)。"""
+        if len(args) != 1:
+            return f"使い方: {op} <クラス名>"
+        cls = self._resolve_class(args[0])
+        if cls is None:
+            return self._unknown_class_error(args[0])
+        self._intents[cls] = Intent(op=op, ifc_class=cls)
+        count = self._element_counts[cls]
+        return f"{cls} {count}要素を{_SET_OP_LABELS[op]}対象に追加しました。"
+
+    def _command_decimate(self, args: list[str]) -> str:
+        if len(args) != 2:
+            return "使い方: decimate <クラス名> <ratio>"
+        cls = self._resolve_class(args[0])
+        if cls is None:
+            return self._unknown_class_error(args[0])
+        try:
+            ratio = float(args[1])
+        except ValueError:
+            return f"decimate の ratio は数値で指定してください: {args[1]!r}"
+        if not (_RATIO_MIN <= ratio <= _RATIO_MAX):
+            return (
+                f"decimate の ratio は {_RATIO_MIN}~{_RATIO_MAX} の範囲で"
+                f"指定してください: {ratio}"
+            )
+        self._intents[cls] = Intent(op="decimate", ifc_class=cls, ratio=ratio)
+        count = self._element_counts[cls]
+        percent = ratio * 100
+        return f"{cls} {count}要素を間引き(残{percent:.0f}%)対象に追加しました。"
+
+    def _command_keep(self, args: list[str]) -> str:
+        if len(args) != 1:
+            return "使い方: keep <クラス名>"
+        cls = self._resolve_class(args[0])
+        if cls is None:
+            return self._unknown_class_error(args[0])
+        self._intents[cls] = Intent(op="keep", ifc_class=cls)
+        count = self._element_counts[cls]
+        return f"{cls} {count}要素を保持し、既存の操作指定を解除しました。"
+
+    def _command_undo(self, args: list[str]) -> str:
+        if len(args) > 1:
+            return "使い方: undo [番号]"
+        if not self._intents:
+            return "取り消す操作がありません。"
+
+        if not args:
+            # 番号省略時は挿入順で最後に新規追加されたクラスを取り消す。
+            # 既存クラスの再指定は挿入順を変えない(モジュールdocstring参照)ため、
+            # 「直近に更新されただけ」のクラスは対象にならない。
+            cls = next(reversed(self._intents))
+            del self._intents[cls]
+            return f"{cls} の操作を取り消しました。"
+
+        try:
+            n = int(args[0])
+        except ValueError:
+            return f"undo の番号は整数で指定してください: {args[0]!r}"
+
+        order = list(self._intents.keys())
+        if not (1 <= n <= len(order)):
+            return f"#{n} は範囲外です(現在{len(order)}件)。"
+
+        cls = order[n - 1]
+        del self._intents[cls]
+        return f"#{n} ({cls}) を取り消しました。"

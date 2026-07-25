@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+*.ifc
+scripts/
+.pytest_cache/
+dist/
+build/
+presets.json
+
+# OSS release hygiene: local test data, tool state, and agent scratch (never tracked)
+*.reb
+.claude/
+
+# common editor / OS / coverage artifacts
+.env
+*.log
+.coverage
+htmlcov/
+.vscode/
+.idea/
+*.egg-info/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,480 @@
+"""軽量化 (design.md Phase3 Task3)。
+
+純粋計算(bbox/hull/decimate)は numpy in/out で ifcopenshell 非依存。
+replace_representation / count_shared_elements は ifcopenshell 依存の書き戻し層。
+"""
+
+from __future__ import annotations
+
+import warnings
+
+import numpy as np
+
+import ifcopenshell
+import ifcopenshell.util.element
+import ifcopenshell.util.unit
+from scipy.spatial import ConvexHull
+
+try:
+    import fast_simplification
+except ImportError as exc:  # pragma: no cover - 依存導入漏れの早期検知用
+    raise ImportError(
+        "fast-simplification がインストールされていません。"
+        "`pip install fast-simplification` を実行してください。"
+    ) from exc
+
+
+# ---------------------------------------------------------------------------
+# 純粋関数
+# ---------------------------------------------------------------------------
+
+_BBOX_LOCAL_FACES = np.array(
+    [
+        [0, 2, 1], [0, 3, 2],  # z0 (底面)
+        [4, 5, 6], [4, 6, 7],  # z1 (上面)
+        [0, 5, 4], [0, 1, 5],  # y0
+        [1, 6, 5], [1, 2, 6],  # x1
+        [2, 7, 6], [2, 3, 7],  # y1
+        [3, 4, 7], [3, 0, 4],  # x0
+    ],
+    dtype=np.int64,
+)
+
+
+def bbox_mesh(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """頂点群のローカル座標AABBを表す直方体メッシュ(8頂点12面)を返す。"""
+    v = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    mn = v.min(axis=0)
+    mx = v.max(axis=0)
+    x0, y0, z0 = mn
+    x1, y1, z1 = mx
+
+    verts = np.array(
+        [
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ],
+        dtype=np.float64,
+    )
+    return verts, _BBOX_LOCAL_FACES.copy()
+
+
+def convex_hull_mesh(vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """頂点群の凸包メッシュを返す(内部点は消える)。scipy.spatial.ConvexHull を使用。"""
+    v = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    hull = ConvexHull(v)
+
+    hull_vertex_indices = hull.vertices  # 凸包上の点の元インデックス(ユニーク)
+    old_to_new = {old: new for new, old in enumerate(hull_vertex_indices)}
+
+    out_verts = v[hull_vertex_indices]
+    out_faces = np.array(
+        [[old_to_new[i] for i in simplex] for simplex in hull.simplices],
+        dtype=np.int64,
+    )
+    return out_verts, out_faces
+
+
+def decimate_mesh(
+    vertices: np.ndarray, faces: np.ndarray, ratio: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """メッシュを間引く。ratio=残す三角形の割合(0<ratio<1)。
+
+    fast_simplification.simplify の target_reduction は「削除する割合」なので
+    target_reduction = 1 - ratio に変換する(README の記載通り。値は経験的に
+    ratio=0.1/0.5/0.9 で kept_ratio がほぼ一致することを検証済み)。
+    """
+    if not (0 < ratio < 1):
+        raise ValueError(f"ratio は 0<ratio<1 である必要があります: {ratio!r}")
+
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    target_reduction = 1.0 - ratio
+
+    out_verts, out_faces = fast_simplification.simplify(
+        v, f, target_reduction=target_reduction
+    )
+    return np.asarray(out_verts, dtype=np.float64), np.asarray(out_faces, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
+# IFC書き戻し
+# ---------------------------------------------------------------------------
+
+
+def _find_body_shape_representation(element):
+    rep = getattr(element, "Representation", None)
+    if rep is None:
+        return None
+    for r in rep.Representations or []:
+        if r.RepresentationIdentifier == "Body":
+            return r
+    return None
+
+
+def _representation_type_for_schema(schema: str) -> str:
+    return "Brep" if schema == "IFC2X3" else "Tessellation"
+
+
+def _verts_to_native_units(ifc_file, verts: np.ndarray) -> np.ndarray:
+    """SI/メートル座標(verts)を、ファイルの実寸法単位(ミリメートル等)に変換する。
+
+    ifc_project_length * unit_scale = si_meters (ifcopenshell.util.unit の定義) なので、
+    逆変換は verts_native = verts_si / unit_scale。unit_scale が 0/None など不正な場合は
+    変換せずに警告する(メートル単位ファイル(unit_scale=1.0)では実質no-op)。
+    """
+    scale = ifcopenshell.util.unit.calculate_unit_scale(ifc_file)
+    if not scale:
+        warnings.warn(
+            "長さ単位のスケールを取得できませんでした(calculate_unit_scale が "
+            f"{scale!r} を返しました)。座標を変換せずに書き込みます。",
+            stacklevel=2,
+        )
+        return verts
+    return verts / scale
+
+
+def _build_triangulated_faceset_items(ifc_file, verts: np.ndarray, faces: np.ndarray):
+    coord_list = ifc_file.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[tuple(float(c) for c in row) for row in verts],
+    )
+    coord_index = [tuple(int(i) + 1 for i in tri) for tri in faces]  # IFCは1-based
+    tfs = ifc_file.create_entity(
+        "IfcTriangulatedFaceSet",
+        Coordinates=coord_list,
+        CoordIndex=coord_index,
+    )
+    return [tfs]
+
+
+def _build_faceted_brep_items(ifc_file, verts: np.ndarray, faces: np.ndarray):
+    points = [
+        ifc_file.create_entity("IfcCartesianPoint", Coordinates=tuple(float(c) for c in row))
+        for row in verts
+    ]
+    face_entities = []
+    for tri in faces:
+        loop = ifc_file.create_entity("IfcPolyLoop", Polygon=[points[i] for i in tri])
+        bound = ifc_file.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        face_entities.append(ifc_file.create_entity("IfcFace", Bounds=[bound]))
+    shell = ifc_file.create_entity("IfcClosedShell", CfsFaces=face_entities)
+    brep = ifc_file.create_entity("IfcFacetedBrep", Outer=shell)
+    return [brep]
+
+
+def _build_representation_items(ifc_file, verts: np.ndarray, faces: np.ndarray):
+    verts_native = _verts_to_native_units(ifc_file, verts)
+    if ifc_file.schema == "IFC2X3":
+        return _build_faceted_brep_items(ifc_file, verts_native, faces)
+    return _build_triangulated_faceset_items(ifc_file, verts_native, faces)
+
+
+def _styled_items_for_item(item) -> list:
+    """item(IfcRepresentationItem)を指す IfcStyledItem のリストを返す
+
+    (inverse属性 StyledByItem。付いていなければ空リスト)。"""
+    return list(getattr(item, "StyledByItem", []) or [])
+
+
+def _resolve_surface_rgb(style) -> tuple[float, float, float] | None:
+    """IfcSurfaceStyle から IfcSurfaceStyleShading(のサブタイプ Rendering含む)の
+    SurfaceColour(RGB)を取り出す。最初に見つかったものを返す。取れなければNone。"""
+    for sub_style in getattr(style, "Styles", []) or []:
+        if sub_style.is_a("IfcSurfaceStyleShading"):
+            colour = sub_style.SurfaceColour
+            if colour is not None:
+                return (float(colour.Red), float(colour.Green), float(colour.Blue))
+    return None
+
+
+def style_signature(items) -> frozenset | None:
+    """items(representation itemのリスト)に付いた全IfcStyledItemから比較用
+    シグネチャを作る((styleのentity id, RGB or None)のペア集合)。付いたスタイルが
+    1つもなければNone。"""
+    sig: set[tuple[int, tuple[float, float, float] | None]] = set()
+    for item in items:
+        for styled_item in _styled_items_for_item(item):
+            for style in styled_item.Styles or []:
+                sig.add((style.id(), _resolve_surface_rgb(style)))
+    return frozenset(sig) if sig else None
+
+
+def styles_match(sig_a, sig_b) -> bool:
+    """同一スタイルentity id、または同一RGBのいずれかが一致すれば「同じ色」とみなす
+    (design.md契約: 「同一style entity id OR 同一RGB」の保守的な比較)。両方Noneなら
+    (スタイル無し同士)一致とみなす。"""
+    if sig_a is None and sig_b is None:
+        return True
+    if sig_a is None or sig_b is None:
+        return False
+    ids_a = {entity_id for entity_id, _ in sig_a}
+    ids_b = {entity_id for entity_id, _ in sig_b}
+    if ids_a & ids_b:
+        return True
+    rgb_a = {rgb for _, rgb in sig_a if rgb is not None}
+    rgb_b = {rgb for _, rgb in sig_b if rgb is not None}
+    return bool(rgb_a & rgb_b)
+
+
+def _transfer_styled_items(ifc_file, old_items, new_items) -> None:
+    """old_items 上の IfcStyledItem を new_items へ付け替える(Item属性を再指定)。
+
+    old_items→new_itemsの差し替えでは、new_itemsが1つ(_build_representation_items
+    は常に単一アイテムを返す)であれば、old_items全体に付いていたスタイルを1つに
+    集約してそこへ付け替える(「単一新アイテムへ全スタイルが移る」という契約上の
+    マッピング規則)。new_itemsが複数ある場合はインデックスで対応付ける(はみ出す分は
+    末尾のアイテムへ)。new_itemsが空(呼び出し元の異常系)の場合は付け替え先が無いため、
+    ぶら下がりを避けて対象のIfcStyledItemを削除する。
+    """
+    for i, old_item in enumerate(old_items):
+        styled_items = _styled_items_for_item(old_item)
+        if not styled_items:
+            continue
+        if not new_items:
+            for styled_item in styled_items:
+                ifc_file.remove(styled_item)
+            continue
+        target = new_items[0] if len(new_items) == 1 else new_items[min(i, len(new_items) - 1)]
+        for styled_item in styled_items:
+            styled_item.Item = target
+
+
+def _cleanup_items(ifc_file, old_items) -> list[str]:
+    """旧 representation アイテムを、他から参照されない場合のみ再帰的に削除する。
+
+    掃除の失敗は書き戻し自体を失敗させず、警告文字列として呼び出し元に返す。
+    """
+    warnings: list[str] = []
+    for item in old_items:
+        try:
+            ifcopenshell.util.element.remove_deep2(ifc_file, item)
+        except Exception as exc:  # noqa: BLE001 - 掃除の失敗は警告に留め、書き戻し自体は成功させる
+            warnings.append(f"旧形状アイテムの掃除に失敗: {exc}")
+    return warnings
+
+
+def _replace_items_in_place(ifc_file, shape_representation, new_items) -> list[str]:
+    old_items = list(shape_representation.Items)
+    _transfer_styled_items(ifc_file, old_items, new_items)
+    shape_representation.Items = new_items
+    shape_representation.RepresentationType = _representation_type_for_schema(ifc_file.schema)
+    return _cleanup_items(ifc_file, old_items)
+
+
+def _transform_operator_matrix(op) -> np.ndarray | None:
+    """IfcCartesianTransformationOperator3D を 4x4 アフィン行列にする。
+
+    Axis1/Axis2/Axis3(IfcDirection, optional)・LocalOrigin(IfcCartesianPoint,
+    optional)・Scale(float, optional, 既定1.0)を扱う。未指定の軸は既定
+    (1,0,0)/(0,1,0)/(0,0,1)。指定された軸はGram-Schmidtで正規直交化するため、
+    回転部分は常に直交行列(一様スケールSCALEを乗じたもの)になる。
+
+    op が None(MappingTargetなし)なら恒等行列を返す。
+    IfcCartesianTransformationOperator3DnonUniform(非一様スケール、Scale2/Scale3
+    を持つ)は Scale のみでは行列を再現できないため None を返す(=安全に逆変換
+    できないことを示すシグナル。呼び出し側はscope="element"へフォールバックする)。
+    """
+    if op is None:
+        return np.eye(4)
+    if op.is_a("IfcCartesianTransformationOperator3DnonUniform"):
+        return None
+
+    axis1 = np.array(op.Axis1.DirectionRatios, dtype=np.float64) if op.Axis1 else np.array([1.0, 0.0, 0.0])
+    axis2 = np.array(op.Axis2.DirectionRatios, dtype=np.float64) if op.Axis2 else np.array([0.0, 1.0, 0.0])
+    axis3 = np.array(op.Axis3.DirectionRatios, dtype=np.float64) if op.Axis3 else np.array([0.0, 0.0, 1.0])
+    origin = np.array(op.LocalOrigin.Coordinates, dtype=np.float64) if op.LocalOrigin else np.zeros(3)
+    scale = op.Scale if op.Scale is not None else 1.0
+
+    d1 = axis1 / np.linalg.norm(axis1)
+    d2 = axis2 - np.dot(axis2, d1) * d1
+    n2 = np.linalg.norm(d2)
+    d2 = d2 / n2 if n2 > 1e-12 else np.array([0.0, 1.0, 0.0])
+    d3 = axis3 - np.dot(axis3, d1) * d1 - np.dot(axis3, d2) * d2
+    n3 = np.linalg.norm(d3)
+    d3 = d3 / n3 if n3 > 1e-12 else np.cross(d1, d2)
+
+    rotation = np.column_stack([d1, d2, d3]) * scale
+    matrix = np.eye(4)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = origin
+    return matrix
+
+
+def _is_identity_matrix(matrix: np.ndarray) -> bool:
+    return np.allclose(matrix, np.eye(4), atol=1e-9)
+
+
+def _is_safe_similarity_matrix(matrix: np.ndarray | None) -> bool:
+    """一様スケール・回転(鏡映なし、行列式>0)であり、安全に逆変換できるか。
+
+    _transform_operator_matrix の構築上、回転部分は常に直交行列(スケール倍)に
+    なるため、ここでは非退化(スケール!=0)と鏡映なし(行列式>0、右手系維持)のみ
+    確認すれば十分。"""
+    if matrix is None:
+        return False
+    rotation = matrix[:3, :3]
+    scale_estimate = np.linalg.norm(rotation[:, 0])
+    if scale_estimate < 1e-9:
+        return False
+    return np.linalg.det(rotation) > 1e-9
+
+
+def _invert_similarity_matrix(matrix: np.ndarray) -> np.ndarray:
+    """_is_safe_similarity_matrix が True を返す行列の逆行列を返す。"""
+    rotation = matrix[:3, :3]
+    origin = matrix[:3, 3]
+    scale = np.linalg.norm(rotation[:, 0])
+    rotation_unit = rotation / scale
+    inv_rotation = rotation_unit.T / scale
+    inv = np.eye(4)
+    inv[:3, :3] = inv_rotation
+    inv[:3, 3] = -inv_rotation @ origin
+    return inv
+
+
+def _apply_matrix_to_verts(matrix: np.ndarray, verts: np.ndarray) -> np.ndarray:
+    v = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    homogeneous = np.hstack([v, np.ones((v.shape[0], 1))])
+    transformed = (matrix @ homogeneous.T).T
+    return transformed[:, :3]
+
+
+def _unshare_and_replace(ifc_file, element, body_rep, verts: np.ndarray, faces: np.ndarray) -> list[str]:
+    """共有 IfcMappedItem を解いて、この要素専用の新規 IfcShapeRepresentation に
+    差し替える(scope="element" 本体、および scope="shared" の逆変換フォールバック
+    先としても再利用する)。"""
+    new_items = _build_representation_items(ifc_file, verts, faces)
+    _transfer_styled_items(ifc_file, list(body_rep.Items), new_items)
+    new_body_rep = ifc_file.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_rep.ContextOfItems,
+        RepresentationIdentifier="Body",
+        RepresentationType=_representation_type_for_schema(ifc_file.schema),
+        Items=new_items,
+    )
+    product_shape = element.Representation
+    reps = list(product_shape.Representations)
+    idx = reps.index(body_rep)
+    reps[idx] = new_body_rep
+    product_shape.Representations = reps
+
+    # 古い個別ラッパー(body_rep)はこの要素からしか参照されていないはずなので、
+    # まずそれを起点に掃除する。共有マップ/ジオメトリが他から参照されていれば
+    # remove_deep2 が自動的に保護する。
+    return _cleanup_items(ifc_file, [body_rep])
+
+
+def replace_representation(
+    ifc_file, element, verts: np.ndarray, faces: np.ndarray, scope: str = "element"
+) -> list[str]:
+    """要素の Body 表現を verts/faces の三角形メッシュに差し替える。
+
+    verts は SI単位(メートル)であることを前提とする(ifcopenshell.geom / core/extract.py
+    が返す座標系と同じ)。ファイルの実寸法単位がメートル以外(ミリメートル等)の場合、
+    書き込み前に ifcopenshell.util.unit.calculate_unit_scale(ifc_file) を用いて
+    ファイル側の単位に変換してから IfcCartesianPointList3D / IfcCartesianPoint に
+    格納する(単位不整合で形状が縮小/拡大するバグの回避)。
+
+    scope="element": 対象要素だけを差し替える。共有 IfcRepresentationMap を
+        参照している場合は、その要素専用の新規 IfcShapeRepresentation を割り当てて
+        個別化する(共有マップ自体は変更しない)。
+    scope="shared": 参照している IfcRepresentationMap の MappedRepresentation を
+        直接差し替える。同じマップを参照する全要素に波及する。
+
+        verts は呼び出し元(export.py の _current_mesh)が ifcopenshell.geom で
+        抽出したこの要素のローカル座標であり、この要素の IfcMappedItem.MappingTarget
+        (共有マップ座標系→この要素のローカル座標系への変換)が既に適用済みである
+        (Final Review Fix3で判明した前提)。MappedRepresentation(共有マップの
+        座標系)へそのまま書き込むと、次にこの要素(または他の共有要素)を再抽出した
+        際に MappingTarget がもう一度適用され、2重変換になってしまう。
+        そのためMappingTargetが恒等でない場合は、書き込み前にその逆行列を verts に
+        適用して共有マップの座標系に戻す。逆行列が安全に求まらない場合(非一様スケール
+        等)は、この要素だけ scope="element" にフォールバックし、警告を返す
+        (共有マップ自体は変更されない)。
+
+    戻り値: 旧アイテムの掃除中に発生した警告文字列のリスト(全成功時は空リスト)。
+    書き戻し自体は掃除の失敗に関わらず成功する。
+    """
+    if scope not in ("element", "shared"):
+        raise ValueError(f"不正な scope です: {scope!r}")
+
+    body_rep = _find_body_shape_representation(element)
+    if body_rep is None:
+        raise ValueError(f"要素に Body representation がありません: {element}")
+
+    old_items = list(body_rep.Items)
+    is_mapped = len(old_items) == 1 and old_items[0].is_a("IfcMappedItem")
+
+    if not is_mapped:
+        # 個別所有の representation。scope に関わらずその場で差し替える。
+        new_items = _build_representation_items(ifc_file, verts, faces)
+        return _replace_items_in_place(ifc_file, body_rep, new_items)
+
+    mapped_item = old_items[0]
+    mapping_source = mapped_item.MappingSource
+    mapped_representation = mapping_source.MappedRepresentation
+
+    if scope == "shared":
+        matrix = _transform_operator_matrix(mapped_item.MappingTarget)
+
+        if matrix is not None and _is_identity_matrix(matrix):
+            new_items = _build_representation_items(ifc_file, verts, faces)
+            return _replace_items_in_place(ifc_file, mapped_representation, new_items)
+
+        if matrix is not None and _is_safe_similarity_matrix(matrix):
+            verts_in_shared_frame = _apply_matrix_to_verts(_invert_similarity_matrix(matrix), verts)
+            new_items = _build_representation_items(ifc_file, verts_in_shared_frame, faces)
+            return _replace_items_in_place(ifc_file, mapped_representation, new_items)
+
+        # MappingTargetを安全に逆変換できない(非一様スケール等)。共有マップは
+        # 変更せず、この要素だけscope="element"にフォールバックする。
+        result = _unshare_and_replace(ifc_file, element, body_rep, verts, faces)
+        result.append(
+            "scope=\"shared\"の書き戻しでMappingTargetを安全に逆変換できないため、"
+            f"この要素(GlobalId={getattr(element, 'GlobalId', '?')})はscope=\"element\""
+            "にフォールバックしました(共有マップは変更されていません)。"
+        )
+        return result
+
+    # scope == "element": 共有を解いて個別化する。
+    return _unshare_and_replace(ifc_file, element, body_rep, verts, faces)
+
+
+def _shared_element_group(ifc_file, gid: str) -> list:
+    """gid の要素が参照する形状(共有 RepresentationMap 含む)を使う要素の
+    entity リストを返す(gid自身を含む)。Body representationが無ければ空リスト。
+    count_shared_elements/get_shared_element_gids の共通の内部実装。"""
+    element = ifc_file.by_guid(gid)
+    body_rep = _find_body_shape_representation(element)
+    if body_rep is None:
+        return []
+
+    items = list(body_rep.Items)
+    if len(items) == 1 and items[0].is_a("IfcMappedItem"):
+        mapped_representation = items[0].MappingSource.MappedRepresentation
+        return list(
+            ifcopenshell.util.element.get_elements_by_representation(
+                ifc_file, mapped_representation
+            )
+        )
+
+    return [element]
+
+
+def count_shared_elements(ifc_file, gid: str) -> int:
+    """gid の要素が参照する形状(共有 RepresentationMap 含む)を使う要素数を返す。"""
+    return len(_shared_element_group(ifc_file, gid))
+
+
+def get_shared_element_gids(ifc_file, gid: str) -> list[str]:
+    """gid の要素と同一形状(共有 RepresentationMap)を参照する、gid自身を除いた
+    兄弟要素のGlobalIdリストを返す(共有波及の着色 §Phase4 Task4 で使用)。
+    共有していない、またはBody representationが無い要素は空リストを返す。"""
+    return [e.GlobalId for e in _shared_element_group(ifc_file, gid) if e.GlobalId != gid]
