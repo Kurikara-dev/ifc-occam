@@ -2,32 +2,58 @@
 
 **English** | [日本語](README.ja.md)
 
-IFC Occam is a lightweighting workbench for IFC (ISO 16739) files, the standard exchange format for building BIM. It turns oversized models into smaller derivative files that ordinary BIM tools can actually open.
+A workbench for cutting oversized IFC (ISO 16739) models down to a size that ordinary BIM tools can actually open. You decide what goes — **by IFC class, not element by element** — and the tool writes a smaller derivative file. Your original file is never modified.
 
-## Why it exists
+> **Two things to know before you read further.** The user interface — both the web UI and the interactive command loop — is **Japanese only**; the code, comments, and design notes are Japanese too. Development and testing happen on Windows. Everything else below still applies, but if neither of those works for you, this probably isn't the tool you want.
 
-IFC files coming out of detail-heavy workflows — steel fabrication is a common source — pile up bolts, welds, small fittings, and plates until a single model reaches hundreds of megabytes or several gigabytes. At that size, general-purpose BIM tools, and sometimes even IFC Occam's own full-model loader, struggle to open the file at all.
+## The problem
 
-Reviewing a model like that element-by-element isn't realistic. What works is deciding **by class**: look at a ranked breakdown of which IFC classes dominate the element and geometry count, then make a handful of coarse, deliberate calls — "remove every fastener," "reduce every plate to a bounding box" — instead of thousands of individual judgments. IFC Occam is built around that workflow, in two forms depending on model size.
+IFC files from detail-heavy workflows — steel fabrication is the usual culprit — accumulate bolts, welds, small fittings, and plates until one model is hundreds of megabytes or several gigabytes. General-purpose BIM tools stall or fail to open them at all.
 
-## Two modes: GUI and CUI
+Reviewing such a model element by element is not realistic. What works is deciding by class: look at a ranked breakdown of which IFC classes dominate the element and triangle counts, then make a handful of coarse, deliberate calls — *remove every fastener*, *reduce every plate to a bounding box* — instead of thousands of individual judgements.
 
-- **GUI** (`python -m ifc_occam serve`) — starts a local web server and opens a 3D viewer (three.js) in your browser. Select elements interactively; delete, bbox, convex-hull, or decimate them; review duplicate-shape groups; apply named presets; act on a whole IFC class at once; then export. Best for small-to-medium models (roughly up to ~300 MB as a rule of thumb).
-- **CUI** (`python -m ifc_occam cui <file.ifc>`) — no 3D rendering. A lightweight text scan of the raw STEP file produces a per-class ranking (element count, estimated face count) in seconds to minutes. An interactive command loop then lets you commit to class-level operations before a single full open-and-export pass. Built for huge models (hundreds of MB to multi-GB). Pass `--scan-only` to print the ranking and exit without entering the interactive loop.
+A measured example. A 102 MB fabrication model with 11,273 elements and 2.23 million triangles: deleting one accessory class (2,728 elements) and reducing a fitting class (1,784 elements) to bounding boxes produced a 94 MB file with 1.43 million triangles — **36% fewer triangles** — with no dangling references and no new geometry warnings. The byte count barely moved; the triangle count is what decides whether a viewer can handle the model.
 
-Both modes share the same underlying operations and the same rule: **the tool never decides on its own** — a human selects, confirms, and applies every change.
+## Before you start
 
-## Quick start
+| | |
+|---|---|
+| **Input** | `.ifc` STEP files. Tested against IFC4 and IFC2X3. |
+| **Output** | A new `.ifc` file (the CUI defaults to `<input>_light.ifc`). The input is never written to. |
+| **UI language** | Japanese only. |
+| **Platform** | Windows (developed and tested there). The Python code has no OS-specific dependencies; only the convenience launchers are `.bat`. |
+| **Python** | 3.11 or newer. |
+| **Standing** | Output is a **reference-only derivative**, never a design or construction record. See [Disclaimer](#disclaimer). |
+
+## Install
 
 ```bash
 git clone https://github.com/Kurikara-dev/ifc-occam.git
 cd ifc-occam
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e .            # add ".[dev]" to also install test dependencies
 ```
 
-Requires Python >= 3.11. Run the test suite with `pytest` (after installing the `dev` extra).
+Activate the virtual environment — `.venv\Scripts\activate` on Windows, `source .venv/bin/activate` elsewhere — then:
+
+```bash
+pip install -e .
+```
+
+Add `".[dev]"` instead of `.` if you also want the test dependencies, then run `pytest` to check your install (the suite takes about ten minutes; most of it is real-model integration tests).
+
+If installation fails, it is almost always `ifcopenshell`: it ships platform- and Python-version-specific wheels, so a mismatch there is the usual cause. This project is developed against ifcopenshell 0.8.5.
+
+On Windows you can skip the command line entirely once the virtual environment exists: **double-click `start.bat`** to launch the GUI. (`start-exe.bat` runs a PyInstaller build from `dist/` if you have made one; there are no prebuilt binaries in releases yet.)
+
+## Which mode do I want?
+
+| Your model | Mode | What you get |
+|---|---|---|
+| up to roughly 300 MB | **GUI** | 3D viewer, click to select, see what you are about to delete |
+| roughly 300 MB – 2 GB | **CUI** | text scan, then class-level decisions, then one full open-and-export pass |
+| bigger than that, or when a full open will not fit in RAM | **CUI text mode** (`--text`) | deletions applied by rewriting the STEP text; the model is never fully opened |
+
+The rule of thumb behind the middle row: opening a model with `ifcopenshell` needs roughly **14× the file size in RAM** (measured and calibrated). A 1.2 GB model peaked at 14.75 GB. The CUI estimates this before you commit and warns you when it looks unaffordable.
 
 ### GUI
 
@@ -35,13 +61,17 @@ Requires Python >= 3.11. Run the test suite with `pytest` (after installing the 
 python -m ifc_occam serve
 ```
 
-Open the printed URL in your browser, then load a model by entering a path relative to the folder you launched the server from.
+Open the printed URL. Pick a model through the **file dialog** (browsing is confined to the folder you launched the server from; a collapsed manual-path field is still there if you'd rather type it). The sidebar has three tabs — class, layer, and duplicate-shape groups — each row showing element/shape/triangle counts, with delete/simplify/keep quick-action buttons that appear on hover. Select elements in the viewer or act on a whole class/layer at once; delete, reduce to a bounding box, take a convex hull, or decimate; save named **operation patterns** (reusable rule sets, applied with a per-rule count you confirm first) for reuse across models. Export goes through a **save dialog** too, and it refuses a filename that resolves to the file you loaded. The 3D view sits the model on a floor with two back walls for a sense of scale (toggle with the "ステージ" button); selecting something dims everything else and outlines the selection. If port 8000 is busy the server picks the next free port and prints it.
+
+<!-- Screenshot: GUI overview (sidebar tabs + docked operation bar + 3D view) — pending -->
 
 ### CUI
 
 ```bash
 python -m ifc_occam cui heavy_steel.ifc
 ```
+
+A lightweight scan of the raw STEP text — no geometry engine, no full open — produces a per-class ranking in seconds to minutes, then hands you a command loop:
 
 ```
 IFC Occam CUI — 軽量スキャン中...
@@ -54,23 +84,58 @@ IFC Occam CUI — 軽量スキャン中...
 > apply
 ```
 
-Interactive commands: `delete` / `bbox` / `hull` / `decimate` / `keep` / `undo` / `list` / `rank` / `apply` (plus `help` and `quit`). Note that both the CUI and the GUI's web interface currently display Japanese text only.
+Commands: `delete`, `bbox`, `hull`, `decimate`, `keep`, `undo`, `list`, `rank`, `apply`, plus `help` and `quit`. Nothing touches disk until `apply`, and `apply` asks you to confirm twice — once on the operation summary, once after the real file has been read and the deletion cascade has been expanded, so you see how many extra elements come along with your choices before anything is written. It also prompts for the output filename.
+
+`--scan-only` prints the ranking and exits, which is the fast way to size up a model you have never seen.
+
+### Text mode: for models you cannot open
+
+Some models are not merely large but hostile to element-by-element editing. On one real family of models, `ifcopenshell`'s per-element deletion measured **~22 seconds per element** — 456 elements would have taken 2.8 hours — while a comparable model deleted at 110–140 ms per element. Text mode exists for those cases, and for models too big to open at all.
+
+```bash
+python -m ifc_occam cui huge_model.ifc --text
+```
+
+When every pending operation is a deletion, the CUI offers to apply it by rewriting the STEP file as a byte stream: it scans the reference graph, works out which records die with your targets (openings and their fillings, aggregated children, and any records left referenced by nothing), patches the reference lists of the relationship records that survive, and streams everything else through untouched. `ifcopenshell` is never called.
+
+The mode is offered only for delete-only operation sets — bounding boxes, hulls, and decimation need a geometry engine — and only when you pass `--text` or the memory estimate above has already warned you. Its correctness is pinned by an equivalence test: for the same deletion, the text path and the ordinary full-open path must produce the same surviving elements and the same geometry. Read [Limits](#limits-and-known-gaps) for what that test does *not* cover.
+
+## What this tool never does
+
+- **It never modifies your input file.** If you point the output at the input, it refuses and stops.
+- **It never decides for you.** There is no automatic optimisation pass: a human selects, confirms, and applies every change.
+- **It never opens the model in text mode.** That is the whole point of that mode.
+
+## Limits and known gaps
+
+Numbers below are measured, not estimated.
+
+- **Full open costs ~14× the file size in RAM.** Beyond about 2 GB the CUI warns you; past that you want text mode.
+- **Text mode's reference-graph scan costs ~4.8× the file size in RAM.** So a 6.5 GB model would need roughly 31 GB of peak memory, and **text mode has not yet been validated at that size** — diagnosis (`--scan-only`) has: a 6.5 GB model scanned in 455 seconds. Reducing this is the next piece of planned work.
+- **Text mode is delete-only.**
+- **Text mode leaves a small residue.** It keeps a few unreferenced records that the full-open path removes — measured at +0.24% of records on a 380,000-record model. Surviving elements and geometry match exactly; the record count does not.
+- **Text mode's cascade equivalence is verified on synthetic models, not real ones.** The real model available for testing contains no openings or fillings at all, so the voids-and-fillings and aggregation cascades are pinned by purpose-built fixtures instead. Both agree exactly with the full-open path; neither has met a real building model.
+- **No release binaries yet**, and no CI.
 
 ## Disclaimer
 
-Output files are **derived, view/reference-only artifacts** — never treat them as the design or construction record of authority. Elements are **irreversibly** removed or simplified in the output. The original file itself is never modified, but once an element is gone from the output, that output cannot be turned back into the full model. Always make design and construction decisions from the original, unaltered file.
+Output files are **derived, reference-only artifacts** — never treat them as the design or construction record of authority. Elements are **irreversibly** removed or simplified in the output. The original file is never modified, but once an element is gone from the output, that output cannot be turned back into the full model. Make design and construction decisions from the original file.
 
-As a safeguard, every exported file's IFC header is stamped with lightweighting provenance — a non-authoritative-derivative disclosure, the source filename, and a count of elements deleted/simplified — appended to `FILE_DESCRIPTION.description` (existing entries such as `ViewDefinition` are preserved), plus `FILE_NAME.originating_system`. This happens automatically on every export, in both GUI and CUI.
+As a safeguard, every exported file carries its provenance in the IFC header: a non-authoritative-derivative disclosure, the source filename, and a count of elements deleted and simplified, appended to `FILE_DESCRIPTION.description` (existing entries such as `ViewDefinition` are preserved) plus `FILE_NAME.originating_system`. This happens automatically on every export, in both modes.
 
 This software is provided under the MIT License's "AS IS" terms, with no warranty of any kind.
 
-## Development status
+## Status
 
-The GUI covers its intended feature set. The CUI is under active development; planned work includes a text-level deletion engine (editing the STEP file directly, without a full `ifcopenshell` open).
+The GUI covers its intended feature set. The CUI covers scanning, class-level operations, provenance stamping, and text-level deletion. The largest models in the intended range are not yet validated end to end — see [Limits](#limits-and-known-gaps).
+
+## More documentation
+
+[docs/testing-guide.md](docs/testing-guide.md) is a hands-on walkthrough written for non-developers (Japanese). Some docstrings refer to internal design documents that are not part of this distribution; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party components — the bundled `three.js` viewer and the LGPL-3.0 `ifcopenshell` dependency, among others — are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT — see [LICENSE](LICENSE). Third-party components, including the bundled `three.js` viewer and the LGPL-3.0 `ifcopenshell` dependency, are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 

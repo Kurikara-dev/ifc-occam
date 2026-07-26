@@ -60,6 +60,27 @@ def test_sorted_descending_by_total_triangles():
     totals = [s.total_triangles for s in result]
     assert totals == sorted(totals, reverse=True)
 
+def test_sort_actually_reorders_and_is_not_just_insertion_order():
+    """降順ソートが実際に効いていること。
+
+    `_model()` は挿入順(Fastener=300 → Wall=10)がたまたま降順と一致して
+    いるため、実装から `sorted(...)` を削除しても上のテストは通ってしまう
+    (GUI改修 Task 3 のレビューで、レイヤー側に同じ弱点を写した際に発覚した)。
+    ここでは**挿入順が昇順**になるフィクスチャを使い、並べ替えが起きなければ
+    落ちるようにする。
+    """
+    shapes = {"small": _shape("small", 5), "big": _shape("big", 500)}
+    elements = [
+        _elem("S1", "IfcSmallThing", "small"),  # 先に挿入=5三角形
+        _elem("B1", "IfcBigThing", "big"),  # 後に挿入=500三角形
+    ]
+    model = ModelData(schema="IFC4", elements=elements, shapes=shapes)
+
+    result = aggregate_by_class(model)
+
+    assert [s.ifc_class for s in result] == ["IfcBigThing", "IfcSmallThing"]
+    assert [s.total_triangles for s in result] == [500, 5]
+
 def test_geometry_less_element_counted_with_zero_triangles():
     stats = {s.ifc_class: s for s in aggregate_by_class(_model())}
     assert stats["IfcSpace"].element_count == 1

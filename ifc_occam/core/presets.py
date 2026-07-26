@@ -141,3 +141,15 @@ def save_presets(path: str | Path, presets: list[Preset]) -> None:
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(presets_to_json(presets), encoding="utf-8")
     tmp.replace(p)
+
+
+def delete_preset(path: str | Path, name: str) -> list[Preset]:
+    """name に完全一致するプリセットを除いて保存する(読み込み→フィルタ→保存)。
+    GUI改修Task6。name が存在しない場合も例外にせず、変更前の一覧をそのまま
+    返す(存在確認とHTTPステータスの判定はサーバAPI側の責務。
+    ifc_occam/server/app.py の delete_preset_endpoint が事前に存在確認して
+    404を返してから呼ぶ)。他のプリセットの順序・内容には影響しない。"""
+    presets = load_presets(path)
+    remaining = [p for p in presets if p.name != name]
+    save_presets(path, remaining)
+    return remaining

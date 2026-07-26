@@ -151,3 +151,118 @@ def test_resolve_unknown_match_key_returns_warning(client):
     data = resp.json()
     assert len(data["warnings"]) == 1
     assert data["rules"][0]["count"] == 0
+
+
+# --- DELETE /api/presets (削除、GUI改修Task6) ---------------------------------
+#
+# 監督者裁定4: 当初案の DELETE /api/presets/{name}(パスパラメータ)は、
+# name に "/" を含む場合にルーティングが壊れる(Starletteの既定コンバータは
+# 単一パスセグメントを "/" で区切るため、%2Fに事前デコードされた時点で
+# パスセグメントが分かれてしまい404になる)。実験で確認済み
+# (本テストの test_..._name_containing_slash
+# で再現)。そのため本APIはクエリパラメータ方式 DELETE /api/presets?name=...
+# を採用する(既存の GET /api/files?path=... と同じ house style)。
+
+_TWO_PRESET_BODY = [
+    {
+        "name": "CFD用",
+        "description": "照明を削除",
+        "rules": [{"match": {"ifc_class": "IfcLightFixture"}, "op": {"op": "delete"}}],
+    },
+    {"name": "干渉チェック用", "description": "", "rules": []},
+]
+
+
+def test_delete_preset_removes_it_from_list(client):
+    client.post("/api/presets", json=_TWO_PRESET_BODY)
+
+    resp = client.delete("/api/presets", params={"name": "CFD用"})
+    assert resp.status_code == 200
+    assert [p["name"] for p in resp.json()] == ["干渉チェック用"]
+
+    get_resp = client.get("/api/presets")
+    assert [p["name"] for p in get_resp.json()] == ["干渉チェック用"]
+
+
+def test_delete_preset_unknown_name_returns_404(client):
+    client.post("/api/presets", json=_SAMPLE_BODY)
+
+    resp = client.delete("/api/presets", params={"name": "存在しない"})
+    assert resp.status_code == 404
+
+    # 404でも既存のプリセットは無事であること
+    get_resp = client.get("/api/presets")
+    assert get_resp.json() == _SAMPLE_BODY
+
+
+def test_delete_preset_does_not_affect_other_presets(client):
+    client.post("/api/presets", json=_TWO_PRESET_BODY)
+
+    client.delete("/api/presets", params={"name": "CFD用"})
+
+    get_resp = client.get("/api/presets")
+    remaining = get_resp.json()
+    assert len(remaining) == 1
+    assert remaining[0] == _TWO_PRESET_BODY[1]
+
+
+def test_delete_preset_supports_japanese_name_with_spaces(client):
+    body = [{"name": "テスト プリセット 名前", "description": "", "rules": []}]
+    client.post("/api/presets", json=body)
+
+    resp = client.delete("/api/presets", params={"name": "テスト プリセット 名前"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+    get_resp = client.get("/api/presets")
+    assert get_resp.json() == []
+
+
+def test_delete_preset_supports_name_containing_slash(client):
+    """裁定4で switch した根拠そのものを固定するテスト: "/" を含む名前でも
+    クエリパラメータ方式なら削除できる(パスパラメータ方式では404になっていた)。"""
+    body = [{"name": "新規/既存 対応", "description": "", "rules": []}]
+    client.post("/api/presets", json=body)
+
+    resp = client.delete("/api/presets", params={"name": "新規/既存 対応"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.parametrize(
+    "tricky_name",
+    [
+        "ha#sh",
+        "qu?ery",
+        "am&per",
+        "pe%rcent",
+        "sl%2Fash",  # リテラルの "%2F"("/" のエンコード済み表記と紛らわしい)
+        "sp%20ace",  # リテラルの "%20"(スペースのエンコード済み表記と紛らわしい)
+        "plus+sign",
+        "混合/名前#テスト?です&こう%なる スペース",
+    ],
+)
+def test_delete_preset_matches_the_exact_name_for_url_significant_characters(
+    client, tricky_name
+):
+    """URL上で意味を持つ文字を含む名前でも、その1件だけが正確に消えること。
+
+    クエリパラメータ方式(裁定4)にした以上、エンコード/デコードが1段ずれると
+    **別のプリセットを消す事故**になる。特に危ないのが `%` を含む名前で、
+    `sl%2Fash`(リテラル)と `sl/ash` は二重デコードが起きると同一視される。
+    Task 6 レビューで実機の13ケースは確認済みだが、恒久的な回帰テストが
+    `/` と日本語だけだったのでここで塞ぐ(Important の引き取り)。
+
+    巻き添え検出のため、常に無関係な番兵プリセットを2件同居させ、削除後に
+    それらが名前も内容も無傷であることまで確認する。
+    """
+    guard_a = {"name": "guard-a", "description": "", "rules": []}
+    guard_b = {"name": "guard-b", "description": "触るな", "rules": []}
+    target = {"name": tricky_name, "description": "", "rules": []}
+    client.post("/api/presets", json=[guard_a, target, guard_b])
+
+    resp = client.delete("/api/presets", params={"name": tricky_name})
+
+    assert resp.status_code == 200
+    assert [p["name"] for p in resp.json()] == ["guard-a", "guard-b"]
+    assert client.get("/api/presets").json() == [guard_a, guard_b]

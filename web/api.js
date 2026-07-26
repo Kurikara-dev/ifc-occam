@@ -252,6 +252,29 @@ export async function postPresets(presets) {
 }
 
 /**
+ * 名前を指定してプリセット(操作パターン)を削除する(GUI改修Task6)。
+ * サーバはクエリパラメータ方式(DELETE /api/presets?name=...)を採る——
+ * パスパラメータ方式(DELETE /api/presets/{name})だと name が "/" を含む
+ * 場合にStarletteの既定コンバータがマッチせず404になるため
+ * (ifc_occam/server/app.py delete_preset_endpoint 参照)。
+ * 存在しない名前は404(detail付きErrorとしてthrow)。
+ * @param {string} name
+ * @returns {Promise<Array<object>>} 削除後の一覧
+ */
+export async function deletePreset(name) {
+  const res = await fetch(`/api/presets?name=${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const detail = await _safeDetail(res);
+    const err = new Error(`preset delete failed (${res.status}): ${detail}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+/**
  * 名前を指定してプリセットを現在のモデルに対して解決する(適用はしない)。
  * @param {string} name
  * @returns {Promise<{rules:Array<object>, warnings:string[]}>}
@@ -265,6 +288,40 @@ export async function resolvePreset(name) {
   if (!res.ok) {
     const detail = await _safeDetail(res);
     throw new Error(`presets resolve failed (${res.status}): ${detail}`);
+  }
+  return res.json();
+}
+
+/**
+ * サーバ起動フォルダ(root)配下のディレクトリ一覧を取得する(GUI改修Task4)。
+ * root外を指すpathは400、存在しないpathは404(エラーはdetailに理由文字列を
+ * 持つErrorとしてthrowする。filedialog.jsがモーダル内に日本語で表示する)。
+ * @param {string} [path] root相対パス("" ならroot直下)
+ * @returns {Promise<{path:string, parent:string|null, entries:Array<{name:string,is_dir:boolean,size:number|null,mtime:number}>}>}
+ */
+export async function fetchFileList(path = "") {
+  const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
+  if (!res.ok) {
+    const detail = await _safeDetail(res);
+    const err = new Error(`file list failed (${res.status}): ${detail}`);
+    err.status = res.status;
+    err.detail = detail;
+    throw err;
+  }
+  return res.json();
+}
+
+/**
+ * サーバ側の定数(フルオープン推定倍率・警告閾値・読込時間推定の一次式係数)を
+ * 取得する(GUI改修Task4)。JS側にこれらの値を写経しないための唯一の取得経路。
+ * @returns {Promise<{fullopen_bytes_multiplier:number, fullopen_warn_bytes:number,
+ *   load_estimate:{sec_per_mb:number, base_sec:number, band_low:number, band_high:number}}>}
+ */
+export async function fetchConfig() {
+  const res = await fetch("/api/config");
+  if (!res.ok) {
+    const detail = await _safeDetail(res);
+    throw new Error(`config fetch failed (${res.status}): ${detail}`);
   }
   return res.json();
 }

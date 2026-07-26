@@ -95,6 +95,26 @@ def test_diagnostics_after_ready_contains_expected_fields(client):
 
     assert body["duplicate_groups"] == []
 
+    # GUI改修Task3: レイヤー別集計。_synthetic_modelはG1(Layer-A,shape s1),
+    # G2(Layer-B,shape s1同じ形状を共有),G3(layer=None,幾何なし)の3要素。
+    layer_names = {l["layer"] for l in body["layer_stats"]}
+    assert layer_names == {"Layer-A", "Layer-B"}
+    for layer_stat in body["layer_stats"]:
+        for key, val in layer_stat.items():
+            if key != "layer":
+                assert isinstance(val, int), f"{key} is not plain int: {type(val)}"
+
+    by_layer = {l["layer"]: l for l in body["layer_stats"]}
+    assert by_layer["Layer-A"]["element_count"] == 1
+    assert by_layer["Layer-A"]["unique_shape_count"] == 1
+    assert by_layer["Layer-A"]["total_triangles"] == 4
+    assert by_layer["Layer-B"]["element_count"] == 1
+    assert by_layer["Layer-B"]["total_triangles"] == 4
+
+    # layer=None(G3)の1件は layer_stats に現れず、layerless_element_countに数える。
+    assert body["layerless_element_count"] == 1
+    assert isinstance(body["layerless_element_count"], int)
+
 
 def test_mesh_matches_build_mesh_payload(client):
     client.post("/api/load", json={"path": "dummy.ifc"})

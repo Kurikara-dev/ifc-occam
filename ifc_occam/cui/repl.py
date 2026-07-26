@@ -22,6 +22,25 @@
        渡すため apply_operations 側の既定導出 `"(in-memory)"` に頼ると元ファイル名
        が失われる)。
 
+    CUI Phase3 Task5(docs/plans/2026-07-25-cui-phase3.md Task5): 手順1(操作サマリ+警告判定)の後・
+    確認1の直前に、「intents が delete のみ」(全件 op=="delete"。keep/bbox/
+    hull/decimateが1件でも混在すれば対象外——keepはフルオープン経路の閉包計算に
+    効く明示指定であり、テキスト経路には相当機能が無いため黙って無視しては
+    ならない)かつ(`--text` フラグ指定 or `est_fullopen_bytes` 警告該当)の場合に
+    限り、テキストモード(フルオープン不要)を提案する1問を割り込ませる
+    (`_run_apply` 内)。y ならテキスト経路(`_run_text_apply`: `scan_full_graph` →
+    `compute_text_delete_plan` → 確認2相当(stats表示) → 出力ファイル名プロンプト
+    (1bと同一規約) → `rewrite_without`)に入り、確認1は出さない(テキスト経路が
+    自前の確認を持つため、確認2回という設計不変条件は保たれる)。n、または
+    この条件に当たらない場合は手順1b以降(フルオープン経路)へそのまま進む
+    (挙動を1バイトも変えない)。`--text` 指定かつ delete 以外の intent があれば、
+    この1問自体を出さずに「テキストモードは削除のみ対応」と表示してフル
+    オープン経路へフォールバックする。テキスト経路は `ifcopenshell.open` を
+    一度も呼ばない(このフェーズの存在意義)。指定クラスが参照グラフ上に
+    1件も見つからない(`seeds==0`)場合は出力を書かずにフルオープン経路へ
+    フォールバックする(黙って書くと「削除したつもりで中身が元と同じ
+    ファイル」という最も危険な失敗モードになるため)。
+
 Ctrl+C(KeyboardInterrupt)・EOF(標準入力終端)は、メインループの `input()` でも
 apply確認中の `input()` でも同じ1箇所の except で捕まえ、安全に終了する
 (呼び出し階層に関わらずPython例外は最も近い外側のtry/exceptまで伝播するため、
@@ -46,8 +65,12 @@ import ifcopenshell
 from ifc_occam.core.cascade import compute_delete_closure
 from ifc_occam.core.export import ExportReport, apply_operations
 from ifc_occam.core.extract import extract_elements_light
-from ifc_occam.cui.session import CuiSession
+from ifc_occam.core.paths import refers_to_same_file
+from ifc_occam.cui.session import CuiSession, Intent
 from ifc_occam.scan.aggregate import FULLOPEN_BYTES_MULTIPLIER, ScanResult, scan_file
+from ifc_occam.scan.fullgraph import scan_full_graph
+from ifc_occam.textops.plan import compute_text_delete_plan
+from ifc_occam.textops.rewrite import RewriteReport, rewrite_without
 
 __all__ = ["run"]
 
@@ -74,7 +97,7 @@ _FULLOPEN_WARN_BYTES = _FULLOPEN_WARN_FILE_BYTES * FULLOPEN_BYTES_MULTIPLIER
 #: 進捗表示の間引き間隔(監督者確定要件3)。
 _PROGRESS_STRIDE = 500
 
-_STAGE_LABELS = {"delete": "削除中", "simplify": "簡略化中"}
+_STAGE_LABELS = {"delete": "削除中", "simplify": "簡略化中", "rewrite": "書き換え中"}
 
 #: ExportReport.stage_seconds のキー(export.py 内部の英語識別子)→ 結果表示用の
 #: 日本語ラベル。keyはexport.apply_operationsが実際に設定する6種で固定
@@ -109,11 +132,17 @@ _HELP_TEXT = """\
   h / help                     このヘルプを表示する"""
 
 
-def run(path: str, *, output: str | None = None, scan_only: bool = False) -> None:
+def run(
+    path: str, *, output: str | None = None, scan_only: bool = False, text: bool = False
+) -> None:
     """CUI対話ループのエントリポイント(cui-design.md §6)。
 
     Phase A(軽量スキャン)→ Phase B(対話。`scan_only=True` ならここで終了)→
     Phase C(`apply` コマンドで開始)の3段を束ねる。
+
+    `text`(CUI Phase3 Task5、CLI `--text`)は apply 確認フローに割り込む
+    テキストモード提案の発動条件の一部として `_run_apply` にそのまま渡す
+    (モジュールdocstring参照)。
     """
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -128,6 +157,13 @@ def run(path: str, *, output: str | None = None, scan_only: bool = False) -> Non
     print()
     print(_INTRO_HINT)
 
+    # M5(ii)(フェーズ最終レビュー): このセッション中に apply が実際に出力
+    # ファイルへの書き込みを完了したかを追跡する。quit/Ctrl+C/EOF の
+    # 「ファイルは変更されていません」は書き込みが一度も起きていない場合
+    # のみ正しい主張であり、無条件に出すと事実に反する(C1のシナリオでは
+    # 積極的な誤誘導になる)。
+    file_written = False
+
     while True:
         try:
             line = input("> ").strip()
@@ -136,24 +172,46 @@ def run(path: str, *, output: str | None = None, scan_only: bool = False) -> Non
             verb = line.split()[0].lower()
 
             if verb == "quit":
-                print("中断しました。ファイルは変更されていません。")
+                print(_exit_message(file_written))
                 return
             if verb in ("h", "help"):
                 print(_HELP_TEXT)
                 continue
             if verb == "apply":
-                _run_apply(scan, session, path, output)
+                if _run_apply(
+                    scan, session, path, output, text=text, already_written=file_written
+                ):
+                    file_written = True
                 continue
 
             print(session.command(line))
         except (EOFError, KeyboardInterrupt):
             print()
-            print("中断しました。ファイルは変更されていません。")
+            print(_exit_message(file_written))
             return
 
 
 def _confirm(prompt: str) -> bool:
     return input(prompt).strip().lower() in ("y", "yes")
+
+
+def _exit_message(file_written: bool) -> str:
+    """quit/Ctrl+C/EOF で表示する中断メッセージ(M5(ii)、フェーズ最終レビュー)。
+
+    file_written は「このセッション中に apply が実際に出力ファイルへの書き込み
+    を完了したか」(run() が追跡する)。書き込みが一度も起きていなければ従来
+    通り「ファイルは変更されていません」(正しい主張)。一度でも書き込みが
+    起きていればこの文言は事実に反するため出さず、代わりに出力ファイルへの
+    書き込みが完了している旨と、原本(入力ファイル)自体は変更されていない
+    旨を伝える(この保証は C1 のガード導入後も変わらず成立する——apply は
+    常に出力先が入力と異なることを確認した上でのみ書き込む)。
+    """
+    if file_written:
+        return (
+            "中断しました。(直前の適用で出力ファイルへの書き込みが完了しています。"
+            "原本は変更されていません。)"
+        )
+    return "中断しました。ファイルは変更されていません。"
 
 
 def _resolve_cui_output_path(path: str, output: str | None) -> str:
@@ -171,14 +229,98 @@ def _resolve_cui_output_path(path: str, output: str | None) -> str:
     return str(src.parent / candidate)
 
 
-def _run_apply(scan: ScanResult, session: CuiSession, path: str, output: str | None) -> None:
-    """`apply` コマンドの一連処理(cui-design.md §6 手順1-3、1b)。"""
+def _output_path_collides_with_source(path: str, output_path: str) -> bool:
+    """output_path(解決済み。プロンプト入力値・`--output` のどちらも通過後)が
+    入力ファイル(path)と同一実体を指しているかを判定する(C1、フェーズ最終
+    レビュー: 出力先=入力先だと `rewrite_without`/フルオープン経路のいずれも
+    原本を破壊しうる——このツールの契約は原本非破壊であり、フルオープン
+    経路は truncate しないだけで原本上書きは同様に契約違反)。
+
+    判定の実体は `core/paths.refers_to_same_file`(唯一の判定器。ライブラリ層の
+    `core/export.apply_operations` と `textops/rewrite.rewrite_without` も同じ
+    関数を使う)。ライブラリ層のガードは書き込みを止めるが例外の形でしか伝え
+    られないため、UI層でも先に判定して分かる日本語メッセージで中断する。
+
+    呼び出し元は `_maybe_prompt_output_filename` で出力ファイル名を確定させた
+    直後、実際の書き込み(フルオープン/`rewrite_without`)を始める前に呼ぶこと
+    (プロンプト入力値・`--output` 指定値のどちらでも output_path は同じ変数を
+    経由するため、呼び出し箇所を1つに絞れば両方を自動的に塞げる)。
+    """
+    return refers_to_same_file(path, output_path)
+
+
+def _print_output_collision_error(output_path: str) -> None:
+    """C1 の同一パス衝突を検出したときの表示(3箇所の呼び出しで文言を共有する)。"""
+    print(
+        f"エラー: 出力先({output_path})が入力ファイルと同一です。"
+        "原本を保護するため中断しました。別のファイル名を指定してください。"
+    )
+
+
+def _maybe_prompt_output_filename(path: str, output: str | None, output_path: str) -> str:
+    """出力ファイル名プロンプト(手順1b・テキスト経路手順(iv)の両方で使う共通処理。
+    CUI Phase3 Task5 監督者裁定4: 「1bと完全に同一規約」を1箇所にまとめ、
+    重複実装を避ける)。
+
+    `output`(CLIの--output)が None のときだけ表示する(CLI --output 指定時は
+    出力先が確定済みのため出さない。非対話経路は無変更)。空Enterは
+    `output_path` をそのまま使い、入力があれば `_resolve_cui_output_path` で
+    解決する(既定値/--outputと同じ基準=入力ファイルと同じディレクトリ)。
+    """
+    if output is not None:
+        return output_path
+    typed = input(f"出力ファイル名 [{Path(output_path).name}]: ").strip()
+    if typed:
+        return _resolve_cui_output_path(path, typed)
+    return output_path
+
+
+def _run_apply(
+    scan: ScanResult,
+    session: CuiSession,
+    path: str,
+    output: str | None,
+    *,
+    text: bool = False,
+    already_written: bool = False,
+) -> bool:
+    """`apply` コマンドの一連処理(cui-design.md §6 手順1-3、1b、
+    CUI Phase3 Task5のテキストモード分岐込み)。
+
+    already_written: このセッション中に(過去の `apply` 呼び出しで)既に
+    出力ファイルへの書き込みが完了しているか(M5(ii)、フェーズ最終レビュー)。
+    この呼び出し自身が確認1/確認2で中断された場合の「中断しました。
+    ファイルは変更されていません。」がセッション全体として見て事実に反する
+    ことがないよう、`_exit_message` と同じ判定に使う(このapply呼び出し単体
+    としては書き込みが起きていなくても、以前のapplyで既に書き込みが起きて
+    いれば「変更されていません」とは言わない)。
+
+    戻り値: このapply呼び出しで実際に出力ファイルへの書き込みが完了したか
+    (呼び出し元の `run()` がこれを集計して次の呼び出しに `already_written`
+    として渡し、quit/Ctrl+C/EOF時のメッセージがファイル書き込みの有無を
+    正しく反映するようにする)。操作リストが空・各確認でno・C1の同一パス
+    ガードで中断、のいずれも**この呼び出し自身は**書き込みが起きていない
+    ため False(ただし `already_written=True` で呼ばれていた場合、そのTrueは
+    呼び出し元がそのまま保持し続ける——このFalseは「今回は書いていない」の
+    意味でしかない)。テキスト経路(`_run_text_apply`)・フルオープン経路の
+    どちらで書き込みが完了しても True。
+    """
     operations = session.to_operations()
     if not operations:
         print("操作が指定されていません(list で確認できます)。")
-        return
+        return False
 
     output_path = _resolve_cui_output_path(path, output)
+
+    # N2(フェーズ最終レビューの再審): `--output` 指定時は出力先がここで確定
+    # しているので、衝突は**この時点で**弾く。テキスト経路の遅い判定
+    # (参照グラフスキャン+確認2の後)まで待つと、このツールの本来の対象である
+    # 多GBファイルでは数十分のスキャンを無駄にした上、実行不可能な操作に
+    # ユーザーが確認を答えることになる。プロンプト入力値は確認の後でしか
+    # 確定しないため、後段の判定も残す二段構えにする。
+    if output is not None and _output_path_collides_with_source(path, output_path):
+        _print_output_collision_error(output_path)
+        return False
 
     # 手順1: 操作サマリ + est_fullopen_bytes 警告判定 → 確認1。
     print(session.render_intents())
@@ -188,9 +330,32 @@ def _run_apply(scan: ScanResult, session: CuiSession, path: str, output: str | N
             f"警告: 推定フルオープンメモリが大きく({scan.est_fullopen_bytes:,} bytes)、"
             "適用に時間がかかるか失敗する可能性があります。"
         )
+
+    # CUI Phase3 Task5: 確認1の直前にテキストモード分岐を割り込ませる
+    # (docs/plans/2026-07-25-cui-phase3.md Task5、監督者裁定1-5、モジュール
+    # docstring参照)。「delete のみ」= intents全件がop=="delete"
+    # (keep/bbox/hull/decimateが1件でもあれば対象外)。
+    intents = session.intents()
+    delete_only = bool(intents) and all(i.op == "delete" for i in intents)
+
+    if text and not delete_only:
+        print(
+            "テキストモードは削除のみ対応です(bbox/hull/decimate/keepを含む操作には"
+            "使えません)。従来のフルオープン経路にフォールバックします。"
+        )
+    elif delete_only and (text or scan.est_fullopen_bytes > _FULLOPEN_WARN_BYTES):
+        if _confirm("テキストモードで適用しますか?(フルオープン不要・削除のみ) [y/N]: "):
+            handled, wrote = _run_text_apply(
+                path, output, output_path, intents, already_written=already_written
+            )
+            if handled:
+                return wrote
+            # 監督者裁定5(seeds==0)によるフォールバックのみここに戻る。
+            # そのまま従来の確認1へ進む。
+
     if not _confirm("この内容で適用を開始しますか? (y/N): "):
-        print("中断しました。ファイルは変更されていません。")
-        return
+        print(_exit_message(already_written))
+        return False
 
     # 手順1b: 出力ファイル名プロンプト(監督者裁定2026-07-25、design.md §6 1b、
     # 要件§5モック準拠)。CLI --output 指定時は出力先が確定済みのため出さない
@@ -198,10 +363,14 @@ def _run_apply(scan: ScanResult, session: CuiSession, path: str, output: str | N
     # を通し、既定値/--output と同じ基準(入力ファイルと同じディレクトリ)に解決する
     # (レビューア指摘2026-07-25で改訂: 入力値だけがcwd基準になっていた不整合を解消。
     # 既存ヘルパーを再利用し、重複実装はしない)。
-    if output is None:
-        typed = input(f"出力ファイル名 [{Path(output_path).name}]: ").strip()
-        if typed:
-            output_path = _resolve_cui_output_path(path, typed)
+    output_path = _maybe_prompt_output_filename(path, output, output_path)
+
+    # C1(Critical、フェーズ最終レビュー): 出力先=入力先だと、フルオープン
+    # 経路でも原本を上書きしてしまう(truncateしないだけで契約違反は同じ)。
+    # フルオープンを始める前(=適用を開始する前)にここで弾く。
+    if _output_path_collides_with_source(path, output_path):
+        _print_output_collision_error(output_path)
+        return False
 
     # 手順2: フルオープン → 実ファイルとの突合 → delete閉包の展開 → 確認2。
     print("フルオープン中...", flush=True)
@@ -210,8 +379,8 @@ def _run_apply(scan: ScanResult, session: CuiSession, path: str, output: str | N
     print(f"フルオープン完了: {time.monotonic() - t0:.1f}秒")
 
     if not _preview_and_confirm2(ifc_file, operations):
-        print("中断しました。ファイルは変更されていません。")
-        return
+        print(_exit_message(already_written))
+        return False
 
     # 手順3: 適用(進捗は間引いて表示)→ 結果表示。source_nameは入力ファイル名を
     # 明示的に渡す(CUI Phase2 Task1: apply_operationsにはfileオブジェクトを渡す
@@ -225,6 +394,148 @@ def _run_apply(scan: ScanResult, session: CuiSession, path: str, output: str | N
         source_name=Path(path).name,
     )
     _print_report(report)
+    return True
+
+
+def _run_text_apply(
+    path: str,
+    output: str | None,
+    output_path: str,
+    intents: list[Intent],
+    *,
+    already_written: bool = False,
+) -> tuple[bool, bool]:
+    """テキストモード経路(cui-design.md §8、CUI Phase3 Task5 監督者裁定4)。
+
+    already_written: `_run_apply` の同名引数の意味と同じ(M5(ii)、フェーズ
+    最終レビュー)。このルート単体の確認2で no と答えた際の中断メッセージが、
+    セッション全体として見て事実に反することがないよう `_exit_message` に渡す。
+
+    手順: (i) 参照グラフスキャン(所要秒数を表示。手順2の「フルオープン中...」
+    表示と同じ流儀) → (ii) `compute_text_delete_plan` → (iii) 確認2
+    (statsを人間可読に表示してから確認) → (iv) 出力ファイル名プロンプト
+    (手順1bと完全に同一規約、`_maybe_prompt_output_filename` を再利用) →
+    (v) `rewrite_without`(進捗は既存プリンタを再利用) → (vi) 結果表示。
+
+    `ifcopenshell.open` は一度も呼ばない(このフェーズの存在意義、監督者裁定8)。
+
+    戻り値: `(handled, wrote)` の2値タプル(M5(ii)、フェーズ最終レビューで
+    `wrote` を追加——`_run_apply`/`run()` がファイル書き込みの有無を正確に
+    追跡できるようにするため。呼び出し元の解釈は監督者裁定4/5から不変)。
+    - `handled`: True ならこのルートで完結した(呼び出し元はそのまま
+      `return wrote` する。出力を書いて完了した場合、確認2で no と答えて
+      中断した場合、C1の同一パスガードで中断した場合のいずれもTrue)。
+      False は監督者裁定5(seeds==0: 指定クラスが参照グラフ上で1件も見つから
+      ない)によるフルオープン経路へのフォールバックを意味し、呼び出し元は
+      確認1以降へそのまま処理を続ける(黙って出力を書くと「削除したつもりで
+      中身が元と同じファイル」という最も危険な失敗モードになるため、この
+      ケースだけは出力を一切書かずに戻る。`wrote` は常にFalse)。
+    - `wrote`: `handled`がTrueのときのみ意味を持つ。実際に `rewrite_without`
+      が出力ファイルへの書き込みを完了したときだけTrue(確認2のno・C1の
+      同一パスガードでの中断はいずれも書き込み前の中断なのでFalse)。
+    """
+    print("参照グラフスキャン中...", flush=True)
+    t0 = time.monotonic()
+    graph = scan_full_graph(path)
+    print(f"参照グラフスキャン完了: {time.monotonic() - t0:.1f}秒")
+
+    delete_classes = [i.ifc_class for i in intents if i.op == "delete"]
+    plan = compute_text_delete_plan(graph, delete_classes)
+
+    if plan.stats["seeds"] == 0:
+        print(
+            "指定クラスが参照グラフ上で見つかりませんでした。"
+            "従来のフルオープン経路にフォールバックします。"
+        )
+        return False, False
+
+    # 手順(iii): 確認2(statsを人間可読に表示。監督者裁定4)。
+    #
+    # I2(Important、フェーズ最終レビュー): ここで分かる数値はいずれも
+    # plan(rewrite_without実行前の見積り)由来であり、実行結果
+    # (RewriteReport、_print_rewrite_report)とは意味が異なる。ラベルは
+    # plan.py の docstring が定義する正確な意味に合わせて正直化する:
+    # - drop_ids.size は「この時点で確定している」削除レコード数の下限
+    #   であり、rels_patched の候補のうち実行時にレコードごと削除へ確定した
+    #   分だけ、実際の削除レコード総数はこれより増え得る(patch.pyの規則
+    #   3/4はレコードのテキスト解析が要るため、Task2(plan.py)の時点では
+    #   まだ確定しない)。
+    # - rels_patched は「参照リスト修正 or レコードごと削除」の**候補**数
+    #   であり、その内訳(何件が実際にpatchされ、何件がdropされたか)は
+    #   rewrite_without実行後にしか確定しない。
+    # - rels_dropped(plan.py側の意味: カスケード/sweepで死んだ関係レコード
+    #   数)は上のdrop_ids.sizeに**既に含まれている**内訳であり、実行時に
+    #   追加で削除される件数(patch候補の一部がdropされる分)とは別物
+    #   なので、その旨を明記して内訳行に統合する(誤読を招く独立行としては
+    #   出さない)。
+    # N3(フェーズ最終レビューの再審): 下限だけの表示では隠れている差の
+    # 大きさが伝わらない(small.ifc/IfcDuctSilencer の実測では下限220件に対し
+    # 実際は572件=+160%)。厳密な上限は「確定分 + patch候補の全件がレコード
+    # ごと削除に倒れた場合」なので、追加パス無しで計算できる。下限と上限を
+    # 併記してユーザーが結果をブラケットできるようにする。
+    print("=== テキストモード適用内容(参照グラフスキャン結果) ===")
+    print(
+        f"削除レコード数(見積り): {int(plan.drop_ids.size)}〜"
+        f"{int(plan.drop_ids.size) + plan.stats['rels_patched']}件"
+        "(確定分〜参照リスト修正候補が全件レコードごと削除になった場合)"
+    )
+    print(
+        f"  内訳: 直接指定{plan.stats['seeds']}件 + 連鎖{plan.stats['cascade']}件"
+        f" + 専有回収{plan.stats['swept']}件"
+        f"(うち関係レコードの連鎖削除{plan.stats['rels_dropped']}件を含む)"
+    )
+    print(
+        "参照リスト修正候補(rel patch候補、実行時に「参照リスト修正」または"
+        f"「レコードごと削除」のいずれかに確定します): {plan.stats['rels_patched']}件"
+    )
+    print("  内訳(何件が修正され何件が削除されたか)は実行後の結果表示で確定します。")
+    if not _confirm("実行しますか? (y/N): "):
+        print(_exit_message(already_written))
+        return True, False
+
+    # 手順(iv): 出力ファイル名プロンプト(1bと完全に同一規約)。
+    output_path = _maybe_prompt_output_filename(path, output, output_path)
+
+    # C1(Critical、フェーズ最終レビュー): 出力先=入力先だと rewrite_without が
+    # 出力ファイルを開いた瞬間に入力をtruncateしてしまう(ライブラリ層にも
+    # 同じガードがあるが、UI層でも早期に検出してフルオープン経路と同じ
+    # エラー表示に揃える)。
+    if _output_path_collides_with_source(path, output_path):
+        _print_output_collision_error(output_path)
+        return True, False
+
+    # 手順(v): ストリーム書き換え(ifcopenshellを一度も開かない)。
+    #
+    # 監督者裁定6: records_in は壊れたレコードを含むため graph.record_count を
+    # 超え得る(= 最終発火が done==total にならず、進捗プリンタが最終行を改行で
+    # 確定しないことがある)。最後に転送した (done, total) を覚えておき、
+    # 未確定のときだけ改行する(無条件に print() すると通常ケースで空行が
+    # 1行余る。プリンタ側の間引き条件(_PROGRESS_STRIDE)をここで再実装しない
+    # ため、改行の有無は「最終発火が done==total だったか」だけで判定する
+    # ——プリンタが改行するのはその条件のときだけ)。
+    printer = _make_progress_printer()
+    last_fired = {"done": 0, "total": 0}
+
+    def _tracked_progress(stage: str, done: int, total: int) -> None:
+        last_fired["done"] = done
+        last_fired["total"] = total
+        printer(stage, done, total)
+
+    report = rewrite_without(
+        path,
+        output_path,
+        plan,
+        graph,
+        source_name=Path(path).name,
+        progress=_tracked_progress,
+    )
+    if last_fired["done"] != last_fired["total"]:
+        print()
+
+    # 手順(vi): 結果表示(_print_report は ExportReport 専用のため流用しない。
+    # 監督者裁定7)。
+    _print_rewrite_report(report, output_path)
+    return True, True
 
 
 def _preview_and_confirm2(ifc_file, operations) -> bool:
@@ -297,6 +608,17 @@ def _print_report(report: ExportReport) -> None:
         size = None
     if size is not None:
         print(f"出力サイズ: {size:,} bytes")
+
+
+def _print_rewrite_report(report: RewriteReport, output_path: str) -> None:
+    """テキストモード経路の結果表示(CUI Phase3 Task5 監督者裁定7: `_print_report`
+    は `ExportReport` 専用のため流用しない)。"""
+    print("=== 完了(テキストモード) ===")
+    print(f"出力ファイル: {output_path}")
+    print(f"削除レコード数: {report.records_dropped}")
+    print(f"パッチ済みrel件数: {report.rels_patched}")
+    print(f"dropされたrel件数: {report.rels_dropped}")
+    print(f"出力サイズ: {report.bytes_out:,} bytes")
 
 
 def _make_progress_printer() -> Callable[[str, int, int], None]:

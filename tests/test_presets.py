@@ -16,6 +16,7 @@ from ifc_occam.core.ops import (
 from ifc_occam.core.presets import (
     Preset,
     PresetRule,
+    delete_preset,
     load_presets,
     presets_from_json,
     presets_to_json,
@@ -167,6 +168,47 @@ def test_save_and_load_presets_roundtrip(tmp_path):
     assert not raw.startswith(b"\xef\xbb\xbf")
     text = raw.decode("utf-8")
     assert "什器" in text
+
+
+# --- delete_preset (GUI改修Task6: 削除API) -----------------------------------
+
+
+def test_delete_preset_removes_named_preset_and_persists(tmp_path):
+    path = tmp_path / "presets.json"
+    save_presets(path, [Preset("a", "dA", []), Preset("b", "dB", [])])
+
+    result = delete_preset(path, "a")
+
+    assert result == [Preset("b", "dB", [])]
+    # ファイルにも反映されている(保存まで行う)こと
+    assert load_presets(path) == [Preset("b", "dB", [])]
+
+
+def test_delete_preset_unknown_name_returns_unchanged_list(tmp_path):
+    path = tmp_path / "presets.json"
+    save_presets(path, [Preset("a", "dA", [])])
+
+    result = delete_preset(path, "存在しない名前")
+
+    assert result == [Preset("a", "dA", [])]
+    assert load_presets(path) == [Preset("a", "dA", [])]
+
+
+def test_delete_preset_missing_file_returns_empty_list(tmp_path):
+    path = tmp_path / "no_such_presets.json"
+
+    result = delete_preset(path, "x")
+
+    assert result == []
+
+
+def test_delete_preset_supports_japanese_name_with_spaces_and_slash(tmp_path):
+    path = tmp_path / "presets.json"
+    save_presets(path, [Preset("テスト プリセット/名前", "d", []), Preset("keep", "d", [])])
+
+    result = delete_preset(path, "テスト プリセット/名前")
+
+    assert result == [Preset("keep", "d", [])]
 
 
 # --- web/preset-samples.json の整合性 -----------------------------------------

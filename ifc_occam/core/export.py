@@ -19,7 +19,6 @@ keep vs 連鎖削除の優先順位 (Final Review Fix2, design.md §4.5参照):
 
 from __future__ import annotations
 
-import datetime
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,6 +37,8 @@ from ifc_occam.core.consolidate import consolidate_duplicates
 from ifc_occam.core.duplicates import find_duplicates
 from ifc_occam.core.extract import extract_model
 from ifc_occam.core.ops import Operation, resolve_effective, validate_operations
+from ifc_occam.core.paths import refers_to_same_file
+from ifc_occam.core.provenance import build_provenance_lines
 from ifc_occam.core.simplify import (
     bbox_mesh,
     convex_hull_mesh,
@@ -57,7 +58,7 @@ _MASS_DELETE_THRESHOLD = 1000
 
 delete closure確定後の対象件数がこの値を**超えたら**(>、以下は非発動)
 ifcopenshell.util.element.batch_remove_deep2/unbatch_remove_deep2 経路を使う。
-Stage Aベンチ(cui-task-7-report.md, docs/cui-measurements.md)で(a)per-remove
+Stage Aベンチ(docs/plans/2026-07-24-cui-phase1.md Task 7, docs/cui-measurements.md)で(a)per-remove
 に対し17〜26%短縮・正当性(verify_no_dangling/GlobalId保存)は全項目パスした
 採用方式。"""
 
@@ -242,7 +243,7 @@ def _mass_delete(
     _delete_loop(既存の削除ループ本体、ロジック不変)を包む。batch_remove_deep2
     は remove_deep2 が辿る副次的なサブグラフ(OwnerHistory/ObjectPlacement等)の
     実削除を遅延させ、unbatch_remove_deep2 が1回の文字列シリアライズ+再パースで
-    まとめて確定する(Stage A実測で(a)比17〜26%短縮、cui-task-7-report.md参照)。
+    まとめて確定する(Stage A実測で(a)比17〜26%短縮、docs/plans/2026-07-24-cui-phase1.md Task 7 参照)。
 
     重要な制約: unbatch_remove_deep2 は**新しい** ifcopenshell.file を返す
     (文字列再パース由来。トランザクション履歴は失われ、呼び出し前の要素ハンドルは
@@ -386,17 +387,16 @@ def _stamp_provenance(
     ローカル値(apply_operations の `deleted`/`simplified` の件数)を渡すこと。
     書込前(ExportReport構築前)に呼ぶため、ExportReportそのものは参照できない。
 
-    刻印文字列はASCIIのみ(STEPヘッダのエンコーディング事故防止)。source_name
-    (ファイル名)自体がASCII外を含む場合はifcopenshellの標準STEPエスケープ
-    (\\X2\\...\\X0\\)に委ねる(このモジュールでの追加エスケープ処理は行わない)。
+    刻印文字列の生成自体は `core/provenance.py:build_provenance_lines` に
+    切り出し済み(CUI Phase3 Task4、監督者裁定1: textops側がこの重量モジュール
+    (ifcopenshell.geom 等を import する)を import せずに同じ文言を共用できる
+    ようにするための抽出。挙動変更ゼロ——`tests/test_export.py` の刻印テスト群を
+    1行も変更せずに green のままであることで証明済み)。本関数はそのヘルパーを
+    呼び、ifcopenshell の header setter に生の文字列を渡すだけになった
+    (STEPエスケープはifcopenshellに委ねる。source_name自体がASCII外を含む
+    場合もifcopenshellの標準STEPエスケープ(\\X2\\...\\X0\\)がそのまま効く)。
     """
-    today = datetime.date.today().isoformat()
-    stamp_lines = (
-        f"Lightweighted by IFC Occam {__version__} on {today}"
-        " - non-authoritative derivative; verify against the source model",
-        f"Source: {source_name}",
-        f"Deleted {deleted_count} elements (incl. cascade); simplified {simplified_count}",
-    )
+    stamp_lines = build_provenance_lines(source_name, deleted_count, simplified_count)
     header = ifc_file.header
     header.file_description.description = (
         tuple(header.file_description.description) + stamp_lines
@@ -453,6 +453,24 @@ def apply_operations(
     is_file_src = isinstance(src, ifcopenshell.file)
     if source_name is None:
         source_name = "(in-memory)" if is_file_src else Path(src).name
+
+    # 出力先=入力先の禁止(原本非破壊の契約。C1の水平展開)。src がパスのときだけ
+    # 判定できる(file オブジェクト渡しには比較対象の元パスが無い——その経路
+    # (CUI)は repl 側の UI ガードが塞ぐ)。フルオープン経路は全体をメモリに
+    # 読んでから書くため truncate はしないが、原本を軽量化結果で上書きするのは
+    # 同じく契約違反なので、フルオープン/テキストの両経路で同じ判定器
+    # (core/paths.refers_to_same_file)を使って拒否する。
+    #
+    # 位置: **フルオープンより前**。ここで弾かないと、数十秒〜数分かけて開いて
+    # 削除・簡略化まで終えた後に write 直前で落ちることになる(GUI では
+    # export スレッドが失敗として報告するだけで、費用は丸ごと無駄になる)。
+    # resolve_output_path は純粋関数なので、この事前判定と後段の実際の解決で
+    # 2回呼んでも副作用はない。
+    if not is_file_src and refers_to_same_file(src, resolve_output_path(src, output_path)):
+        raise ValueError(
+            f"出力先が入力ファイルと同一です: {output_path} "
+            "(原本非破壊のため拒否しました。別のファイル名を指定してください)"
+        )
 
     t0 = time.monotonic()
     ifc_file = src if is_file_src else ifcopenshell.open(str(src))

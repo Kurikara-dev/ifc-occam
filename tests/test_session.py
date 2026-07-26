@@ -1,4 +1,4 @@
-"""cui/session.py(対話セッション・純粋ロジック層)のTDD (cui-design.md §6、task-4-brief.md)。
+"""cui/session.py(対話セッション・純粋ロジック層)のTDD (cui-design.md §6、docs/plans/2026-07-24-cui-phase1.md Task 4)。
 
 `CuiSession` は軽量スキャン結果(`ScanResult`)を受け取り、対話コマンド文字列を
 解釈してクラス単位の操作意図(`Intent`)を管理する。stdin/stdout・ファイルI/O・
@@ -203,7 +203,7 @@ def test_class_matching_is_case_insensitive_for_mixed_case_too():
 
 
 # --- 4b. 不明クラス: 前方一致候補が_CANDIDATE_LIMIT件を超える場合の切断表示
-# (持ち越しMinor #1 / 最終レビューM2、task-3-brief.md 同梱要件) ---
+# (持ち越しMinor #1 / 最終レビューM2、docs/plans/2026-07-25-cui-phase2.md Task 3 同梱要件) ---
 
 
 def test_unknown_class_error_appends_overflow_notice_when_candidates_exceed_limit():
@@ -355,7 +355,7 @@ def test_list_command_returns_same_string_as_render_intents():
     assert session.command("list") == session.render_intents()
 
 
-# --- 7b. list の操作ラベルは日本語(監督者確定要件2、cui-task-6-brief.md) ---
+# --- 7b. list の操作ラベルは日本語(監督者確定要件2、docs/plans/2026-07-24-cui-phase1.md Task 6) ---
 #
 # _op_label は要件定義§5のモック(「削除」「間引き 0.3」等)に合わせて日本語ラベルを
 # 返す。bbox/hull は _SET_OP_LABELS の既存語彙(bbox軽量化/凸包化)と揃える
@@ -426,7 +426,7 @@ def test_render_ranking_handles_empty_scan_without_crashing():
     assert isinstance(rendered, str)
 
 
-# --- 8b. rank: proxy 名称内訳セクション (task-3-brief.md、docs/cui-measurements.md
+# --- 8b. rank: proxy 名称内訳セクション (docs/plans/2026-07-25-cui-phase2.md Task 3、docs/cui-measurements.md
 # 「Task 8」章の実測に基づく機能追加) ---
 
 

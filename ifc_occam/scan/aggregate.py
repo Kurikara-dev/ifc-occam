@@ -13,11 +13,11 @@ weighted の3バケツ。ブロッククラスは意図的に不在)を受け取
    `ids`(全idの空間)上のインデックスに解決する(解決できない場合は `-1`。
    ブロッククラスは`RawScan`に存在しないため、そこへの参照は必ず解決不能=
    重み0として扱う、という設計上の意図的な挙動)。id→index の Python dict は
-   一切構築しない(cui-design.md §4 手順1、task-3-brief.mdの明示指定)。
+   一切構築しない(cui-design.md §4 手順1、docs/plans/2026-07-24-cui-phase1.md Task 3 の明示指定)。
    製品同定・proxy_names 等、`entities`(全体の一部)だけを対象にする小さい
    Python set/dict はこの「idテーブル全体のdict化禁止」とは別物として許容する
-   (`entities` は大きいファイルでも全体の一部、cui-task-2-report.mdの実測では
-   large.ifcで約11.3%)。
+   (`entities` は大きいファイルでも全体の一部、docs/plans/2026-07-24-cui-phase1.md
+   Task 2 の実測では large.ifcで約11.3%)。
 
 2. **製品の同定**: `IFCPRODUCTDEFINITIONSHAPE` の entity_id 集合を作り、
    `entities` のうち refs がその集合と交差するものを「製品」とする
@@ -31,8 +31,8 @@ weighted の3バケツ。ブロッククラスは意図的に不在)を受け取
    二重に加算してしまう**(例: 製品→{A,B}→共有フェース、という構造で
    w(製品)=w(A)+w(B) を単純合算すると共有フェースの重みが2回加算される。
    これは「共有形状を2製品が参照→expandedは2倍」という設計の要求とは
-   別物で、task-3-brief.md が明示的に要求する「ダイヤモンド参照で二重加算
-   しない」と真正面から矛盾する)。
+   別物で、docs/plans/2026-07-24-cui-phase1.md Task 3 が明示的に要求する
+   「ダイヤモンド参照で二重加算しない」と真正面から矛盾する)。
 
    このモジュールは矛盾を、**「製品ごとに独立した到達集合ベースの走査」**で
    解決する: 各製品について明示スタックで到達可能な全ノードを走査し、
@@ -60,7 +60,7 @@ weighted の3バケツ。ブロッククラスは意図的に不在)を受け取
    メモ化する、といった追加の工夫が必要になる)。
 
    `refs` タプル自体の重複(parserは重複除去しない設計、
-   cui-task-2-report.md参照)は、CSR構築時に各エンティティの refs を
+   docs/plans/2026-07-24-cui-phase1.md Task 2 参照)は、CSR構築時に各エンティティの refs を
    `sorted(set(...))` してから解決する(同じ理由: 1エンティティの直接refs
    内の重複がそのまま二重加算にならないようにする、上記ダイヤモンド対応の
    一部)。
@@ -92,7 +92,7 @@ weighted の3バケツ。ブロッククラスは意図的に不在)を受け取
    (Name が正規表現 `^【([^】]*)】` に一致する場合は「【カテゴリ】」部分
    (接頭辞全体、括弧含む)、一致しない場合は Name 全体)の頻度上位20件
    (`Counter.most_common`)。Name が空文字列/None の製品は数えない
-   (task-3-brief.md)。
+   (docs/plans/2026-07-25-cui-phase2.md Task 3)。
    集計キーをタグ接頭辞方式にした根拠(Task 8実測、docs/cui-measurements.md
    「Task 8」章「5. 鉄骨ファブ系の所見」): 実データのproxy Nameは連番付き
    (例「【曲折円柱】曲折円柱 (1903)」)で、素朴なName完全一致の頻度集計では
@@ -142,7 +142,7 @@ _PDS_CLASS = "IFCPRODUCTDEFINITIONSHAPE"
 _PROXY_CLASS = "IFCBUILDINGELEMENTPROXY"
 _PROXY_NAME_TOP_N = 20
 
-#: proxy Name先頭の「【カテゴリ】」タグ接頭辞を検出する正規表現(task-3-brief.md)。
+#: proxy Name先頭の「【カテゴリ】」タグ接頭辞を検出する正規表現(docs/plans/2026-07-25-cui-phase2.md Task 3)。
 #: 実データ(docs/cui-measurements.md「Task 8」章)では個体ごとに連番("ST-001"等)が
 #: 付き素朴なName完全一致集計は無力だが、この接頭辞(括弧含む全体、group(0))での
 #: 集計は同一カテゴリの個体を束ねる。
@@ -197,7 +197,7 @@ class _Graph:
     # searchsortedする(旧 raw_id_to_full_index の dict[int,int] は
     # large.ifcで実測21.8MB消費し、モジュールdocstring §1の
     # 「id→indexのPython dictは一切構築しない」規則に反していたため撤去。
-    # cui-task-4-brief.md 前段修正)。
+    # docs/plans/2026-07-24-cui-phase1.md Task 4 前段修正)。
 
 
 @dataclass(slots=True)
@@ -282,7 +282,7 @@ def _build_graph(raw: RawScan) -> _Graph:
 
 def _resolve_full_indices(raw_ids: np.ndarray, graph: _Graph) -> np.ndarray:
     """製品の raw_id 配列を `graph.ids`(全id空間、昇順)上のフルインデックス配列に
-    一括解決する(cui-task-4-brief.md 前段修正: 旧 `raw_id_to_full_index` dict の
+    一括解決する(docs/plans/2026-07-24-cui-phase1.md Task 4 前段修正: 旧 `raw_id_to_full_index` dict の
     置換。`_build_graph` 内の参照解決(L238-241相当)と同じ
     searchsorted+clamp+等値チェックのパターンを使う)。
 
@@ -362,7 +362,7 @@ def _identify_products(entities: list[ScanEntity]) -> list[_Product]:
 
 
 def _proxy_name_key(name: str) -> str:
-    """proxy Name の集計キーを決定する(task-3-brief.md)。
+    """proxy Name の集計キーを決定する(docs/plans/2026-07-25-cui-phase2.md Task 3)。
 
     先頭が `【カテゴリ】` 形式のタグ接頭辞なら接頭辞全体(括弧含む、
     `_PROXY_TAG_PREFIX_RE` の group(0))をキーにする。それ以外は Name 全体を
@@ -392,7 +392,7 @@ def aggregate_scan(raw: RawScan, *, path: str | Path, file_size: int) -> ScanRes
     products = _identify_products(raw.entities)
 
     # 両パスで使う製品→フルインデックスの解決を、パス開始前に一括で行う
-    # (cui-task-4-brief.md 前段修正: 製品ごとのdictルックアップをベクトル化し、
+    # (docs/plans/2026-07-24-cui-phase1.md Task 4 前段修正: 製品ごとのdictルックアップをベクトル化し、
     # 2パス分をまとめて1回のsearchsortedで済ませる)。
     product_raw_ids = np.fromiter(
         (p.raw_id for p in products), dtype=np.int64, count=len(products)

@@ -93,6 +93,10 @@ def main(argv: list[str] | None = None) -> None:
         "--scan-only", action="store_true",
         help="軽量スキャンとランキング表示のみ行い、対話ループに入らず終了する",
     )
+    cui_parser.add_argument(
+        "--text", action="store_true",
+        help="delete のみの操作ならテキストモード(フルオープン不要)を提案する",
+    )
 
     args = parser.parse_args(argv)
 
@@ -104,7 +108,11 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "serve":
         _serve(port=args.port, open_browser=not args.no_browser)
     elif args.command == "cui":
-        run_cui(args.path, output=args.output, scan_only=args.scan_only)
+        # --text は docs/plans/2026-07-25-cui-phase3.md Task5 で追加した新フラグ。
+        # output/scan_only と同じく値に関わらず常に渡す(3フラグを対称に扱う)。
+        run_cui(
+            args.path, output=args.output, scan_only=args.scan_only, text=args.text
+        )
 
 
 def _find_free_port(start: int, host: str = "127.0.0.1", tries: int = 20) -> int:

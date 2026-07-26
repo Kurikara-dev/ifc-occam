@@ -1,5 +1,5 @@
 """scan/pipeline.py の scan_records(バルク走査経路)のTDD
-(監督者指示の性能最適化。cui-task-2-report.md「## 最適化ラウンド」)。
+(監督者指示の性能最適化。docs/plans/2026-07-24-cui-phase1.md Task 2)。
 
 scan_records(path) -> RawScan は、reader.iter_records を1回だけ回し、
 レコードごとに安価なヘッダ(id/クラス名)抽出だけを行った上でカテゴリ
@@ -301,7 +301,7 @@ def _build_perf_mix_body(min_size: int) -> bytes:
     似せた比率の合成STEP本体を、min_sizeバイトに達するまで繰り返し生成する。
 
     block区分には2つの負荷特性が混在することが実測(large.ifcのgrep調査、
-    cui-task-2-report.md「## 最適化ラウンド」参照)で分かっている:
+    docs/plans/2026-07-24-cui-phase1.md Task 2 参照)で分かっている:
     (a) 第1属性がGUID形でない素朴なblock(IFCCARTESIANPOINT等。旧経路でも
     GUIDゲートが速く失敗するので差は小さい)、(b) IFCPROPERTYSETのように
     IfcRoot系で実際に22文字のGlobalIdを持つblock(旧経路はゲート成立後に
@@ -345,7 +345,7 @@ def test_scan_records_beats_full_parse_on_block_heavy_data(tmp_path):
     回帰ガード。絶対MB/sではなく同一データ上の比率で判定するため実行環境の
     CPU速度差に対してフレーキーにならない。
 
-    フロア値についての重要な注記(cui-task-2-report.md「## 最適化ラウンド」
+    フロア値についての重要な注記(docs/plans/2026-07-24-cui-phase1.md Task 2
     に詳細): タスクブリーフは「3倍以上」を指定していたが、実測調査
     (large.ifc実データでの前後比較、および複数の合成比率での比較)により
     3倍は本アーキテクチャでは到達不能と判明した。理由: 除去できるのは
@@ -405,8 +405,8 @@ def test_scan_records_beats_full_parse_on_block_heavy_data(tmp_path):
 
 def test_large_ifc_scan_records_throughput_and_sanity(large_ifc_path):
     """large.ifc で reader+scan_records を通した実測を報告する(監督者目標:
-    end-to-end >=15MB/s、stretch 20MB/s。cui-task-2-report.md「## 最適化
-    ラウンド」に前後比較を記載)。
+    end-to-end >=15MB/s、stretch 20MB/s。docs/plans/2026-07-24-cui-phase1.md
+    Task 2 に前後比較を記載)。
 
     reader.py単体(30.4MB/s)には及ばないはずだが、旧経路(全レコードを
     parse_recordにかける、5-6MB/s)からの構造的な改善を検証する。CI/実行

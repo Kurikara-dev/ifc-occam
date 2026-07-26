@@ -31,9 +31,20 @@ from ifc_occam.core.diagnose import aggregate_by_class
 from ifc_occam.core.duplicates import find_duplicates
 from ifc_occam.core.export import apply_operations
 from ifc_occam.core.extract import extract_model
+from ifc_occam.core.layers import aggregate_by_layer
 from ifc_occam.core.ops import Operation, resolve_effective, validate_operations
-from ifc_occam.core.presets import Preset, PresetRule, load_presets, resolve_preset, save_presets
+from ifc_occam.core.presets import (
+    Preset,
+    PresetRule,
+    delete_preset,
+    load_presets,
+    resolve_preset,
+    save_presets,
+)
 from ifc_occam.core.simplify import count_shared_elements, get_shared_element_gids
+from ifc_occam.cui.repl import _FULLOPEN_WARN_BYTES
+from ifc_occam.scan.aggregate import FULLOPEN_BYTES_MULTIPLIER
+from ifc_occam.server.files import list_directory, resolve_within_root
 from ifc_occam.server.meshpack import build_mesh_payload
 from ifc_occam.server.state import AppState
 
@@ -48,6 +59,23 @@ logger = logging.getLogger(__name__)
 # presets.json の既定パス(サーバ起動時のcwd相対、プロジェクトルート想定)。
 # テストは create_app(presets_path=...) で tmp_path に注入して差し替える。
 DEFAULT_PRESETS_PATH = Path("presets.json")
+
+# ファイル選択ダイアログ(GET /api/files)で表示する拡張子(大小文字は
+# ifc_occam.server.files.list_directory 側で無視して比較する)。
+FILE_LIST_SUFFIXES: tuple[str, ...] = (".ifc",)
+
+# GET /api/config の load_estimate。実測2点(small.ifc 21.5MB→45秒、
+# large.ifc 102MB→103秒)から出した一次式の係数(監督者裁定4)。
+# sec_per_mb/base_sec は secMid = base_sec + sec_per_mb * MB の係数、
+# band_low/band_high は secMid に掛けて幅を作る係数。この値は開発機の
+# CPU性能に依らない一次近似であり、遅い実行環境で推定より長くかかっても
+# 係数側を調整しない(実測環境そのものが定格より遅いだけであるため)。
+LOAD_ESTIMATE_CONFIG = {
+    "sec_per_mb": 0.72,
+    "base_sec": 30.0,
+    "band_low": 0.5,
+    "band_high": 2.0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +202,22 @@ def _plain_int(value: object) -> object:
     return value
 
 
+def _dataclass_dict_plain_int(obj) -> dict:
+    """dataclass インスタンスを、数値フィールドを素の int に変換した dict に直す。
+
+    ClassStats/LayerStats はフィールド構成が異なるだけで変換規則は同一なので、
+    この変換自体は共有する(集計ロジックの非共通化(aggregate_by_class/
+    aggregate_by_layer)とは別の話)。
+    """
+    return {k: _plain_int(v) for k, v in dataclasses.asdict(obj).items()}
+
+
 def _class_stats_dict(stats) -> dict:
-    return {k: _plain_int(v) for k, v in dataclasses.asdict(stats).items()}
+    return _dataclass_dict_plain_int(stats)
+
+
+def _layer_stats_dict(stats) -> dict:
+    return _dataclass_dict_plain_int(stats)
 
 
 def _element_gids_by_shape(model) -> dict[str, list[str]]:
@@ -197,6 +239,17 @@ def _unique_sorted_layers(model) -> list[str]:
     return sorted({e.layer for e in model.elements if e.layer is not None})
 
 
+def _layerless_element_count(model) -> int:
+    """layer(IfcPresentationLayerAssignment)が未設定の要素数。
+
+    aggregate_by_layer は layer=None の要素を結果から除外するため、その件数が
+    診断レスポンスから消えてしまう(監督者裁定2)。GUIでレイヤー別集計の合計が
+    全要素数に一致しないときに「集計が壊れている」と誤解されないよう、
+    別フィールドとして明示する。
+    """
+    return sum(1 for e in model.elements if e.layer is None)
+
+
 def _cascade_item_dict(item) -> dict:
     return {
         "global_id": item.global_id,
@@ -206,21 +259,74 @@ def _cascade_item_dict(item) -> dict:
     }
 
 
-def create_app(presets_path: str | Path | None = None) -> FastAPI:
+def create_app(presets_path: str | Path | None = None, root: Path | None = None) -> FastAPI:
     app = FastAPI()
     state = AppState()
     app.state.ifc_state = state
     app.state.presets_path = Path(presets_path) if presets_path is not None else DEFAULT_PRESETS_PATH
+    # ファイル一覧/読込パスの閉じ込め判定基準(監督者裁定1)。起動時に1回だけ
+    # resolve() して確定させ、以後変えない。root は既定でサーバのカレント
+    # ディレクトリ(Path.cwd())——テストは root=tmp_path で差し替える。
+    app.state.files_root = (root if root is not None else Path.cwd()).resolve()
 
     @app.post("/api/load", status_code=202)
     def load(body: LoadRequest):
+        # 監督者裁定6: ファイル選択ダイアログだけでなく手打ち欄からのパスも
+        # root外なら拒否する(ダイアログを塞いでも手打ち欄が素通しなら意味が
+        # 無い)。存在確認はしない(既存のFileNotFoundError経路
+        # (test_load_nonexistent_path_sets_error_state)は非同期のerror状態
+        # 遷移のままにする——ここでのチェックは閉じ込め判定のみ)。
+        try:
+            resolved_path = resolve_within_root(app.state.files_root, body.path)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
         if not state.begin_loading():
             return JSONResponse(
                 status_code=409, content={"detail": "load already in progress"}
             )
-        thread = threading.Thread(target=_run_load, args=(state, body.path), daemon=True)
+        thread = threading.Thread(
+            target=_run_load, args=(state, str(resolved_path)), daemon=True
+        )
         thread.start()
         return {"status": "loading"}
+
+    @app.get("/api/files")
+    def list_files(path: str = ""):
+        try:
+            result = list_directory(app.state.files_root, path, FILE_LIST_SUFFIXES)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        except FileNotFoundError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except OSError as exc:
+            # 読めないディレクトリ(権限拒否、OneDrive等のプレースホルダ、
+            # ネットワークドライブの一時不通、ウイルス対策ソフトのロック)。
+            # FileNotFoundError より後に置くこと——あちらも OSError の
+            # サブクラスなので、順序を逆にすると404が403に化ける。
+            # 捕まえずに落とすと 500 "Internal Server Error" になり、
+            # ダイアログにその英語がそのまま出る(Task 4 レビュー Important-1:
+            # レビュアが icacls で読み取り拒否したフォルダを作って再現した)。
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": (
+                        f"フォルダを読めませんでした(アクセス拒否またはI/Oエラー): "
+                        f"{path!r} ({exc.__class__.__name__})"
+                    )
+                },
+            )
+        return result
+
+    @app.get("/api/config")
+    def get_config():
+        # fullopen_bytes_multiplier/fullopen_warn_bytesはaggregate.py/repl.pyの
+        # 定数をそのまま返す(JS側への写経禁止。二重管理を避けるため)。
+        return {
+            "fullopen_bytes_multiplier": FULLOPEN_BYTES_MULTIPLIER,
+            "fullopen_warn_bytes": _FULLOPEN_WARN_BYTES,
+            "load_estimate": dict(LOAD_ESTIMATE_CONFIG),
+        }
 
     @app.get("/api/status")
     def status():
@@ -240,6 +346,7 @@ def create_app(presets_path: str | Path | None = None) -> FastAPI:
 
         total_triangles = sum(_plain_int(s.total_triangles) for s in stats)
         gids_by_shape = _element_gids_by_shape(model)
+        layer_stats = aggregate_by_layer(model)
         return {
             "schema": model.schema,
             "element_count": len(model.elements),
@@ -248,6 +355,8 @@ def create_app(presets_path: str | Path | None = None) -> FastAPI:
             "duplicate_groups": [_duplicate_group_dict(g, gids_by_shape) for g in groups],
             "warnings": list(warnings),
             "layers": _unique_sorted_layers(model),
+            "layer_stats": [_layer_stats_dict(s) for s in layer_stats],
+            "layerless_element_count": _layerless_element_count(model),
         }
 
     @app.get("/api/mesh")
@@ -388,6 +497,23 @@ def create_app(presets_path: str | Path | None = None) -> FastAPI:
         save_presets(app.state.presets_path, presets)
         return [p.to_dict() for p in presets]
 
+    @app.delete("/api/presets")
+    def delete_preset_endpoint(name: str):
+        # GUI改修Task6・監督者裁定4: 当初案の DELETE /api/presets/{name}
+        # (パスパラメータ)は、name に "/" を含む場合にStarletteのデフォルト
+        # コンバータ(単一セグメント、"/"非許容)がマッチせず404になる
+        # (ASGIサーバが%2Fを事前に生の"/"へデコードしてルーティングに渡すため)。
+        # そのためクエリパラメータ方式に変更した(GET /api/files?path=... と
+        # 同じhouse style)。name はFastAPIが自動でURLデコードするため、
+        # ここではデコード後の文字列とプリセット名を完全一致で比較するだけでよい。
+        presets = load_presets(app.state.presets_path)
+        if not any(p.name == name for p in presets):
+            return JSONResponse(
+                status_code=404, content={"detail": f"その名前の操作パターンはありません: {name!r}"}
+            )
+        remaining = delete_preset(app.state.presets_path, name)
+        return [p.to_dict() for p in remaining]
+
     @app.post("/api/presets/resolve")
     def resolve_presets_endpoint(body: PresetResolveRequest):
         ready = state.get_ready_snapshot()
@@ -399,7 +525,7 @@ def create_app(presets_path: str | Path | None = None) -> FastAPI:
         preset = next((p for p in presets if p.name == body.name), None)
         if preset is None:
             return JSONResponse(
-                status_code=404, content={"detail": f"unknown preset name: {body.name!r}"}
+                status_code=404, content={"detail": f"その名前の操作パターンはありません: {body.name!r}"}
             )
 
         results, warnings = resolve_preset(preset, model)

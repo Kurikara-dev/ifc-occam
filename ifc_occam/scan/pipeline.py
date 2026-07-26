@@ -1,6 +1,6 @@
 """レコード単位の `parse_record` を束ね、ファイル全体を一括で走査する
-バルクパス(監督者指示による性能最適化。cui-task-2-report.md 「## 最適化
-ラウンド」参照)。
+バルクパス(監督者指示による性能最適化。docs/plans/2026-07-24-cui-phase1.md
+Task 2 参照)。
 
 ## なぜ parser.py と別モジュールにしたか
 
@@ -13,7 +13,7 @@
 して再利用する(分類ロジックの単一の真実源を保つ。二重定義すると片方だけ
 改修され乖離するリスクがあるため)。`_match_header` は「どこまでが壊れた
 レコードか」の判定基準そのものを parse_record と共有するために
-parser.py 側に切り出した(cui-task-2-report.md 「## 最適化ラウンド」)。
+parser.py 側に切り出した(docs/plans/2026-07-24-cui-phase1.md Task 2)。
 reader.py の内部実装は(parser.py と同じ理由で)import しない —
 `iter_records` という公開契約のみに依存する。
 
@@ -64,7 +64,7 @@ __all__ = ["RawScan", "scan_records"]
 
 @dataclass(slots=True)
 class RawScan:
-    """`scan_records` の戻り値(cui-task-2-report.md 「## 最適化ラウンド」)。
+    """`scan_records` の戻り値(docs/plans/2026-07-24-cui-phase1.md Task 2)。
 
     class_counts: 全クラス(block含む)のレコード件数。
     face_ids: 単純frontier(IFCFACE/IFCFACESURFACE/IFCADVANCEDFACE、

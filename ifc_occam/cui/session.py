@@ -139,7 +139,7 @@ class CuiSession:
         cui-design.md §6)。
 
         末尾に proxy 名称内訳(`_render_proxy_name_breakdown`)を追記する
-        (task-3-brief.md)。`scan.proxy_names` が空の場合は何も追記せず、
+        (docs/plans/2026-07-25-cui-phase2.md Task 3)。`scan.proxy_names` が空の場合は何も追記せず、
         従来出力と完全一致する(後方互換)。
         """
         scan = self._scan
@@ -177,7 +177,7 @@ class CuiSession:
 
     @staticmethod
     def _render_proxy_name_breakdown(proxy_names: list[tuple[str, int]]) -> list[str]:
-        """rank末尾に追記する proxy 名称内訳セクションの行群(task-3-brief.md)。
+        """rank末尾に追記する proxy 名称内訳セクションの行群(docs/plans/2026-07-25-cui-phase2.md Task 3)。
 
         `proxy_names` が空なら空リストを返す(呼び出し側の出力を一切変えない
         = 従来出力との完全一致を保つ)。非空なら見出し1行 +
@@ -217,7 +217,7 @@ class CuiSession:
 
     @staticmethod
     def _op_label(intent: Intent) -> str:
-        """list 表示用の操作ラベル(日本語、cui-task-6-brief.md 監督者確定要件2)。
+        """list 表示用の操作ラベル(日本語、docs/plans/2026-07-24-cui-phase1.md Task 6 監督者確定要件2)。
 
         要件定義§5の list モック例(「削除」「間引き 0.3」等)に合わせる。
         delete/bbox/hull は _SET_OP_LABELS の既存語彙(削除/bbox軽量化/凸包化)を
@@ -244,7 +244,7 @@ class CuiSession:
         """不明クラスのエラーメッセージ。前方一致候補を最大 `_CANDIDATE_LIMIT`
         件まで提示する。候補がそれを超える場合は切断していることが分かるよう
         末尾に `...他N件`(N=超過件数)を付す(持ち越しMinor #1 / 最終レビュー
-        M2、task-3-brief.md 同梱要件)。"""
+        M2、docs/plans/2026-07-25-cui-phase2.md Task 3 同梱要件)。"""
         cls = raw.upper()
         candidates = sorted(c for c in self._element_counts if c.startswith(cls))
         if candidates:

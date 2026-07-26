@@ -62,28 +62,36 @@ export class SelectionModel {
   }
 
   /**
-   * 指定クラスの全要素を選択する(既存選択は置き換える)。
-   * @param {string} cls
-   * @param {Array<object>} elements meta.elements
+   * 指定したglobal_id集合を既存選択に追加する(既存選択は保持したまま増やす)。
+   * selectByGidsと同じ既知gid判定方式で、elements(meta.elements)に存在しない
+   * gidは黙って除外する(未知gidを含めて渡してもエラーにはしない)。すでに
+   * 選択済みのgidを追加してもSetの性質上重複はしない。
+   * GUI改修 Task2: 一覧行のShift+クリック(選択に追加)で使う。
+   * @param {Iterable<string>} gids
+   * @param {Array<object>} elements meta.elements(既知gid判定用)
    */
-  selectByClass(cls, elements) {
-    const next = new Set();
-    for (const el of elements) {
-      if (el.ifc_class === cls) next.add(el.global_id);
+  addGids(gids, elements) {
+    const known = new Set(elements.map((el) => el.global_id));
+    const next = new Set(this._selected);
+    for (const gid of gids) {
+      if (known.has(gid)) next.add(gid);
     }
     this._selected = next;
     this._emit();
   }
 
   /**
-   * 指定レイヤーの全要素を選択する(既存選択は置き換える)。
-   * @param {string} layer
-   * @param {Array<object>} elements meta.elements
+   * 指定したglobal_id集合を既存選択から除外する(既存選択のうち該当gidのみ
+   * 外す。他は変えない)。選択に含まれていないgidを渡しても何も起きない
+   * (Set.deleteは存在しないキーに対しても安全)。addGidsと異なりelementsに
+   * よる既知gid判定は不要(選択されていないgidの除外は常に無害)。
+   * GUI改修 Task2: 一覧行のCtrl/Cmd+クリック(選択から除外)で使う。
+   * @param {Iterable<string>} gids
    */
-  selectByLayer(layer, elements) {
-    const next = new Set();
-    for (const el of elements) {
-      if (el.layer === layer) next.add(el.global_id);
+  removeGids(gids) {
+    const next = new Set(this._selected);
+    for (const gid of gids) {
+      next.delete(gid);
     }
     this._selected = next;
     this._emit();

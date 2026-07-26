@@ -11,27 +11,44 @@ import {
   startExport,
   fetchPresets,
   postPresets,
+  deletePreset,
   resolvePreset,
+  fetchFileList,
+  fetchConfig,
 } from "./api.js";
-import { initViewer, classColor } from "./viewer.js";
+import { initViewer, shouldOutline, isClickNotDrag, shouldDim } from "./viewer.js";
 import { SelectionModel, triangleToElement } from "./selection.js";
-import { OperationList, resolveEffective, statusColor } from "./operations.js";
+import { OperationList, resolveEffective } from "./operations.js";
+import { renderDataTable, readClickMode } from "./datatable.js";
+import {
+  openFileDialog,
+  isSameRootRelativePath,
+  SAME_AS_SOURCE_MESSAGE,
+} from "./filedialog.js";
+import { estimateLoad, formatDuration, formatBytes } from "./estimate.js";
+import { roundToNiceStep, buildStage } from "./stage.js";
+import * as THREE from "./vendor/three.module.js"; // ?selftest=1でbuildStageにTHREE.Box3を渡すためだけに使う。
 
 const canvas = document.getElementById("canvas");
+const filePickButton = document.getElementById("file-pick-button");
+const selectedPathDisplay = document.getElementById("selected-path");
+const manualPathToggle = document.getElementById("manual-path-toggle");
+const manualPathRow = document.getElementById("manual-path-row");
 const pathInput = document.getElementById("path-input");
 const loadButton = document.getElementById("load-button");
 const statusLine = document.getElementById("status-line");
+const loadEstimateEl = document.getElementById("load-estimate");
 const errorBanner = document.getElementById("error-banner");
 const diagnosticsSummary = document.getElementById("diagnostics-summary");
-const classTableTitle = document.getElementById("class-table-title");
 const classTableWrap = document.getElementById("class-table-wrap");
-const layerTitle = document.getElementById("layer-title");
 const layerList = document.getElementById("layer-list");
-const clearButton = document.getElementById("clear-button");
+const layerlessNote = document.getElementById("layerless-note");
+const selectionChipLabel = document.getElementById("selection-chip-label");
+const selectionChipClearButton = document.getElementById("selection-chip-clear-button");
+const selectionChipOutlineNote = document.getElementById("selection-chip-outline-note");
 const infoTitle = document.getElementById("info-title");
 const infoPanel = document.getElementById("info-panel");
 const selectionNotice = document.getElementById("selection-notice");
-const duplicatesTitle = document.getElementById("duplicates-title");
 const duplicatesList = document.getElementById("duplicates-list");
 const duplicatesNote = document.getElementById("duplicates-note");
 const opsControlsTitle = document.getElementById("ops-controls-title");
@@ -40,18 +57,41 @@ const opDeleteButton = document.getElementById("op-delete-button");
 const opSimplifyMethod = document.getElementById("op-simplify-method");
 const opSimplifyRatio = document.getElementById("op-simplify-ratio");
 const opSimplifyButton = document.getElementById("op-simplify-button");
+const simplifyDesc = document.getElementById("simplify-desc");
+const simplifyRatioDesc = document.getElementById("simplify-ratio-desc");
+const simplifyEstimate = document.getElementById("simplify-estimate");
 const opKeepButton = document.getElementById("op-keep-button");
 const opsPanelTitle = document.getElementById("ops-panel-title");
 const opsPanelList = document.getElementById("ops-panel-list");
 const opsClearButton = document.getElementById("ops-clear-button");
+const exportPathPickButton = document.getElementById("export-path-pick-button");
+const exportSelectedPathDisplay = document.getElementById("export-selected-path");
+const exportManualPathToggle = document.getElementById("export-manual-path-toggle");
+const exportManualPathRow = document.getElementById("export-manual-path-row");
 const exportPathInput = document.getElementById("export-path-input");
+const exportPathError = document.getElementById("export-path-error");
 const exportConsolidateCheckbox = document.getElementById("export-consolidate-checkbox");
 const exportButton = document.getElementById("export-button");
+const exportStatusLine = document.getElementById("export-status-line");
 const exportResult = document.getElementById("export-result");
 const presetList = document.getElementById("preset-list");
 const presetEmptyNotice = document.getElementById("preset-empty-notice");
 const presetLoadSamplesButton = document.getElementById("preset-load-samples-button");
 const presetSaveButton = document.getElementById("preset-save-button");
+const sidebarEl = document.getElementById("sidebar");
+const sidebarResizer = document.getElementById("sidebar-resizer");
+const sidebarToggle = document.getElementById("sidebar-toggle");
+const stageToggleButton = document.getElementById("stage-toggle-button");
+const listTabButtons = {
+  class: document.getElementById("tab-class"),
+  layer: document.getElementById("tab-layer"),
+  duplicate: document.getElementById("tab-duplicate"),
+};
+const listPanels = {
+  class: document.getElementById("panel-class"),
+  layer: document.getElementById("panel-layer"),
+  duplicate: document.getElementById("panel-duplicate"),
+};
 
 // ifc_occam/core/ops.py の _VALID_OPS/_VALID_SCOPES/_VALID_SIMPLIFY_METHODS を
 // フロントでも検証できるよう鏡写しにする(Task3から持ち越されたギャップ。
@@ -94,19 +134,16 @@ let selectionNoticeTimer = null;
 // onModelReadyで構築し、renderSelectionでは各クラス/レイヤー自身の要素数分だけを見る。
 let classIndex = new Map(); // ifc_class -> Set(global_id)
 let layerIndex = new Map(); // layer -> Set(global_id)
-// 前回選択されていたgid集合。差分のみ色を戻すために保持する(全頂点リセットの代替)。
-let prevSelected = new Set();
-// 重複群パネルの行と、その行が指す要素gid集合(全選択判定用)。
-let duplicateRows = []; // Array<{el: HTMLElement, gids: Set<string>}>
-// 操作リストの有効操作(resolve_effective相当)。色戻し(revert)判定に使うため
-// 常に最新のものを保持する。前回分は差分反映(変化したgidのみ)のために保持。
+// 操作リストの有効操作(resolve_effective相当)。GUI改修Task8:
+// repaintViewerColorsが選択変更・操作変更のどちらからも常にこの最新値を読み、
+// viewer.repaintColorsで全要素を1パスで塗り直す(差分反映方式は廃止した)。
 let currentEffective = new Map(); // global_id -> operation
-let prevEffective = new Map();
 // Final Review Fix2 (frontend): 確定した削除操作(operation)ごとに、そのプレビュー
 // 時点で連鎖していたgid集合(keep上書き分含む)を保持する。closureの子(開口・充填要素)
 // はcurrentEffectiveに自分自身のOperationを持たない(operationのtargetsは直接対象の
-// gidのみ)ため、通常のapplyOperationColorsでは削除色にならない。これを補うための
-// 追加着色専用マップ。key=operation object(参照)、value=string[](gid配列)。
+// gidのみ)ため、currentEffective単体をそのままrepaintViewerColorsに渡しても
+// 削除色にならない。これを補うための追加着色専用マップ(buildEffectiveOpsForPaint
+// が読む)。key=operation object(参照)、value=string[](gid配列)。
 // クリア: op-cancel-buttonクリック時とops-clear-button(全消去)時。
 let cascadePreviewByOp = new Map();
 // scope="shared"のsimplify確定時に着色する兄弟gid(同一RepresentationMap参照要素、
@@ -118,6 +155,9 @@ let opsSyncTimer = null;
 // export中はサーバがopsを409で拒否する(exporting中は状態変更不可のゲート)。
 // これはエラーではなく想定挙動なので、フラグを立てておきready復帰後に再送する。
 let opsResyncPending = false;
+// 出力実行中かどうか(GUI改修Task5)。setExportInFlightのみが変更し、出力系の
+// 入力欄・ボタン群のdisabled状態と出力ボタンの最終ゲートを一箇所にまとめる。
+let exportInFlight = false;
 
 /**
  * 選択パネル付近に短時間だけ非モーダルの通知を表示する(alert()は使わない)。
@@ -155,6 +195,7 @@ function clearError() {
 function setLoadingUI(isLoading) {
   loadButton.disabled = isLoading;
   pathInput.disabled = isLoading;
+  filePickButton.disabled = isLoading;
 }
 
 async function handleLoadClick() {
@@ -168,8 +209,9 @@ async function handleLoadClick() {
   setLoadingUI(true);
   diagnosticsSummary.innerHTML = "";
   classTableWrap.innerHTML = "";
-  classTableTitle.style.display = "none";
+  setTabCount("class", 0);
   statusLine.textContent = "読込を開始しています...";
+  hideLoadEstimate();
   lastLoadedPath = path;
 
   try {
@@ -181,6 +223,87 @@ async function handleLoadClick() {
   }
 
   startPolling();
+}
+
+// ---------------------------------------------------------------------------
+// ファイル選択ダイアログと読込前の推定 (GUI改修 Task4)
+// ---------------------------------------------------------------------------
+
+let cachedConfig = null;
+
+/** GET /api/config を初回のみ取得してキャッシュする(セッション中に値は変わらない)。 */
+async function getConfig() {
+  if (!cachedConfig) cachedConfig = await fetchConfig();
+  return cachedConfig;
+}
+
+/** #selected-path を pathInput.value の現在値に同期する(未選択なら"(未選択)")。 */
+function updateSelectedPathDisplay() {
+  const value = pathInput.value.trim();
+  selectedPathDisplay.textContent = value || "(未選択)";
+}
+
+function hideLoadEstimate() {
+  loadEstimateEl.style.display = "none";
+  loadEstimateEl.innerHTML = "";
+}
+
+/**
+ * 読込前の推定(読込時間レンジ・推定メモリ)を表示する。文言はbrief verbatim。
+ * warn===trueのときはCUI案内を警告色で追加表示する(監督者裁定4: 係数は
+ * 実測2点からの目安であり、遅い実行環境で外れて見えても係数は調整しない)。
+ * @param {number} bytes
+ * @param {object} config GET /api/config の戻り値
+ * @param {string} path 選択されたパス(CUI案内コマンドの引用に使う)
+ */
+function renderLoadEstimate(bytes, config, path) {
+  const est = estimateLoad(bytes, config);
+  const rangeText = `${formatDuration(est.secLow)}〜${formatDuration(est.secHigh)}`;
+  const memText = formatBytes(est.memBytes);
+  let html = `<div>推定読込時間 ${rangeText} / 推定メモリ 約${memText}(実測2点からの目安です)</div>`;
+  if (est.warn) {
+    const cuiCommand = `python -m ifc_occam cui "${path}" --scan-only`;
+    html += `<div class="load-estimate-warning">${escapeHtml(
+      `このサイズはフルオープンに失敗する可能性があります。CUI なら開かずに診断できます: ${cuiCommand}`
+    )}</div>`;
+  }
+  loadEstimateEl.innerHTML = html;
+  loadEstimateEl.style.display = "block";
+}
+
+/**
+ * ファイル選択ダイアログで選ばれたパスの推定を表示する。サイズは
+ * openFileDialogの戻り値(パス文字列のみ)に含まれないため、選択されたパスの
+ * 親ディレクトリを再取得してentry.sizeを引く(/api/filesの再利用。新規
+ * エンドポイントは増やさない)。推定は付加情報のため、取得に失敗しても
+ * 読込導線自体は塞がない(エラーバナーは出さず、単に推定非表示のままにする)。
+ * @param {string} path
+ */
+async function updateLoadEstimateForPath(path) {
+  hideLoadEstimate();
+  const idx = path.lastIndexOf("/");
+  const dir = idx >= 0 ? path.slice(0, idx) : "";
+  const name = idx >= 0 ? path.slice(idx + 1) : path;
+
+  let listing;
+  let config;
+  try {
+    [listing, config] = await Promise.all([fetchFileList(dir), getConfig()]);
+  } catch (_err) {
+    return;
+  }
+  const entry = (listing.entries || []).find((e) => e.name === name && !e.is_dir);
+  if (!entry || entry.size == null) return;
+  renderLoadEstimate(entry.size, config, path);
+}
+
+/** 「ファイル指定」ボタン: ダイアログを開き、選択されたら手打ち欄に反映して推定を出す。 */
+async function handleFilePickClick() {
+  const selected = await openFileDialog({ mode: "open", initialPath: "", suffixes: [".ifc"] });
+  if (selected == null) return;
+  pathInput.value = selected;
+  updateSelectedPathDisplay();
+  await updateLoadEstimateForPath(selected);
 }
 
 function startPolling() {
@@ -250,19 +373,22 @@ async function onModelReady() {
     ]);
     currentMeta = meshData.meta;
     exportPathInput.value = deriveDefaultExportName(lastLoadedPath);
+    updateExportSelectedPathDisplay();
+    refreshExportPathValidity();
     gidToElement = new Map(currentMeta.elements.map((el) => [el.global_id, el]));
     buildSelectionIndexes(currentMeta.elements);
-    prevSelected = new Set();
     selectionModel.clear();
     renderDiagnostics(diagnostics);
-    renderLayers(diagnostics.layers || []);
+    renderLayers(diagnostics.layer_stats || [], diagnostics.layerless_element_count || 0);
     renderDuplicates(diagnostics.duplicate_groups || []);
+    activateTab("class");
     viewer.setMesh(meshData.meta, meshData.positions, meshData.indices);
     // 新規読込ではサーバ側の操作リストも空(state.set_readyでリセット済み)なので
     // フロントも追従させる(古いgidの色戻し試行はel未検出で黙って無視される)。
     exportResult.innerHTML = "";
+    exportStatusLine.textContent = "";
     // cascadePreviewByOpはoperation object参照をキーにした追加着色マップ。
-    // operationList.clear()のonChange->applyOperationColors再描画で古い連鎖gidが
+    // operationList.clear()のonChange->repaintViewerColors再描画で古い連鎖gidが
     // ghost paintされないよう、clear()より前に空にしておく。
     cascadePreviewByOp.clear();
     sharedSiblingsByOp.clear();
@@ -293,17 +419,143 @@ function buildSelectionIndexes(elements) {
 }
 
 /**
- * group(Set)の全要素がselectedに含まれるかを判定する。
- * groupの要素数分だけ見れば済み、selectedやelements全体を走査しない。
- * @param {Set<string>} group
+ * gids(Array/Set)の全要素がselectedに含まれるかを判定する(行のハイライト
+ * 判定用)。行の要素数分だけ見れば済み、selectedやelements全体を走査しない。
+ * @param {Iterable<string>} gids
  * @param {Set<string>} selected
  */
-function isFullySelected(group, selected) {
-  if (!group || group.size === 0) return false;
-  for (const gid of group) {
+function isFullySelected(gids, selected) {
+  let any = false;
+  for (const gid of gids) {
+    any = true;
     if (!selected.has(gid)) return false;
   }
-  return true;
+  return any;
+}
+
+/**
+ * container内の各行(datatable.jsがtr._rowに行データを持たせている)のハイライトを
+ * 選択状態に合わせて更新する。クラス/レイヤー/重複形状の3パネルで共通に使う
+ * (GUI改修Task2: 旧classIndex/layerIndex/duplicateRowsを別々に見ていた3つの
+ * ループの統合)。並べ替え後の見た目の行順にも自然に追従する(tr._rowを見るため)。
+ * @param {HTMLElement} container
+ * @param {Set<string>} selected
+ */
+function refreshRowHighlight(container, selected) {
+  for (const tr of container.querySelectorAll("tbody tr")) {
+    const row = tr._row;
+    if (!row) continue;
+    tr.classList.toggle("selected-row", isFullySelected(row.gids, selected));
+  }
+}
+
+// クイックボタンのtitle文言(GUI改修Task2 brief手順1: 行の種類に応じて呼び出し側が渡す)。
+const QUICK_ACTION_TITLES = {
+  class: {
+    delete: "このクラスの全要素を削除対象にする",
+    simplify: "このクラスの全要素を軽量化対象にする",
+    keep: "このクラスの全要素を残す対象にする",
+  },
+  layer: {
+    delete: "このレイヤーの全要素を削除対象にする",
+    simplify: "このレイヤーの全要素を軽量化対象にする",
+    keep: "このレイヤーの全要素を残す対象にする",
+  },
+  duplicate: {
+    delete: "この重複形状グループの全要素を削除対象にする",
+    simplify: "この重複形状グループの全要素を軽量化対象にする",
+    keep: "この重複形状グループの全要素を残す対象にする",
+  },
+};
+
+/**
+ * @param {"class"|"layer"|"duplicate"} kind
+ * @param {"delete"|"simplify"|"keep"} action
+ * @returns {string|undefined}
+ */
+function quickActionTitle(kind, action) {
+  return QUICK_ACTION_TITLES[kind]?.[action];
+}
+
+// 列定義(GUI改修Task2/3): クラス表/重複形状/レイヤーは列を固定する(brief要件7,6/Task3)。
+const CLASS_COLUMNS = [
+  { key: "ifc_class", label: "クラス", align: "left" },
+  { key: "element_count", label: "要素数", align: "right" },
+  { key: "unique_shape_count", label: "形状数", align: "right" },
+  { key: "total_triangles", label: "三角形数", align: "right" },
+  { key: "mapped_count", label: "共有経由", align: "right" },
+  { key: "max_single_shape_triangles", label: "最大単体", align: "right" },
+];
+
+// GUI改修Task3: レイヤーもクラス別ランキングと同様にボリュームを見せる。
+// ただしLayerStatsにはmapped_count/max_single_shape_triangles相当が無いため
+// (共有形状の分析はレイヤー軸では意味が薄いという監督者裁定4)、4列止まり。
+const LAYER_COLUMNS = [
+  { key: "layer", label: "レイヤー", align: "left" },
+  { key: "element_count", label: "要素数", align: "right" },
+  { key: "unique_shape_count", label: "形状数", align: "right" },
+  { key: "total_triangles", label: "三角形数", align: "right" },
+];
+
+const DUPLICATE_COLUMNS = [
+  { key: "shape_count", label: "形状数", align: "right" },
+  { key: "element_count", label: "要素数", align: "right" },
+  { key: "triangle_count", label: "三角形数", align: "right" },
+  { key: "savable_triangles", label: "節約可能", align: "right" },
+];
+
+/**
+ * 一覧行クリックの共通処理(クラス/レイヤー/重複形状で共通)。修飾キーで
+ * 置換/追加/除外を振り分ける(監督者裁定1: 置換=selectByGids、追加=addGids、
+ * 除外=removeGids。行クリックの経路はgidsベースに統一されている。旧
+ * selectByClass/selectByLayer(クラス名/レイヤー名で直接置き換える版)は
+ * この統一により呼び出し元が無くなったため、Task 10で削除した)。
+ * @param {{gids:string[]}} row
+ * @param {{additive:boolean, subtractive:boolean}} mode
+ */
+function handleListRowClick(row, mode) {
+  if (!currentMeta) return;
+  if (mode.subtractive) {
+    // 除外は「選択が0件になる」ことも正常な結果なので、空選択の通知は出さない。
+    selectionModel.removeGids(row.gids);
+    clearSelectionNotice();
+    return;
+  }
+  if (mode.additive) {
+    selectionModel.addGids(row.gids, currentMeta.elements);
+  } else {
+    selectionModel.selectByGids(row.gids, currentMeta.elements);
+  }
+  if (selectionModel.selected.size === 0) {
+    showSelectionNotice("この分類に描画対象の要素はありません");
+  } else {
+    clearSelectionNotice();
+  }
+}
+
+/**
+ * 一覧行のクイック操作ボタン(削除/軽量化/残す)の共通処理。監督者裁定2,3:
+ * 確認モーダルを飛ばさず既存のhandleDeleteClick/handleSimplifyClick/
+ * handleKeepClickをそのまま経由させる。実行前にその行のgidsを選択状態にする
+ * (置換。何に対する操作か3Dで見えるようにするため)。
+ * @param {{gids:string[]}} row
+ * @param {"delete"|"simplify"|"keep"} action
+ */
+async function handleRowQuickAction(row, action) {
+  if (!currentMeta) return;
+  selectionModel.selectByGids(row.gids, currentMeta.elements);
+  if (selectionModel.selected.size === 0) {
+    showSelectionNotice("この分類に描画対象の要素はありません");
+    return;
+  }
+  clearSelectionNotice();
+  if (action === "delete") {
+    await handleDeleteClick();
+  } else if (action === "simplify") {
+    await handleSimplifyClick();
+  } else if (action === "keep") {
+    handleKeepClick();
+  }
 }
 
 function renderDiagnostics(diagnostics) {
@@ -324,162 +576,211 @@ function renderDiagnostics(diagnostics) {
     ${excludedLine}
   `;
 
-  const sorted = [...diagnostics.class_stats].sort(
-    (a, b) => b.total_triangles - a.total_triangles
-  );
+  const stats = diagnostics.class_stats || [];
+  const rows = stats.map((s) => ({
+    key: s.ifc_class,
+    cells: {
+      ifc_class: s.ifc_class,
+      element_count: s.element_count,
+      unique_shape_count: s.unique_shape_count,
+      total_triangles: s.total_triangles,
+      mapped_count: s.mapped_count,
+      max_single_shape_triangles: s.max_single_shape_triangles,
+    },
+    gids: [...(classIndex.get(s.ifc_class) ?? [])],
+  }));
 
-  const rows = sorted
-    .map(
-      (s) => `
-      <tr data-class="${escapeHtml(s.ifc_class)}">
-        <td>${escapeHtml(s.ifc_class)}</td>
-        <td>${s.element_count}</td>
-        <td>${s.unique_shape_count}</td>
-        <td>${s.total_triangles}</td>
-        <td>${s.mapped_count}</td>
-        <td>${s.max_single_shape_triangles}</td>
-      </tr>`
-    )
-    .join("");
-
-  classTableWrap.innerHTML = `
-    <table>
-      <thead>
-        <tr>
-          <th>クラス</th><th>要素数</th><th>形状数</th>
-          <th>三角形数</th><th>共有経由</th><th>最大単体</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-  `;
-  classTableTitle.style.display = "block";
-
-  for (const row of classTableWrap.querySelectorAll("tbody tr")) {
-    row.addEventListener("click", () => {
-      if (!currentMeta) return;
-      selectionModel.selectByClass(row.dataset.class, currentMeta.elements);
-      if (selectionModel.selected.size === 0) {
-        showSelectionNotice("この分類に描画対象の要素はありません");
-      } else {
-        clearSelectionNotice();
-      }
-    });
-  }
+  renderDataTable(classTableWrap, {
+    columns: CLASS_COLUMNS,
+    rows,
+    defaultSort: { key: "total_triangles", dir: "desc" },
+    onRowClick: handleListRowClick,
+    onQuickAction: handleRowQuickAction,
+    actionTitle: (row, action) => quickActionTitle("class", action),
+    emptyMessage: "クラスがありません",
+  });
+  setTabCount("class", rows.length);
 }
 
 /**
- * レイヤー一覧を描画する。空なら要件§5.2に従いセクション非表示。
- * @param {string[]} layers
+ * レイヤー一覧を描画する(GUI改修Task3: クラス別ランキングと同様に要素数/形状数/
+ * 三角形数のボリュームを見せる)。三角形数の降順で表示する(サーバの
+ * aggregate_by_layerが既に降順で返すが、defaultSortでヘッダソートの初期状態も
+ * renderDiagnosticsのクラス版と揃える)。
+ * @param {Array<{layer:string, element_count:number, unique_shape_count:number, total_triangles:number}>} layerStats
+ * @param {number} layerlessCount layerが未設定(null)の要素数。aggregate_by_layerは
+ *   これらを結果から除外するため、レイヤー別集計の合計が全要素数に一致しない
+ *   ことを「集計が壊れている」と誤解されないよう別途表示する(監督者裁定2)。
+ *   0のときは注記を出さない。
  */
-function renderLayers(layers) {
-  layerList.innerHTML = "";
-  if (!layers || layers.length === 0) {
-    layerTitle.style.display = "none";
-    layerList.style.display = "none";
-    return;
-  }
-  layerTitle.style.display = "block";
-  layerList.style.display = "block";
+function renderLayers(layerStats, layerlessCount) {
+  const stats = layerStats || [];
+  const rows = stats.map((s) => ({
+    key: s.layer,
+    cells: {
+      layer: s.layer,
+      element_count: s.element_count,
+      unique_shape_count: s.unique_shape_count,
+      total_triangles: s.total_triangles,
+    },
+    gids: [...(layerIndex.get(s.layer) ?? [])],
+  }));
 
-  for (const layer of layers) {
-    const li = document.createElement("li");
-    li.textContent = layer;
-    li.dataset.layer = layer;
-    li.addEventListener("click", () => {
-      if (!currentMeta) return;
-      selectionModel.selectByLayer(layer, currentMeta.elements);
-      if (selectionModel.selected.size === 0) {
-        showSelectionNotice("この分類に描画対象の要素はありません");
-      } else {
-        clearSelectionNotice();
-      }
-    });
-    layerList.appendChild(li);
-  }
-}
+  renderDataTable(layerList, {
+    columns: LAYER_COLUMNS,
+    rows,
+    defaultSort: { key: "total_triangles", dir: "desc" },
+    onRowClick: handleListRowClick,
+    onQuickAction: handleRowQuickAction,
+    actionTitle: (row, action) => quickActionTitle("layer", action),
+    emptyMessage: "レイヤーがありません",
+  });
+  setTabCount("layer", rows.length);
 
-/**
- * gidリストを選択する(重複群パネルの行/ボタン共通処理)。空選択なら通知を出す。
- * @param {string[]} gids
- * @returns {boolean} 何かが選択されたか
- */
-function selectDuplicateGroup(gids) {
-  if (!currentMeta) return false;
-  selectionModel.selectByGids(gids, currentMeta.elements);
-  if (selectionModel.selected.size === 0) {
-    showSelectionNotice("この分類に描画対象の要素はありません");
-    return false;
-  }
-  clearSelectionNotice();
-  return true;
-}
-
-/**
- * 操作セクションへスクロールし、1秒間ハイライトする(重複群「選択して操作」導線)。
- */
-function scrollToOpsControls() {
-  opsControlsTitle.scrollIntoView({ behavior: "smooth", block: "center" });
-  opsControlsTitle.classList.add("flash-highlight");
-  opsControls.classList.add("flash-highlight");
-  setTimeout(() => {
-    opsControlsTitle.classList.remove("flash-highlight");
-    opsControls.classList.remove("flash-highlight");
-  }, 1000);
+  const count = layerlessCount || 0;
+  layerlessNote.style.display = count > 0 ? "block" : "none";
+  layerlessNote.textContent = count > 0 ? `レイヤー未設定: ${count}要素` : "";
 }
 
 const DUPLICATE_DISPLAY_CAP = 50;
 
 /**
- * 重複形状グループ一覧を描画する。/api/diagnostics の duplicate_groups
- * (各要素group_gidsは shape_id毎のリストのlist、平坦化して使う)。
- * 節約可能三角形数降順、上位50件までのみDOMに出す(件数が超える場合は注記表示)。
+ * 重複形状グループ(diagnostics.duplicate_groups の1件)を一覧行データに変換する。
+ * 形状数=shape_ids.length、要素数=element_gids(shape_id毎の要素gid配列のlist)を
+ * 平坦化した件数(GUI改修Task2 要件R6: 旧「件数=N」表記は形状数/要素数の区別が
+ * 付かないため廃止)。三角形数/節約可能はサーバ値をそのまま使う。
+ * @param {{shape_ids:string[], triangle_count:number, savable_triangles:number, element_gids:string[][]}} group
+ */
+function duplicateRow(group) {
+  const flatGids = group.element_gids.flat();
+  return {
+    key: group.shape_ids.join(","),
+    cells: {
+      shape_count: group.shape_ids.length,
+      element_count: flatGids.length,
+      triangle_count: group.triangle_count,
+      savable_triangles: group.savable_triangles,
+    },
+    gids: flatGids,
+  };
+}
+
+/**
+ * 重複形状グループ一覧を描画する。/api/diagnostics の duplicate_groups。
+ * 節約可能三角形数降順で上位50件までのみ表示する(この打ち切り基準自体は
+ * ヘッダクリックで表示順を変えても変わらない。表示中の50件の並びだけが変わる)。
+ * 件数が超える場合は注記を出す。
  * @param {Array<object>} groups diagnostics.duplicate_groups
  */
 function renderDuplicates(groups) {
-  duplicatesList.innerHTML = "";
-  duplicateRows = [];
+  const list = groups || [];
+  setTabCount("duplicate", list.length);
 
-  if (!groups || groups.length === 0) {
-    duplicatesTitle.style.display = "none";
-    duplicatesList.style.display = "none";
+  if (list.length === 0) {
     duplicatesNote.style.display = "none";
+    renderDataTable(duplicatesList, {
+      columns: DUPLICATE_COLUMNS,
+      rows: [],
+      emptyMessage: "重複形状がありません",
+    });
     return;
   }
 
-  const sorted = [...groups].sort((a, b) => b.savable_triangles - a.savable_triangles);
-  const capped = sorted.slice(0, DUPLICATE_DISPLAY_CAP);
+  const sortedBySavable = [...list].sort((a, b) => b.savable_triangles - a.savable_triangles);
+  const capped = sortedBySavable.slice(0, DUPLICATE_DISPLAY_CAP);
 
-  duplicatesTitle.style.display = "block";
-  duplicatesList.style.display = "block";
-  duplicatesNote.style.display = sorted.length > DUPLICATE_DISPLAY_CAP ? "block" : "none";
-  if (sorted.length > DUPLICATE_DISPLAY_CAP) {
-    duplicatesNote.textContent = `上位50件を表示(全${sorted.length}件)`;
+  const truncated = list.length > DUPLICATE_DISPLAY_CAP;
+  duplicatesNote.style.display = truncated ? "block" : "none";
+  if (truncated) {
+    duplicatesNote.textContent =
+      `全 ${list.length} 件のうち、節約可能三角形数の多い上位50件を表示しています`;
   }
 
-  for (const group of capped) {
-    const flatGids = group.element_gids.flat();
-    const gidSet = new Set(flatGids);
+  renderDataTable(duplicatesList, {
+    columns: DUPLICATE_COLUMNS,
+    rows: capped.map(duplicateRow),
+    defaultSort: { key: "savable_triangles", dir: "desc" },
+    onRowClick: handleListRowClick,
+    onQuickAction: handleRowQuickAction,
+    actionTitle: (row, action) => quickActionTitle("duplicate", action),
+    emptyMessage: "重複形状がありません",
+  });
+}
 
-    const li = document.createElement("li");
-    const label = document.createElement("span");
-    label.textContent = `件数=${group.shape_ids.length} 節約可能三角形数=${group.savable_triangles}`;
-    label.addEventListener("click", () => selectDuplicateGroup(flatGids));
-    const batchButton = document.createElement("button");
-    batchButton.type = "button";
-    batchButton.className = "dup-batch-button";
-    batchButton.textContent = "選択して操作";
-    batchButton.addEventListener("click", (evt) => {
-      evt.stopPropagation();
-      if (!selectDuplicateGroup(flatGids)) return;
-      scrollToOpsControls();
-    });
-    li.appendChild(label);
-    li.appendChild(batchButton);
-    li.addEventListener("click", () => selectDuplicateGroup(flatGids));
-    duplicatesList.appendChild(li);
-    duplicateRows.push({ el: li, gids: gidSet });
+// 縁取り省略の通知文言(verbatim。監督者裁定5: 黙って効かないのは禁止)。
+const OUTLINE_OMITTED_MESSAGE = "(縁取りは選択が大きいため省略)";
+
+// cascadePreviewByOp/sharedSiblingsByOpをviewer.repaintColorsのeffectiveOpsへ
+// 合成するためのプレースホルダop。statusColor(operations.js)はop種別しか
+// 見ないため、これで十分(GUI改修Task8: 色の決定はviewer.repaintColors内に
+// 一本化したため、ここではもうstatusColor自体を呼ばない)。
+const DELETE_GHOST_OP = { op: "delete" };
+const SIMPLIFY_GHOST_OP = { op: "simplify" };
+
+/**
+ * currentEffectiveへcascadePreviewByOp(連鎖削除プレビュー)とsharedSiblingsByOp
+ * (共有波及プレビュー)のghost opを合成する。cascadeは無条件に上書きする
+ * (このgidが自分自身のOperationを持つことは無い設計のため)。sharedSiblingsは
+ * 自身の操作色を優先し、既にエントリがあれば上書きしない(旧applyOperationColors
+ * の優先順位をそのまま維持——Final Review Fix2 / Phase4 Task4 §3)。
+ * @returns {Map<string, object>}
+ */
+function buildEffectiveOpsForPaint() {
+  const merged = new Map(currentEffective);
+  for (const gids of cascadePreviewByOp.values()) {
+    for (const gid of gids) merged.set(gid, DELETE_GHOST_OP);
   }
+  for (const gids of sharedSiblingsByOp.values()) {
+    for (const gid of gids) {
+      if (!merged.has(gid)) merged.set(gid, SIMPLIFY_GHOST_OP);
+    }
+  }
+  return merged;
+}
+
+/**
+ * 選択・有効操作の現在値からviewer.repaintColorsを1回呼ぶ(GUI改修Task8)。
+ * 「前回選択との差分だけ塗る」旧方式は廃止した(減光は選択0件/1件以上で
+ * 全要素の明るさが変わるため、差分方式では成立しない)。選択が変わった時
+ * (renderSelection)・操作リストが変わった時(operationList.onChange)の
+ * どちらの経路からも必ずこの関数を呼び、単一の描画ロジックに揃える。
+ */
+function repaintViewerColors() {
+  const selected = selectionModel.selected;
+  viewer.repaintColors({
+    selectedGids: selected,
+    effectiveOps: buildEffectiveOpsForPaint(),
+    dim: shouldDim(selected.size),
+  });
+}
+
+/**
+ * 選択要素の縁取りを更新する(GUI改修Task8)。選択0件ならviewer側で消すだけ。
+ * 選択三角形数が上限(viewer.jsのMAX_OUTLINE_TRIANGLES)を超えて省略された
+ * 場合は選択チップの横にverbatim文言を出す(監督者裁定5: 黙って効かないのは
+ * 禁止)。
+ * @param {Set<string>} selected
+ */
+function updateSelectionOutline(selected) {
+  const elements = [...selected].map((gid) => gidToElement.get(gid)).filter(Boolean);
+  const created = viewer.setSelectionOutline(elements);
+  const omitted = elements.length > 0 && !created;
+  selectionChipOutlineNote.style.display = omitted ? "inline" : "none";
+  selectionChipOutlineNote.textContent = omitted ? OUTLINE_OMITTED_MESSAGE : "";
+}
+
+/**
+ * 操作バー(#ops-dock)左端の選択チップを更新する(GUI改修Task8: 選択解除の
+ * 経路4)。`選択中 {N}件`(×は選択1件以上でのみ表示)/ 0件は`選択なし`と
+ * 薄く表示し×は出さない。既存の「選択をクリア」ボタン(#clear-button)は
+ * このチップの×に統合して撤去した(index.html)。
+ * @param {Set<string>} selected
+ */
+function updateSelectionChip(selected) {
+  const n = selected.size;
+  selectionChipLabel.textContent = n > 0 ? `選択中 ${n}件` : "選択なし";
+  selectionChipLabel.classList.toggle("selection-chip-empty", n === 0);
+  selectionChipClearButton.style.display = n > 0 ? "inline-block" : "none";
 }
 
 /**
@@ -487,42 +788,19 @@ function renderDuplicates(groups) {
  * @param {Set<string>} selected
  */
 function renderSelection(selected) {
-  // 色戻しは「前回選択されていて今回は選択されていない要素」の頂点範囲のみ
-  // 戻す(resetColors()による全頂点走査はもう選択経路では呼ばない)。
-  // 戻す先は有効操作のステータス色(あれば)、なければクラス色(選択赤が優先、
-  // 3D上の操作ステータス表示契約: docs/plans/2026-07-23-phase3-operations.md)。
-  for (const gid of prevSelected) {
-    if (selected.has(gid)) continue;
-    const el = gidToElement.get(gid);
-    if (!el) continue;
-    const operation = currentEffective.get(gid);
-    const [r, g, b] = operation ? statusColor(operation) : classColor(el.ifc_class);
-    viewer.setElementColor(el, r, g, b);
-  }
-  for (const gid of selected) {
-    const el = gidToElement.get(gid);
-    if (el) viewer.setElementColor(el, 1, 0.2, 0.2);
-  }
-  prevSelected = new Set(selected);
+  repaintViewerColors();
+  updateSelectionOutline(selected);
+  updateSelectionChip(selected);
 
   opsControlsTitle.style.display = selected.size > 0 ? "block" : "none";
   opsControls.style.display = selected.size > 0 ? "block" : "none";
 
-  for (const row of classTableWrap.querySelectorAll("tbody tr")) {
-    const group = classIndex.get(row.dataset.class);
-    row.classList.toggle("selected-row", isFullySelected(group, selected));
-  }
-
-  for (const li of layerList.querySelectorAll("li")) {
-    const group = layerIndex.get(li.dataset.layer);
-    li.classList.toggle("selected-row", isFullySelected(group, selected));
-  }
-
-  for (const { el, gids } of duplicateRows) {
-    el.classList.toggle("selected-row", isFullySelected(gids, selected));
-  }
+  refreshRowHighlight(classTableWrap, selected);
+  refreshRowHighlight(layerList, selected);
+  refreshRowHighlight(duplicatesList, selected);
 
   renderInfoPanel(selected);
+  updateSimplifyExplanation();
 }
 
 function renderInfoPanel(selected) {
@@ -549,53 +827,6 @@ function renderInfoPanel(selected) {
     `;
   } else {
     infoPanel.innerHTML = `<div>${selected.size} 要素選択中</div>`;
-  }
-}
-
-/**
- * 有効操作(currentEffective)が変化したgidのみ3D上の色を更新する。
- * 選択中(赤)のgidは触らない(選択が解除された時にrenderSelectionが反映する)。
- */
-function applyOperationColors() {
-  const changed = new Set([...prevEffective.keys(), ...currentEffective.keys()]);
-  for (const gid of changed) {
-    if (selectionModel.selected.has(gid)) continue;
-    const el = gidToElement.get(gid);
-    if (!el) continue;
-    const operation = currentEffective.get(gid);
-    const [r, g, b] = operation ? statusColor(operation) : classColor(el.ifc_class);
-    viewer.setElementColor(el, r, g, b);
-  }
-  prevEffective = currentEffective;
-
-  // Final Review Fix2: 確定済み削除操作のプレビュー連鎖(cascadePreviewByOp)も
-  // 削除色で塗る。これらのgidはcurrentEffectiveに自分自身のOperationを持たない
-  // (openings/fillings等はtargetsに含まれない)が、export時には一緒に消える。
-  if (cascadePreviewByOp.size > 0) {
-    const deleteColor = statusColor({ op: "delete" });
-    for (const gids of cascadePreviewByOp.values()) {
-      for (const gid of gids) {
-        if (selectionModel.selected.has(gid)) continue;
-        const el = gidToElement.get(gid);
-        if (!el) continue;
-        viewer.setElementColor(el, deleteColor[0], deleteColor[1], deleteColor[2]);
-      }
-    }
-  }
-
-  // Phase4 Task4 §3: scope="shared"のsimplify確定時、同一RepresentationMapを
-  // 参照する兄弟要素(export時に実際に一緒に変わる範囲)も軽量化色で着色する。
-  if (sharedSiblingsByOp.size > 0) {
-    const simplifyColor = statusColor({ op: "simplify" });
-    for (const gids of sharedSiblingsByOp.values()) {
-      for (const gid of gids) {
-        if (selectionModel.selected.has(gid)) continue;
-        if (currentEffective.has(gid)) continue; // 自身の操作色を優先(上書きしない)
-        const el = gidToElement.get(gid);
-        if (!el) continue;
-        viewer.setElementColor(el, simplifyColor[0], simplifyColor[1], simplifyColor[2]);
-      }
-    }
   }
 }
 
@@ -707,12 +938,35 @@ function showModal({ title, bodyHtml, actions }) {
 
     const actionsDiv = document.createElement("div");
     actionsDiv.className = "modal-actions";
+
+    // Esc で閉じる。app.js の選択解除用 Esc ハンドラは `.modal-overlay` が
+    // あると「モーダル側の Esc が優先」として自分を抑止するが、**その
+    // モーダル側に Esc が無かった**ため、確認モーダルが出ている間は Esc が
+    // 完全な無反応になっていた(フェーズ最終レビュー I-3)。閉じ方は
+    // キャンセル相当(=非 primary の action があればその値、無ければ null)。
+    const cancelAction = actions.find((a) => !a.primary);
+    const closeValue = cancelAction ? cancelAction.value : null;
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      cleanup();
+      resolve(closeValue);
+    };
+    function cleanup() {
+      document.removeEventListener("keydown", onKeyDown, true);
+      overlay.remove();
+    }
+    // capture フェーズで拾う。document 側の選択解除ハンドラより先に走らせ、
+    // stopPropagation でそちらへ届かないようにするため(モーダルを閉じた
+    // 拍子に選択まで消えるのを防ぐ)。
+    document.addEventListener("keydown", onKeyDown, true);
+
     for (const action of actions) {
       const btn = document.createElement("button");
       btn.textContent = action.label;
       if (action.primary) btn.className = "modal-btn-primary";
       btn.addEventListener("click", () => {
-        overlay.remove();
+        cleanup();
         resolve(action.value);
       });
       actionsDiv.appendChild(btn);
@@ -756,8 +1010,10 @@ async function loadPresetsPanel() {
 }
 
 /**
- * プリセット一覧を描画する。空なら「サンプルを読み込む」ボタンを表示する
- * (自動読み込みはしない、ユーザー操作が必要)。
+ * 操作パターン一覧を描画する。空なら「操作パターンがまだありません。」
+ * を表示する(GUI改修Task6: 「サンプルを追加」ボタンはこの通知の外に出し、
+ * 常時表示にした——空でなくてもサンプルを追加できるようにするため)。
+ * 各行に「適用」と削除(×)の2ボタンを置く。
  * @param {Array<object>} presets
  */
 function renderPresetsPanel(presets) {
@@ -771,20 +1027,59 @@ function renderPresetsPanel(presets) {
       <div class="preset-name">${escapeHtml(preset.name)}</div>
       <div class="preset-desc">${escapeHtml(preset.description || "")}</div>
     `;
+    const actionsDiv = document.createElement("div");
+    actionsDiv.className = "preset-actions";
+
     const applyButton = document.createElement("button");
     applyButton.type = "button";
     applyButton.className = "preset-apply-button";
     applyButton.textContent = "適用";
     applyButton.addEventListener("click", () => handlePresetApplyClick(preset.name));
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "preset-delete-button";
+    deleteButton.textContent = "×";
+    deleteButton.title = `操作パターン「${preset.name}」を削除`;
+    deleteButton.addEventListener("click", () => handlePresetDeleteClick(preset.name));
+
+    actionsDiv.appendChild(applyButton);
+    actionsDiv.appendChild(deleteButton);
     li.appendChild(infoDiv);
-    li.appendChild(applyButton);
+    li.appendChild(actionsDiv);
     presetList.appendChild(li);
   }
 }
 
 /**
- * 「サンプルを読み込む」: web/preset-samples.json を取得し POST /api/presets で
- * 保存する(ユーザー操作起点。自動読み込みはしない)。
+ * プリセット行の削除(×): 確認モーダル(verbatim文言、監督者裁定4)→確定で
+ * DELETE /api/presets(クエリパラメータ方式)→一覧再取得。GUI改修Task6。
+ * @param {string} name
+ */
+async function handlePresetDeleteClick(name) {
+  const confirmed = await showModal({
+    title: "操作パターンの削除確認",
+    bodyHtml: `<div>操作パターン「${escapeHtml(name)}」を削除しますか?</div>`,
+    actions: [
+      { label: "キャンセル", value: false },
+      { label: "削除する", value: true, primary: true },
+    ],
+  });
+  if (!confirmed) return;
+
+  try {
+    await deletePreset(name);
+    await loadPresetsPanel();
+  } catch (err) {
+    showError(String(err.message || err));
+  }
+}
+
+/**
+ * 「サンプルを追加」: web/preset-samples.json を取得し、既存のプリセットへ
+ * 追加する(GUI改修Task6監督者裁定6: 全置換ではない)。サンプルと同名の
+ * プリセットが既にあれば上書き、無ければ追加する(他の既存プリセットは
+ * 保持される)。ボタンは常時表示(一覧が空でなくても押せる)。
  */
 async function handleLoadSamplePresetsClick() {
   presetLoadSamplesButton.disabled = true;
@@ -792,7 +1087,10 @@ async function handleLoadSamplePresetsClick() {
     const res = await fetch("./preset-samples.json");
     if (!res.ok) throw new Error(`preset-samples.json取得失敗 (${res.status})`);
     const samples = await res.json();
-    await postPresets(samples);
+    const existing = await fetchPresets();
+    const sampleNames = new Set(samples.map((s) => s.name));
+    const merged = [...existing.filter((p) => !sampleNames.has(p.name)), ...samples];
+    await postPresets(merged);
     await loadPresetsPanel();
   } catch (err) {
     showError(String(err.message || err));
@@ -838,7 +1136,7 @@ async function handlePresetApplyClick(name) {
       : "";
 
   const confirmed = await showModal({
-    title: `プリセット適用: ${name}`,
+    title: `操作パターンを適用: ${name}`,
     bodyHtml: `<ul>${rowsHtml}</ul>${warningsHtml}`,
     actions: [
       { label: "キャンセル", value: false },
@@ -863,17 +1161,33 @@ async function handlePresetApplyClick(name) {
  * 名前+説明を入力する保存用モーダル(showModalの汎用actionsでは入力値を
  * 読めないため専用実装)。キャンセルはnull、保存は{name, description}を返す
  * (nameが空ならnullとして扱う)。
+ *
+ * GUI改修Task6監督者裁定5: 保存対象/保存できない操作の件数をverbatim文言で
+ * 表示し、M>0(部分選択で対象外になった操作がある)でも保存自体は続行できる
+ * ようにする(ここで止めない。ユーザーが承知の上で保存したい場合がある)。
+ * M>0のときは対象外になった操作の要約(op/対象件数)も一覧で出す。
+ * @param {number} savedCount 保存対象になるルール数(N)
+ * @param {number} skippedCount 保存できない操作数(M)
+ * @param {Array<{op:string, count:number}>} skippedSummaries 対象外になった操作の要約
  * @returns {Promise<{name:string, description:string}|null>}
  */
-function showPresetSaveModal() {
+function showPresetSaveModal(savedCount, skippedCount, skippedSummaries) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay";
     const box = document.createElement("div");
     box.className = "modal-box";
+    const skippedListHtml =
+      skippedCount > 0
+        ? `<ul>${skippedSummaries
+            .map((s) => `<li>${escapeHtml(opLabel(s.op))} / ${s.count}件</li>`)
+            .join("")}</ul>`
+        : "";
     box.innerHTML = `
-      <h3>プリセットとして保存</h3>
+      <h3>操作パターンとして保存</h3>
       <div class="modal-body">
+        <div id="preset-save-summary">保存対象: ${savedCount}件 / 保存できない操作: ${skippedCount}件(部分選択のため)</div>
+        ${skippedListHtml}
         <label>名前<br><input id="preset-save-name-input" type="text" style="width:100%;"></label>
         <br><br>
         <label>説明<br><textarea id="preset-save-desc-input" style="width:100%;" rows="3"></textarea></label>
@@ -882,10 +1196,25 @@ function showPresetSaveModal() {
     const actionsDiv = document.createElement("div");
     actionsDiv.className = "modal-actions";
 
+    // Esc で閉じる(showModal と同じ理由。フェーズ最終レビュー I-3)。
+    // 名前欄にフォーカスがあっても閉じてよい——このモーダルは「キャンセル」で
+    // 失うものが入力途中の名前だけなので、Esc の一般的な期待どおりに振る舞う。
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      cleanup();
+      resolve(null);
+    };
+    function cleanup() {
+      document.removeEventListener("keydown", onKeyDown, true);
+      overlay.remove();
+    }
+    document.addEventListener("keydown", onKeyDown, true);
+
     const cancelBtn = document.createElement("button");
     cancelBtn.textContent = "キャンセル";
     cancelBtn.addEventListener("click", () => {
-      overlay.remove();
+      cleanup();
       resolve(null);
     });
 
@@ -895,7 +1224,7 @@ function showPresetSaveModal() {
     saveBtn.addEventListener("click", () => {
       const name = box.querySelector("#preset-save-name-input").value.trim();
       const description = box.querySelector("#preset-save-desc-input").value.trim();
-      overlay.remove();
+      cleanup();
       resolve(name ? { name, description } : null);
     });
 
@@ -913,15 +1242,16 @@ function showPresetSaveModal() {
  * 「あるレイヤーの全gid」と完全一致する場合のみ{layer}ルールにする。どちらとも
  * 一致しない操作(部分選択/複数クラス混在等)はクラス/レイヤー単位でないため
  * プリセット化せずスキップする(誠実性: 条件だけでは再現できない選択を
- * ルール化しない)。
+ * ルール化しない)。GUI改修Task6監督者裁定5: スキップした操作はop/対象件数を
+ * skippedSummariesに積み、保存モーダルで明示する(黙ってスキップしない)。
  * @param {Array<object>} operations
  * @param {Map<string, Set<string>>} classIndexMap
  * @param {Map<string, Set<string>>} layerIndexMap
- * @returns {{rules: Array<object>, skippedCount: number}}
+ * @returns {{rules: Array<object>, skippedCount: number, skippedSummaries: Array<{op:string, count:number}>}}
  */
 function deriveRulesFromOperations(operations, classIndexMap, layerIndexMap) {
   const rules = [];
-  let skippedCount = 0;
+  const skippedSummaries = [];
 
   for (const operation of operations) {
     const targetSet = new Set(operation.targets);
@@ -943,7 +1273,7 @@ function deriveRulesFromOperations(operations, classIndexMap, layerIndexMap) {
     }
 
     if (!match) {
-      skippedCount++;
+      skippedSummaries.push({ op: operation.op, count: operation.targets.length });
       continue;
     }
     rules.push({
@@ -952,7 +1282,7 @@ function deriveRulesFromOperations(operations, classIndexMap, layerIndexMap) {
     });
   }
 
-  return { rules, skippedCount };
+  return { rules, skippedCount: skippedSummaries.length, skippedSummaries };
 }
 
 /** @param {Set<*>} a @param {Set<*>} b */
@@ -966,23 +1296,38 @@ function setsEqual(a, b) {
 
 /**
  * 「現在の操作からプリセット保存」: 操作リストをクラス/レイヤー単位のルールに
- * 変換できるものだけプリセット化し、名前入力モーダルで確定後にサーバへ保存する。
+ * 変換できるものだけプリセット化する。保存モーダルに保存対象/保存できない
+ * 操作の件数を出し(GUI改修Task6監督者裁定5)、対象外の操作があっても
+ * (M>0)保存自体は続行できるようにする(ここでは止めない)。操作が1件も
+ * 無い場合のみ「保存できる操作がありません」で止める(M=0かつN=0で
+ * そもそも保存するものが無いケース。裁定5が対象とする「M>0でも止めない」
+ * とは別の話)。
  */
 async function handleSavePresetFromCurrentClick() {
-  const { rules, skippedCount } = deriveRulesFromOperations(
+  if (operationList.operations.length === 0) {
+    showError("操作がありません。操作パターンにできる操作がありません。");
+    return;
+  }
+
+  const { rules, skippedCount, skippedSummaries } = deriveRulesFromOperations(
     operationList.operations,
     classIndex,
     layerIndex
   );
+
+  // 保存できるルールが1件も無いなら保存させない(Task 6 レビュー Minor の裁定)。
+  // 裁定5の「M>0 でも止めるな」は「一部が対象外でも保存を続行させろ」の意味で
+  // あって、ルール0件の空プリセットを作らせる意味ではない。空で保存すると
+  // 適用しても何も起きない操作パターンが一覧に並び、ユーザーは理由が分からない。
   if (rules.length === 0) {
     showError(
-      "クラス/レイヤー単位でない操作はプリセット化できません(" +
-        `${skippedCount}件)。保存可能な操作がありません。`
+      "保存できる操作がありません(すべて部分選択のため)。" +
+        "クラスまたはレイヤー全体への操作を含めてください。"
     );
     return;
   }
 
-  const saved = await showPresetSaveModal();
+  const saved = await showPresetSaveModal(rules.length, skippedCount, skippedSummaries);
   if (!saved) return;
 
   try {
@@ -993,9 +1338,6 @@ async function handleSavePresetFromCurrentClick() {
     ];
     await postPresets(updated);
     await loadPresetsPanel();
-    if (skippedCount > 0) {
-      showSelectionNotice(`クラス/レイヤー単位でない操作はプリセット化できません(${skippedCount}件)`);
-    }
   } catch (err) {
     showError(String(err.message || err));
   }
@@ -1075,6 +1417,93 @@ async function handleDeleteClick() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 簡略化手法の説明と効果の目安 — GUI改修 Task7
+// ---------------------------------------------------------------------------
+
+// 手法ごとの説明文(verbatim。brief/監督者裁定1により1文字も変えないこと)。
+const SIMPLIFY_METHOD_DESCRIPTIONS = {
+  bbox: "形を、それがすっぽり入る直方体1個に置き換えます。いちばん軽くなり、いちばん形が失われます。",
+  convex_hull:
+    "形の外側を輪ゴムで包んだような形に置き換えます。くぼみは埋まりますが、おおよその姿は残ります。",
+  decimate:
+    "三角形の数を減らして形を近似します。0.3 なら元の約30%まで減らします。数字が小さいほど軽く、粗くなります。",
+};
+
+// 凸包は事前に正確な三角形数を出せない(推測値を出さない — 監督者裁定2)。verbatim。
+const CONVEX_HULL_ESTIMATE_UNAVAILABLE =
+  "凸包後の三角形数は形状によって変わるため、事前には出せません。";
+
+/**
+ * 簡略化手法の効果の目安を計算する(副作用なし。DOMに触らない — 監督者裁定5)。
+ * bbox: 要素あたり12三角形で確定している(ifc_occam/core/simplify.pyの実装。
+ * 直方体=6面×2三角形)ため、afterは推測ではなく正確な数値として返せる
+ * (監督者裁定2)。
+ * decimate: round(triangles*ratio)。実際の削減率は形状によりズレるため、
+ * "(目安)"の付記は呼び出し側の責務とする(この関数自体は数値のみ返す)。
+ * convex_hull・未知の手法: 事前に正確な数を出せないため常にnullを返す
+ * (推測値を出さない — 監督者裁定2)。
+ * elementCountが0以下のときも常にnullを返す(監督者裁定3: 選択0件で
+ * "約0→0三角形"のような無意味な表示を作らせないための判定をここに持つ)。
+ * @param {{method:string, elementCount:number, triangles:number, ratio?:number}} params
+ * @returns {{before:number, after:number}|null} 出せないときはnull。
+ */
+function estimateSimplified({ method, elementCount, triangles, ratio }) {
+  if (!(elementCount > 0)) return null;
+  if (method === "bbox") {
+    return { before: triangles, after: elementCount * 12 };
+  }
+  if (method === "decimate") {
+    // ratio欄が空文字の一時的な入力中はNumber("")===0(NaNではない)になる。
+    // 0以下を素通しすると"約T→0三角形(目安)"という無意味な数字が一瞬出る
+    // ため、有限かつ正の値のときだけ計算する(厳密な0.05〜0.95の範囲検証は
+    // 確定操作であるhandleSimplifyClick側の責務のまま変えない)。
+    if (!Number.isFinite(ratio) || ratio <= 0) return null;
+    return { before: triangles, after: Math.round(triangles * ratio) };
+  }
+  return null; // convex_hull および未知の手法
+}
+
+/**
+ * #simplify-desc(手法説明)・#simplify-ratio-desc(ratio欄の説明)・
+ * #simplify-estimate(効果の目安)を、現在の選択・手法・ratioに合わせて
+ * 更新する。選択・手法・ratioのいずれかが変わったら必ず呼ぶこと
+ * (監督者裁定7)。DOMを読み書きする側であり、estimateSimplified自体は
+ * 呼ぶだけで計算ロジックは持たない。
+ */
+function updateSimplifyExplanation() {
+  const method = opSimplifyMethod.value;
+  simplifyDesc.textContent = SIMPLIFY_METHOD_DESCRIPTIONS[method] ?? "";
+  simplifyRatioDesc.style.display = method === "decimate" ? "block" : "none";
+
+  const selected = selectionModel.selected;
+  if (selected.size === 0) {
+    // 監督者裁定3: 選択0件のときは効果の目安を出さない(説明文だけ出す)。
+    simplifyEstimate.textContent = "";
+    return;
+  }
+
+  if (method === "convex_hull") {
+    // 監督者裁定2: 凸包は数字を出さない(推測値をでっち上げない)。
+    simplifyEstimate.textContent = CONVEX_HULL_ESTIMATE_UNAVAILABLE;
+    return;
+  }
+
+  let triangles = 0;
+  for (const gid of selected) {
+    const el = gidToElement.get(gid);
+    if (el) triangles += el.tri_count;
+  }
+  const ratio = Number(opSimplifyRatio.value);
+  const result = estimateSimplified({ method, elementCount: selected.size, triangles, ratio });
+  if (!result) {
+    simplifyEstimate.textContent = "";
+    return;
+  }
+  const suffix = method === "decimate" ? "(目安)" : "";
+  simplifyEstimate.textContent = `約 ${result.before} → ${result.after} 三角形${suffix}`;
+}
+
 /**
  * 「軽量化」ボタン: method/ratio選択→対象に共有要素があればscope確認→
  * Operation(simplify)追加。
@@ -1122,7 +1551,7 @@ async function handleSimplifyClick() {
 
     // Phase4 Task4 §3: scope="shared"確定時、export時に実際に一緒に変わる
     // 兄弟要素(自身targetsは除く)を着色対象として記録する。onChange
-    // (applyOperationColors)より前に登録しておく必要がある。
+    // (repaintViewerColors)より前に登録しておく必要がある。
     if (scope === "shared") {
       const targetSet = new Set(targets);
       const siblingSet = new Set();
@@ -1154,22 +1583,194 @@ function handleKeepClick() {
   }
 }
 
-/** 「出力」ボタン: POST /api/export→/api/statusをポーリングし結果を表示する。 */
+// ---------------------------------------------------------------------------
+// 出力先の指定と検証 (GUI改修 Task5)
+// ---------------------------------------------------------------------------
+
+// 文言の出典は filedialog.js の1箇所に集約する(保存ダイアログの入力欄と
+// この手打ち欄の両方で同じ文字列を出すため。リテラルを各所に置くと片方だけ
+// 直されて食い違う——Task 5 レビュー Minor の引き取り)。
+const EXPORT_SAME_FILE_MESSAGE = SAME_AS_SOURCE_MESSAGE;
+
+/** #export-selected-path を exportPathInput.value の現在値に同期する。 */
+function updateExportSelectedPathDisplay() {
+  const value = exportPathInput.value.trim();
+  exportSelectedPathDisplay.textContent = value || "(未選択)";
+}
+
+/**
+ * 出力先が読込中のファイルと同一実体を指しているかを判定する
+ * (監督者裁定1・2)。判定の実体はfiledialog.jsのisSameRootRelativePath
+ * (表記ゆれ・大文字小文字違いを吸収する正規化比較)——ダイアログの一覧行の
+ * 無効化(filedialog.js)と手打ち欄のこの事前チェックが同じ関数を共有する
+ * ことで、経路によって判定基準がずれることを防ぐ。あくまでUI側の事前チェック
+ * であり、サーバ側 core/paths.refers_to_same_file(apply_operations内、
+ * os.path.samefile経由)が最終防衛線として別途効く。
+ * @returns {boolean}
+ */
+function isExportPathInvalid() {
+  return isSameRootRelativePath(lastLoadedPath, exportPathInput.value.trim());
+}
+
+/** exportInFlight/パス検証の結果に応じて出力ボタンの有効/無効を一箇所で決める。 */
+function updateExportButtonDisabled() {
+  exportButton.disabled = exportInFlight || isExportPathInvalid();
+}
+
+/**
+ * 出力先の同一ファイル判定を再評価し、赤字表示とボタンの有効/無効を更新する
+ * (監督者裁定2: 出力ボタンの押下前に読込元と突き合わせる)。手打ち欄の
+ * inputイベントと保存ダイアログでの選択後、モデル読込完了時に呼ぶ。
+ * @returns {boolean} 判定結果(trueなら出力先が読込中のファイルと同一)
+ */
+function refreshExportPathValidity() {
+  const invalid = isExportPathInvalid();
+  exportPathError.style.display = invalid ? "block" : "none";
+  exportPathError.textContent = invalid ? EXPORT_SAME_FILE_MESSAGE : "";
+  updateExportButtonDisabled();
+  return invalid;
+}
+
+/**
+ * 出力実行中の入出力制御を一箇所にまとめる(読込側のsetLoadingUIと同じ流儀)。
+ * @param {boolean} inFlight
+ */
+function setExportInFlight(inFlight) {
+  exportInFlight = inFlight;
+  exportPathPickButton.disabled = inFlight;
+  exportManualPathToggle.disabled = inFlight;
+  exportPathInput.disabled = inFlight;
+  exportConsolidateCheckbox.disabled = inFlight;
+  updateExportButtonDisabled();
+}
+
+/** 「保存先を指定」ボタン: 保存ダイアログを開き、選択されたら手打ち欄に反映する。 */
+async function handleExportPathPickClick() {
+  const selected = await openFileDialog({
+    mode: "save",
+    initialPath: exportPathInput.value.trim(),
+    suffixes: [".ifc"],
+    excludePath: lastLoadedPath,
+  });
+  if (selected == null) return;
+  exportPathInput.value = selected;
+  updateExportSelectedPathDisplay();
+  refreshExportPathValidity();
+}
+
+/**
+ * 出力先パス(root相対、ディレクトリ部分を含んでよい)の実体が既に存在するかを
+ * /api/filesの一覧で調べる(監督者裁定3: 新しいAPIは増やさない)。ディレクトリの
+ * 一覧取得に失敗した場合(root外・権限エラー等、通常は起こらない)は
+ * 「存在しない」側として扱う——上書き確認を出せないだけで、実際の書き込みの
+ * 安全性(原本非破壊)は/api/export側のサーバ判定に委ねられており損なわれない。
+ * ファイル名の比較は大文字小文字を区別しない(Windowsのファイルシステムに合わせる)。
+ * @param {string} path
+ * @returns {Promise<boolean>}
+ */
+async function exportTargetExists(path) {
+  const idx = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  const dir = idx >= 0 ? path.slice(0, idx) : "";
+  const name = idx >= 0 ? path.slice(idx + 1) : path;
+  let listing;
+  try {
+    listing = await fetchFileList(dir);
+  } catch (_err) {
+    return false;
+  }
+  const lowerName = name.toLowerCase();
+  return (listing.entries || []).some((e) => !e.is_dir && e.name.toLowerCase() === lowerName);
+}
+
+// ifc_occam/cui/repl.py の _STAGE_SECONDS_LABELS と同じ日本語(監督者裁定5)。
+// キーはexport.apply_operationsが実際に設定する6種で固定
+// (open/deletes/simplify/reextract_duplicates/consolidate/write)。UI文言(語彙)
+// の共有であり、estimate.jsの数値係数のような二重管理禁止の対象ではない
+// (opLabelがcore/ops.pyの操作名と同じ語彙を独自に持つのと同じ扱い)。
+const STAGE_SECONDS_LABELS = {
+  open: "開く",
+  deletes: "削除",
+  simplify: "簡略化",
+  reextract_duplicates: "重複再抽出",
+  consolidate: "重複統合",
+  write: "書き込み",
+};
+
+/**
+ * export_result.stage_seconds から表示用の行データ配列を作る(監督者裁定5)。
+ * 0秒以下のステージ(consolidate=falseのときexport.apply_operationsが
+ * reextract_duplicates/consolidateに明示的に0.0を入れる、等)は実行されていない
+ * ため意味の無い行になり、除外する。未知キーが来てもラベルが無いだけで
+ * 落ちない(そのままキー文字列を表示する)。
+ * @param {Record<string, number>|undefined} stageSeconds
+ * @returns {Array<{key:string, label:string, seconds:number}>}
+ */
+function formatStageSeconds(stageSeconds) {
+  if (!stageSeconds) return [];
+  return Object.entries(stageSeconds)
+    .filter(([, seconds]) => seconds > 0)
+    .map(([key, seconds]) => ({ key, label: STAGE_SECONDS_LABELS[key] ?? key, seconds }));
+}
+
+/**
+ * export_result から表示すべき先頭行の文言を選ぶ(GUI改修Task5、既存バグ修正の
+ * 核)。result.errorがあれば失敗文言(サーバの拒否理由をそのまま含む、verbatim:
+ * 「出力に失敗しました: {error}」)を返す。無ければ既存の件数表示文言を返す。
+ * renderExportResultがこれを先頭行としてそのまま使う(brief手順6の
+ * ?selftest=1アサーション対象——サーバ契約は変えないため、この分岐自体を
+ * フロントのテストで固定する)。
+ * @param {{error?:string, deleted?:*, simplified?:*, skipped?:*}} result
+ * @returns {string}
+ */
+function pickExportMessage(result) {
+  if (result.error) return `出力に失敗しました: ${result.error}`;
+  return `削除: ${result.deleted}件 / 軽量化: ${result.simplified}件 / スキップ: ${result.skipped}件`;
+}
+
+/**
+ * 「出力」ボタン: 同名/既存チェック→POST /api/export→/api/statusをポーリングし
+ * 結果を表示する。
+ */
 async function handleExportClick() {
   const outputPath = exportPathInput.value.trim();
   if (!outputPath) {
     showError("出力パスを入力してください。");
     return;
   }
+  // 監督者裁定2: 手打ち欄はinputイベントで反応的に赤字/ボタン無効化されている
+  // はずだが、押下時にも同じ判定でもう一度止める(防御的二重チェック。
+  // 最終防衛線はサーバ側 core/export.apply_operations の refers_to_same_file)。
+  if (refreshExportPathValidity()) return;
   clearError();
-  exportButton.disabled = true;
+
+  // 監督者裁定3: 既存ファイルへの出力は上書き確認を挟む。新しいAPIは増やさず
+  // /api/filesの一覧で存在を判定する(手打ち・ダイアログ選択のどちらでも同じ
+  // ここ1箇所で判定する)。
+  const exists = await exportTargetExists(outputPath);
+  if (exists) {
+    const fileName = outputPath.split(/[/\\]/).pop() || outputPath;
+    const confirmed = await showModal({
+      title: "上書きの確認",
+      bodyHtml: `<div>${escapeHtml(fileName)} は既に存在します。上書きしますか?</div>`,
+      actions: [
+        { label: "キャンセル", value: false },
+        { label: "上書きする", value: true, primary: true },
+      ],
+    });
+    if (!confirmed) return;
+  }
+
+  setExportInFlight(true);
   exportResult.innerHTML = "";
+  const startedAt = performance.now();
+  exportStatusLine.textContent = "出力中... (0.0秒)";
 
   try {
     await startExport(outputPath, exportConsolidateCheckbox.checked);
   } catch (err) {
     showError(String(err.message || err));
-    exportButton.disabled = false;
+    setExportInFlight(false);
+    exportStatusLine.textContent = "";
     return;
   }
 
@@ -1179,22 +1780,38 @@ async function handleExportClick() {
       status = await pollStatus();
     } catch (err) {
       clearInterval(handle);
-      exportButton.disabled = false;
+      setExportInFlight(false);
+      exportStatusLine.textContent = "";
       showError(String(err.message || err));
       return;
     }
 
-    if (status.state === "exporting") return;
+    if (status.state === "exporting") {
+      // /api/statusのelapsed_secはload専用のタイマー(_load_started_at)なので
+      // export進捗には使えない(exporting中もload時点からの経過秒を返し続ける)。
+      // ここはクライアント側のperformance.nowで経過秒を測る(読込時と同じ
+      // 「実行中...(X.X秒)」の流儀を、サーバを変更せずに実現する)。
+      const elapsed = (performance.now() - startedAt) / 1000;
+      exportStatusLine.textContent = `出力中... (${elapsed.toFixed(1)}秒)`;
+      return;
+    }
 
     clearInterval(handle);
-    exportButton.disabled = false;
+    setExportInFlight(false);
 
     if (status.state === "error") {
+      exportStatusLine.textContent = "";
       showError(status.message || "出力に失敗しました。");
       return;
     }
     if (status.export_result) {
+      const elapsed = (performance.now() - startedAt) / 1000;
+      exportStatusLine.textContent = status.export_result.error
+        ? ""
+        : `出力完了 (${elapsed.toFixed(1)}秒)`;
       renderExportResult(status.export_result);
+    } else {
+      exportStatusLine.textContent = "";
     }
     if (status.state === "ready") {
       resyncOpsIfPending();
@@ -1202,7 +1819,21 @@ async function handleExportClick() {
   }, 500);
 }
 
+/**
+ * 出力結果パネルを描画する。result.errorがあれば失敗表示のみを行い、それ以外は
+ * 既存の件数/共有化/出力先/ステージ別秒数/警告を表示する(GUI改修Task5、既存
+ * バグ修正: 従来はresult.errorを見ずにresult.deleted等を読んでいたため、失敗時
+ * に「削除: undefined件」等しか表示されず理由が伝わらなかった)。
+ * @param {object} result status.export_result
+ */
 function renderExportResult(result) {
+  if (result.error) {
+    const message = pickExportMessage(result);
+    exportResult.innerHTML = `<div class="rule-error">${escapeHtml(message)}</div>`;
+    showError(message);
+    return;
+  }
+
   const warnings = result.warnings || [];
   const warningsHtml =
     warnings.length > 0
@@ -1212,10 +1843,18 @@ function renderExportResult(result) {
     result.consolidated_groups != null
       ? `<div>共有化: ${result.consolidated_groups}群 / ${result.consolidated_elements}要素</div>`
       : "";
+  const stageRows = formatStageSeconds(result.stage_seconds);
+  const stageHtml =
+    stageRows.length > 0
+      ? `<div class="export-stage-seconds">${stageRows
+          .map((row) => `${escapeHtml(row.label)}: ${row.seconds.toFixed(1)}秒`)
+          .join(" / ")}</div>`
+      : "";
   exportResult.innerHTML = `
-    <div>削除: ${result.deleted}件 / 軽量化: ${result.simplified}件 / スキップ: ${result.skipped}件</div>
+    <div>${escapeHtml(pickExportMessage(result))}</div>
     ${consolidatedHtml}
     <div>出力先: ${escapeHtml(result.output_path)}</div>
+    ${stageHtml}
     ${warningsHtml}
   `;
 }
@@ -1226,16 +1865,199 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+// ---------------------------------------------------------------------------
+// サイドバー骨格(一覧タブ・幅ドラッグ・折りたたみ) — GUI改修 Task1
+// ---------------------------------------------------------------------------
+
+const TAB_LABELS = { class: "クラス", layer: "レイヤー", duplicate: "重複形状" };
+
+/**
+ * 一覧タブを切り替える(タブの選択状態とパネル表示を同期する)。disabled
+ * かどうかはここでは見ない(disabledなタブはクリックイベント自体が来ない。
+ * 初期表示やモデル読込後の既定タブ選択など、プログラムからの呼び出しは許可する)。
+ * @param {"class"|"layer"|"duplicate"} name
+ */
+export function activateTab(name) {
+  for (const key of Object.keys(listTabButtons)) {
+    const isActive = key === name;
+    listTabButtons[key].classList.toggle("active-tab", isActive);
+    // 見た目(class)と支援技術への通知(aria-selected)を必ず一緒に更新する。
+    // 片方だけ更新するとスクリーンリーダーに嘘の状態が伝わる。
+    listTabButtons[key].setAttribute("aria-selected", isActive ? "true" : "false");
+    listPanels[key].classList.toggle("active-panel", isActive);
+  }
+}
+
+/**
+ * 一覧タブのラベルに件数を反映し、件数0ならdisabledにする
+ * (旧: renderDiagnostics/renderLayers/renderDuplicatesがh2ごと隠していた
+ * 挙動の置き換え。パネル内部の描画そのものは変えない)。
+ * @param {"class"|"layer"|"duplicate"} name
+ * @param {number} count
+ */
+function setTabCount(name, count) {
+  const button = listTabButtons[name];
+  button.textContent = `${TAB_LABELS[name]} ${count}`;
+  button.disabled = count === 0;
+}
+
+for (const key of Object.keys(listTabButtons)) {
+  listTabButtons[key].addEventListener("click", () => activateTab(key));
+}
+
+// --- サイドバー幅のドラッグリサイズ ---
+const SIDEBAR_WIDTH_KEY = "ifcOccam.sidebarWidth";
+const SIDEBAR_COLLAPSED_KEY = "ifcOccam.sidebarCollapsed";
+const SIDEBAR_MIN_WIDTH = 280;
+
+/**
+ * ウィンドウ幅から決まるサイドバー幅の上限を返す(min(60vw, 900px))。
+ * ビューポート幅を引数で受けるのはテストのため——`window.innerWidth` を
+ * 内部で読むと、期待値も同じ関数から作るしかなくなり、係数 0.6 を書き換える
+ * バグをテストが素通ししてしまう(Task 1 レビュー Important-2)。
+ * @param {number} [viewportWidth=window.innerWidth]
+ * @returns {number}
+ */
+function sidebarMaxWidth(viewportWidth = window.innerWidth) {
+  return Math.min(viewportWidth * 0.6, 900);
+}
+
+/**
+ * サイドバー幅を [280, min(60vw,900)] にクランプする。
+ *
+ * 上限が下限を下回る極端に狭いビューポート(概ね467px未満)では**下限を優先**
+ * する。計画は下限280pxと上限min(60vw,900px)を無条件に両立させる書き方に
+ * なっていて両者が矛盾する領域を定義していないが、サイドバーが280px未満に
+ * 潰れて中身が読めなくなるより、はみ出してでも読める方がましと判断した
+ * (Task 1 レビュー Minor-4 の引き取り)。
+ * @param {number} px
+ * @param {number} [viewportWidth=window.innerWidth]
+ * @returns {number}
+ */
+function clampSidebarWidth(px, viewportWidth = window.innerWidth) {
+  const max = Math.max(sidebarMaxWidth(viewportWidth), SIDEBAR_MIN_WIDTH);
+  return Math.min(Math.max(px, SIDEBAR_MIN_WIDTH), max);
+}
+
+function applySidebarWidth(px) {
+  document.documentElement.style.setProperty("--sidebar-width", `${px}px`);
+}
+
+/** 起動時にlocalStorageから幅を復元する(無ければCSS既定の340pxのまま)。 */
+function restoreSidebarWidth() {
+  const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+  if (Number.isFinite(saved) && saved > 0) {
+    applySidebarWidth(clampSidebarWidth(saved));
+  }
+}
+
+let sidebarResizing = false;
+
+sidebarResizer.addEventListener("pointerdown", (evt) => {
+  sidebarResizing = true;
+  sidebarResizer.setPointerCapture(evt.pointerId);
+  document.body.classList.add("sidebar-resizing");
+  evt.preventDefault();
+});
+
+sidebarResizer.addEventListener("pointermove", (evt) => {
+  if (!sidebarResizing) return;
+  const rect = sidebarEl.getBoundingClientRect();
+  applySidebarWidth(clampSidebarWidth(evt.clientX - rect.left));
+});
+
+function endSidebarResize() {
+  if (!sidebarResizing) return;
+  sidebarResizing = false;
+  document.body.classList.remove("sidebar-resizing");
+  const currentPx = parseFloat(document.documentElement.style.getPropertyValue("--sidebar-width"));
+  if (Number.isFinite(currentPx)) {
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(currentPx)));
+  }
+}
+sidebarResizer.addEventListener("pointerup", endSidebarResize);
+sidebarResizer.addEventListener("pointercancel", endSidebarResize);
+
+// --- サイドバー折りたたみ ---
+function applySidebarCollapsed(collapsed) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  sidebarToggle.textContent = collapsed ? "»" : "«";
+}
+
+function restoreSidebarCollapsed() {
+  applySidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
+}
+
+sidebarToggle.addEventListener("click", () => {
+  const collapsed = !document.body.classList.contains("sidebar-collapsed");
+  applySidebarCollapsed(collapsed);
+  localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+});
+
+// --- ステージ(床・壁・グリッド・軸)表示トグル(GUI改修Task9 監督者裁定8) ---
+// 既定は表示(index.htmlのaria-pressed="true"とviewer.js内のstageVisible既定値
+// が一致しているため、初期化時に明示的な同期呼び出しは不要)。
+stageToggleButton.addEventListener("click", () => {
+  const nextVisible = stageToggleButton.getAttribute("aria-pressed") !== "true";
+  viewer.setStageVisible(nextVisible);
+  stageToggleButton.setAttribute("aria-pressed", String(nextVisible));
+});
+
+restoreSidebarWidth();
+restoreSidebarCollapsed();
+
 loadButton.addEventListener("click", handleLoadClick);
-clearButton.addEventListener("click", () => {
+filePickButton.addEventListener("click", handleFilePickClick);
+manualPathToggle.addEventListener("click", () => {
+  const expanded = manualPathRow.style.display !== "none";
+  manualPathRow.style.display = expanded ? "none" : "block";
+  manualPathToggle.setAttribute("aria-expanded", expanded ? "false" : "true");
+});
+pathInput.addEventListener("input", () => {
+  // 手打ちで直接編集された場合、ダイアログ選択に基づく推定はもはや根拠が無い
+  // (サイズを取り直していない)ため、いったん隠す。
+  updateSelectedPathDisplay();
+  hideLoadEstimate();
+});
+updateSelectedPathDisplay();
+
+exportPathPickButton.addEventListener("click", handleExportPathPickClick);
+exportManualPathToggle.addEventListener("click", () => {
+  const expanded = exportManualPathRow.style.display !== "none";
+  exportManualPathRow.style.display = expanded ? "none" : "block";
+  exportManualPathToggle.setAttribute("aria-expanded", expanded ? "false" : "true");
+});
+exportPathInput.addEventListener("input", () => {
+  updateExportSelectedPathDisplay();
+  refreshExportPathValidity();
+});
+updateExportSelectedPathDisplay();
+refreshExportPathValidity();
+
+selectionChipClearButton.addEventListener("click", () => {
   clearSelectionNotice();
   selectionModel.clear();
 });
 selectionModel.onChange(renderSelection);
+renderSelection(selectionModel.selected); // 初期表示(チップ/縁取りの既定状態を確定させる)
+
+// 選択解除の経路(GUI改修Task8監督者裁定、全4経路): (1)Escキー (2)3D背景クリック
+// (3)選択済み要素の再クリック(既存のonTriangleClickのトグル挙動そのまま)
+// (4)選択チップの×(上のselectionChipClearButton)。(1)(2)をここで結線する。
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  // モーダル側のEscが優先(モーダルを閉じる動作を横取りしない)。
+  if (document.querySelector(".modal-overlay")) return;
+  // 入力欄フォーカス時は無効(Escでのテキスト編集キャンセル等を横取りしない)。
+  const activeTag = document.activeElement?.tagName;
+  if (activeTag === "INPUT" || activeTag === "TEXTAREA") return;
+  clearSelectionNotice();
+  selectionModel.clear();
+});
 
 operationList.onChange((operations) => {
   currentEffective = resolveEffective(operations);
-  applyOperationColors();
+  repaintViewerColors();
   renderOpsPanel(operations);
   scheduleOpsSync(operations);
 });
@@ -1250,7 +2072,10 @@ opsClearButton.addEventListener("click", () => {
 });
 opSimplifyMethod.addEventListener("change", () => {
   opSimplifyRatio.style.display = opSimplifyMethod.value === "decimate" ? "inline-block" : "none";
+  updateSimplifyExplanation();
 });
+opSimplifyRatio.addEventListener("input", updateSimplifyExplanation);
+updateSimplifyExplanation(); // 初期表示(選択前でも手法説明欄を埋めておく)
 exportButton.addEventListener("click", handleExportClick);
 presetLoadSamplesButton.addEventListener("click", handleLoadSamplePresetsClick);
 presetSaveButton.addEventListener("click", handleSavePresetFromCurrentClick);
@@ -1261,6 +2086,14 @@ viewer.onTriangleClick((triIndex) => {
   if (!currentMeta) return;
   const el = triangleToElement(currentMeta.elements, triIndex);
   if (el) selectionModel.toggleElement(el.global_id);
+});
+
+// 選択解除の経路2「背景クリック」(GUI改修Task8): 何にも当たらないクリックで
+// 全解除する。ドラッグ判定はviewer.js側(pointerdown/pointerup)で完了済みで、
+// ここに来るのは常に「クリックと判定されたが要素には当たらなかった」場合のみ。
+viewer.onBackgroundClick(() => {
+  clearSelectionNotice();
+  selectionModel.clear();
 });
 
 if (new URLSearchParams(window.location.search).get("selftest") === "1") {
@@ -1276,6 +2109,10 @@ window.__debug = {
   getGidToElement: () => gidToElement,
   getCurrentEffective: () => currentEffective,
   isOpsResyncPending: () => opsResyncPending,
+  // ブラウザタブが非表示扱いになりsetIntervalがスロットルされる環境(ヘッドレス
+  // 自動操作等)向けに、pollOnceを手動で1回発火させる。本番の操作導線では
+  // 使わない(startPollingの1秒間隔が唯一の呼び出し元)。
+  forcePoll: () => pollOnce(),
 };
 
 /**
@@ -1352,4 +2189,278 @@ function runSelftest() {
   checkSelected("selectByGids(未知gidのみ)", sm.selected, []);
 
   console.log(`[selftest] selectByGids: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- clampSidebarWidth の境界ケース(GUI改修 Task1 手順7) ---
+  // ビューポート幅をリテラルで渡し、期待値もリテラルで書く。実装内部と同じ
+  // 関数から期待値を作るとトートロジーになり、上限式の係数を書き換えるバグを
+  // 素通しする(Task 1 レビュー Important-2 の引き取り)。
+  check("clampSidebarWidth(下限未満)", clampSidebarWidth(100, 1600), 280);
+  check("clampSidebarWidth(範囲内)", clampSidebarWidth(400, 1600), 400);
+  check("clampSidebarWidth(上限=60vw側)", clampSidebarWidth(5000, 1000), 600);
+  check("clampSidebarWidth(上限=900px定数側)", clampSidebarWidth(5000, 2000), 900);
+  check("clampSidebarWidth(上限が下限を下回る狭幅は下限優先)", clampSidebarWidth(100, 400), 280);
+  check("sidebarMaxWidth(60vw側)", sidebarMaxWidth(1000), 600);
+  check("sidebarMaxWidth(900px定数側)", sidebarMaxWidth(2000), 900);
+
+  console.log(`[selftest] clampSidebarWidth: 7件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- readClickMode の修飾キー解釈(GUI改修 Task2 手順7) ---
+  check(
+    "readClickMode(Shift=追加)",
+    readClickMode({ shiftKey: true, ctrlKey: false, metaKey: false }),
+    "additive"
+  );
+  check(
+    "readClickMode(Ctrl=除外)",
+    readClickMode({ shiftKey: false, ctrlKey: true, metaKey: false }),
+    "subtractive"
+  );
+  check(
+    "readClickMode(Cmd=除外)",
+    readClickMode({ shiftKey: false, ctrlKey: false, metaKey: true }),
+    "subtractive"
+  );
+  check("readClickMode(修飾なし=置換)", readClickMode({}), "replace");
+
+  console.log(`[selftest] readClickMode: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- SelectionModel.addGids/removeGids の境界ケース(GUI改修 Task2 裁定1) ---
+  const sm2 = new SelectionModel();
+
+  // 空集合への追加 -> 何も変わらない
+  sm2.addGids([], elements);
+  checkSelected("addGids(空集合への追加)", sm2.selected, []);
+
+  sm2.selectByGids(["A"], elements);
+  // 既に入っているgidの追加 -> 重複しない(Setなので個数は増えない)
+  sm2.addGids(["A"], elements);
+  checkSelected("addGids(既に入っているgidの追加)", sm2.selected, ["A"]);
+
+  // 未知gid(elementsに存在しない)の追加は無視される
+  sm2.addGids(["B", "UNKNOWN"], elements);
+  checkSelected("addGids(未知gidの追加は無視される)", sm2.selected, ["A", "B"]);
+
+  // 入っていないgidの除外 -> 壊れない(既存選択はそのまま)
+  sm2.removeGids(["ZZZ"]);
+  checkSelected("removeGids(入っていないgidの除外)", sm2.selected, ["A", "B"]);
+
+  // 入っているgidの除外 -> そのgidだけ外れる
+  sm2.removeGids(["A"]);
+  checkSelected("removeGids(入っているgidの除外)", sm2.selected, ["B"]);
+
+  console.log(`[selftest] addGids/removeGids: 5件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- duplicateRow の行データ導出(GUI改修 Task2 必須アサーション) ---
+  const dupGroup = {
+    shape_ids: ["s1", "s2"],
+    triangle_count: 40,
+    savable_triangles: 40,
+    element_gids: [["a", "b"], ["c"]],
+  };
+  const dupRow = duplicateRow(dupGroup);
+  check("duplicateRow(要素数=element_gidsの平坦化件数)", dupRow.cells.element_count, 3);
+  check("duplicateRow(形状数=shape_ids.length)", dupRow.cells.shape_count, 2);
+  check("duplicateRow(三角形数はそのまま)", dupRow.cells.triangle_count, 40);
+  check("duplicateRow(節約可能はそのまま)", dupRow.cells.savable_triangles, 40);
+
+  console.log(`[selftest] duplicateRow: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- estimate.js の境界値(GUI改修 Task4 手順5) ---
+  // 実際のサーバ定数(ifc_occam/scan/aggregate.FULLOPEN_BYTES_MULTIPLIER=14、
+  // ifc_occam/cui/repl._FULLOPEN_WARN_BYTES=2*1024**3*14)と一次式の係数
+  // (sec_per_mb=0.72/base_sec=30.0/band_low=0.5/band_high=2.0)をここに
+  // ハードコードするのは「期待値」であって「実装への写経」ではない
+  // (estimate.js自体はconfigを引数で受け取るだけで、これらの値を持たない)。
+  const selftestConfig = {
+    fullopen_bytes_multiplier: 14,
+    fullopen_warn_bytes: 2 * 1024 ** 3 * 14,
+    load_estimate: { sec_per_mb: 0.72, base_sec: 30.0, band_low: 0.5, band_high: 2.0 },
+  };
+
+  // small.ifc実測: 21.5MB -> 45秒
+  const est21 = estimateLoad(21.5 * 1024 * 1024, selftestConfig);
+  check(
+    "estimateLoad(21.5MB): 実測45秒がsecLow〜secHighの範囲に入る",
+    est21.secLow <= 45 && 45 <= est21.secHigh,
+    true
+  );
+  // large.ifc実測: 102MB -> 103秒
+  const est102 = estimateLoad(102 * 1024 * 1024, selftestConfig);
+  check(
+    "estimateLoad(102MB): 実測103秒がsecLow〜secHighの範囲に入る",
+    est102.secLow <= 103 && 103 <= est102.secHigh,
+    true
+  );
+
+  check("formatDuration(90) === '1分30秒'", formatDuration(90), "1分30秒");
+  check("formatDuration(45) === '45秒'", formatDuration(45), "45秒");
+  check("formatDuration(4000) === '1時間7分'", formatDuration(4000), "1時間7分");
+  check("formatBytes(1536) === '1.5 KB'", formatBytes(1536), "1.5 KB");
+
+  console.log(`[selftest] estimate.js: 6件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- isSameRootRelativePath の境界ケース(GUI改修 Task5 監督者裁定1) ---
+  // 単純な文字列比較(===)では"./small.ifc"と"small.ifc"、大文字小文字違いを
+  // 別ファイルと誤判定する、というのがこのタスクで直す前提の不具合だった。
+  check(
+    "isSameRootRelativePath(先頭の./の表記ゆれ)",
+    isSameRootRelativePath("small.ifc", "./small.ifc"),
+    true
+  );
+  check(
+    "isSameRootRelativePath(大文字小文字違い)",
+    isSameRootRelativePath("small.ifc", "SMALL.IFC"),
+    true
+  );
+  check(
+    "isSameRootRelativePath(バックスラッシュ表記の違い)",
+    isSameRootRelativePath("sub/small.ifc", "sub\\small.ifc"),
+    true
+  );
+  check(
+    "isSameRootRelativePath(別ファイルはfalse)",
+    isSameRootRelativePath("small.ifc", "large.ifc"),
+    false
+  );
+  check(
+    "isSameRootRelativePath(片方が空文字は同一とみなさない)",
+    isSameRootRelativePath("", "small.ifc"),
+    false
+  );
+  check(
+    "isSameRootRelativePath(両方空文字も同一とみなさない)",
+    isSameRootRelativePath("", ""),
+    false
+  );
+
+  console.log(`[selftest] isSameRootRelativePath: 6件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- pickExportMessage(GUI改修 Task5 brief手順6 必須アサーション) ---
+  // 既存バグ(出力失敗時にresult.errorを見ずにresult.deleted等を読んでいたため
+  // 「削除: undefined件」等しか出なかった)の修正をフロント側で固定する。
+  check(
+    "pickExportMessage({error:'x'})は理由を含む失敗文言を返す",
+    pickExportMessage({ error: "x" }),
+    "出力に失敗しました: x"
+  );
+  check(
+    "pickExportMessage(成功形)は失敗文言を返さない",
+    pickExportMessage({ deleted: [], simplified: [], skipped: [] }).startsWith("出力に失敗しました"),
+    false
+  );
+
+  console.log(`[selftest] pickExportMessage: 2件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- formatStageSeconds: 0秒のステージを除外する(GUI改修 Task5 監督者裁定5) ---
+  const stageRows = formatStageSeconds({
+    open: 1.2,
+    deletes: 0,
+    simplify: 0.5,
+    reextract_duplicates: 0,
+    consolidate: 0,
+    write: 0.3,
+  });
+  check("formatStageSeconds(0秒のステージを除外した件数)", stageRows.length, 3);
+  check("formatStageSeconds(1番目は開く)", stageRows[0].label, "開く");
+  check("formatStageSeconds(2番目は簡略化)", stageRows[1].label, "簡略化");
+  check("formatStageSeconds(3番目は書き込み)", stageRows[2].label, "書き込み");
+  check("formatStageSeconds(stage_seconds未指定は空配列)", formatStageSeconds(undefined).length, 0);
+
+  console.log(`[selftest] formatStageSeconds: 5件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- estimateSimplified(GUI改修 Task7 brief手順4・監督者裁定必須アサーション) ---
+  check(
+    "estimateSimplified(bbox): 要素数10→120三角形(要素あたり12三角形で確定)",
+    estimateSimplified({ method: "bbox", elementCount: 10, triangles: 5000 })?.after,
+    120
+  );
+  check(
+    "estimateSimplified(decimate): round(5000*0.3)=1500",
+    estimateSimplified({ method: "decimate", elementCount: 10, triangles: 5000, ratio: 0.3 })?.after,
+    1500
+  );
+  check(
+    "estimateSimplified(convex_hull): 事前に数値を出せないためnull(推測値を出さない)",
+    estimateSimplified({ method: "convex_hull", elementCount: 10, triangles: 5000 }),
+    null
+  );
+  check(
+    "estimateSimplified(選択0件): elementCount=0はnull('約0→0三角形'を作らせない)",
+    estimateSimplified({ method: "bbox", elementCount: 0, triangles: 0 }),
+    null
+  );
+
+  console.log(`[selftest] estimateSimplified: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- isClickNotDrag(GUI改修Task8 brief手順6・監督者裁定の必須アサーション) ---
+  // 視点操作(ドラッグ)と選択/背景クリックを区別する閾値: 5px未満かつ400ms未満。
+  check(
+    "isClickNotDrag(小さい移動・短時間=クリック)",
+    isClickNotDrag({ dx: 2, dy: 2, ms: 100 }),
+    true
+  );
+  check(
+    "isClickNotDrag(大きい移動=視点操作のドラッグ)",
+    isClickNotDrag({ dx: 20, dy: 0, ms: 100 }),
+    false
+  );
+  check(
+    "isClickNotDrag(移動は無いが長時間の押下=ドラッグ扱い)",
+    isClickNotDrag({ dx: 0, dy: 0, ms: 900 }),
+    false
+  );
+
+  console.log(`[selftest] isClickNotDrag: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- shouldOutline(GUI改修Task8 brief手順6・監督者裁定の必須アサーション) ---
+  // 縁取り生成コストは選択三角形数に比例するため、200,000三角形を上限とする。
+  check("shouldOutline(上限未満なら縁取りを作る)", shouldOutline(150000), true);
+  check("shouldOutline(上限超過なら縁取りを作らない)", shouldOutline(250000), false);
+
+  console.log(`[selftest] shouldOutline: 2件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- shouldDim(GUI改修Task8 監督者裁定2: 減光の規約) ---
+  // 選択0件では減光しない(全要素が通常色)。1件以上選択されたときだけ減光する。
+  check("shouldDim(選択0件では減光しない)", shouldDim(0), false);
+  check("shouldDim(選択1件以上では減光する)", shouldDim(1), true);
+
+  console.log(`[selftest] shouldDim: 2件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- roundToNiceStep(GUI改修Task9 必須アサーション: グリッド分割幅の丸め) ---
+  // 期待値はroundToNiceStepを呼ばずに手計算したリテラル(1,2,5,10の系列を10進の
+  // 桁ごとに適用する規則そのものを目で追って検算した値):
+  //   1234 -> 指数3(base=1000)、fraction=1.234<1.5 -> 1倍 -> 1000
+  //   37   -> 指数1(base=10)、  fraction=3.7 (3.5以上7.5未満) -> 5倍 -> 50
+  //   60000-> 指数4(base=10000)、fraction=6   (3.5以上7.5未満) -> 5倍 -> 50000
+  //          (small.ifcのようなmm単位・座標が数万〜数十万のモデルでも破綻しないことの確認)
+  //   8    -> 指数0(base=1)、   fraction=8   (7.5以上)       -> 10倍 -> 10
+  check("roundToNiceStep(1234) === 1000", roundToNiceStep(1234), 1000);
+  check("roundToNiceStep(37) === 50", roundToNiceStep(37), 50);
+  check(
+    "roundToNiceStep(60000) === 50000(mm単位で座標が大きいモデルでも破綻しない)",
+    roundToNiceStep(60000),
+    50000
+  );
+  check("roundToNiceStep(8) === 10(次の桁への繰り上げ)", roundToNiceStep(8), 10);
+
+  console.log(`[selftest] roundToNiceStep: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- buildStage(GUI改修Task9 必須アサーション: margin適用寸法と床Yの一致) ---
+  const stageTestBox = new THREE.Box3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(10, 4, 6));
+  const stageTest = buildStage(stageTestBox, { margin: 0.15 });
+  const stageFloor = stageTest.group.children.find((c) => c.name === "stage-floor");
+  check("buildStage: 床のY座標がAABBの最小Yと一致する(裁定4)", stageFloor.position.y, 0);
+  check(
+    "buildStage: margin適用後の床のX幅(13)がAABBのX幅(10)より大きい",
+    stageFloor.geometry.parameters.width > stageTestBox.max.x - stageTestBox.min.x,
+    true
+  );
+  check(
+    "buildStage: margin適用後の床のZ幅(7.8)がAABBのZ幅(6)より大きい",
+    stageFloor.geometry.parameters.height > stageTestBox.max.z - stageTestBox.min.z,
+    true
+  );
+  stageTest.dispose();
+
+  console.log(`[selftest] buildStage: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
 }

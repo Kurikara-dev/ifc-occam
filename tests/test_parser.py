@@ -484,12 +484,12 @@ def test_small_ifc_class_counts_match_ifcopenshell_for_sample_product_classes(sm
 def test_large_ifc_full_parse_throughput_and_sanity(large_ifc_path):
     """large.ifc で reader.iter_records + parse_record を通した実測を報告する。
 
-    reader.py単体は30.4MB/s(cui-task-1-report.md)だが、parser.py の
+    reader.py単体は30.4MB/s(docs/plans/2026-07-24-cui-phase1.md Task 1)だが、parser.py の
     レコードごとの処理(正規表現によるヘッダ/GUIDマッチ、中間クラスの
     refs抽出、frontierの重み計算)が乗るため、これより遅くなるのは想定内。
     プロファイル(300,000レコード)で `_split_top_level` が1バイトずつの
     Pythonループになっていた実装上の穴を見つけて修正済み(find/正規表現の
-    ジャンプ方式に変更、cui-task-2-report.md 参照)。それでも合成テストの
+    ジャンプ方式に変更、docs/plans/2026-07-24-cui-phase1.md Task 2 参照)。それでも合成テストの
     シンプルな操作の積み重ねで reader 単体より1桁近く遅い実測値になって
     いる。目標値は本タスクのブリーフに明記されていないため、壊滅的な
     劣化(1MB/s未満)のみを検知するフロアに留め、最適化判断自体は

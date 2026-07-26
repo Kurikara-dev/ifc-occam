@@ -408,7 +408,7 @@ def test_skip_past_realistic_metadata_description_does_not_yield_garbage(tmp_pat
 
 # --- 未再現の残懸念: skip_past の再走査開始位置クランプ(防御的修正) ---
 #
-# cui-task-1-report.md の残懸念: `search_from = max(0, len(self._buf) - (len(marker)
+# docs/plans/2026-07-24-cui-phase1.md Task 1 の残懸念: `search_from = max(0, len(self._buf) - (len(marker)
 # - 1))` が `self._pos` でクランプされていない。理論上、次の `_fill()` 後の再探索が
 # `self._pos` より最大 `len(marker)-2` バイト手前から始まる余地がある。
 #

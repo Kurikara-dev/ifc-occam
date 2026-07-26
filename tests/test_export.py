@@ -443,6 +443,62 @@ def test_apply_operations_does_not_mutate_source_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 出力先=入力先の禁止(原本非破壊。フェーズ最終レビューのC1をフルオープン経路へ
+# 水平展開したもの。テキスト経路は入力を truncate するが、フルオープン経路は
+# 全体をメモリに読んでから書くため truncate はしない——それでも原本を軽量化
+# 結果で上書きするのは同じく契約違反なので、両経路で拒否する)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_operations_refuses_output_equal_to_source(tmp_path):
+    """出力先が入力ファイルと同一実体なら ValueError で拒否し、原本を
+    1バイトも変えないこと。"""
+    import hashlib
+
+    f = build_wall_with_window_ifc()
+    wall_gid = _gid(f.by_type("IfcWall")[0])
+    src_path = _write_fixture(f, tmp_path)
+    before_size = Path(src_path).stat().st_size
+    before_hash = hashlib.sha256(Path(src_path).read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="同一"):
+        apply_operations(src_path, [Operation(op="delete", targets=[wall_gid])], src_path)
+
+    assert Path(src_path).stat().st_size == before_size
+    assert hashlib.sha256(Path(src_path).read_bytes()).hexdigest() == before_hash
+
+
+def test_apply_operations_refuses_output_equal_to_source_before_opening(tmp_path, monkeypatch):
+    """拒否はフルオープンより**前**に行うこと(開いて削除まで終えてから
+    write 直前で落ちると、その時間が丸ごと無駄になる)。"""
+    f = build_wall_with_window_ifc()
+    wall_gid = _gid(f.by_type("IfcWall")[0])
+    src_path = _write_fixture(f, tmp_path)
+
+    def _boom_open(*a, **kw):
+        raise AssertionError("同一パスガードより前に ifcopenshell.open が呼ばれた")
+
+    monkeypatch.setattr(ifcopenshell, "open", _boom_open)
+
+    with pytest.raises(ValueError, match="同一"):
+        apply_operations(src_path, [Operation(op="delete", targets=[wall_gid])], src_path)
+
+
+def test_apply_operations_refuses_output_equal_to_source_via_relative_name(tmp_path):
+    """相対パス指定でも拒否すること(`resolve_output_path` は相対パスを入力
+    ファイルと同じディレクトリ基準で解決するため、入力ファイル名だけを
+    入力すると同一実体になる。GUI の export モーダルはこの運用)。"""
+    f = build_wall_with_window_ifc()
+    wall_gid = _gid(f.by_type("IfcWall")[0])
+    src_path = _write_fixture(f, tmp_path)
+
+    with pytest.raises(ValueError, match="同一"):
+        apply_operations(
+            src_path, [Operation(op="delete", targets=[wall_gid])], Path(src_path).name
+        )
+
+
+# ---------------------------------------------------------------------------
 # consolidate: 出力時共有形状化 (Phase4 Task2)
 # ---------------------------------------------------------------------------
 
@@ -660,7 +716,7 @@ def test_apply_operations_progress_reports_both_stages_in_one_call(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 大量削除の高速経路 (_mass_delete, CUI Phase1 Task7 Stage B, cui-task-7-report.md):
+# 大量削除の高速経路 (_mass_delete, CUI Phase1 Task7 Stage B, docs/plans/2026-07-24-cui-phase1.md Task 7):
 # closure確定後の対象件数が _MASS_DELETE_THRESHOLD(=1,000)を超えたら
 # ifcopenshell.util.element.batch_remove_deep2/unbatch_remove_deep2 経路が発動する。
 # 閾値以下は現行(per-remove)経路のまま変わらない。
@@ -953,7 +1009,7 @@ def test_export_stamps_provenance_header_file_object_src_defaults_to_in_memory(t
 
 
 def test_export_stamps_provenance_header_round_trips_non_ascii_source_name(tmp_path):
-    """回帰ガード(監督者要件、cui-p2-task-3-report.md): `_stamp_provenance` は
+    """回帰ガード(監督者要件、docs/plans/2026-07-25-cui-phase2.md Task 3): `_stamp_provenance` は
     source_name自体のエスケープを一切行わず、ifcopenshellの標準STEPエスケープ
     (\\X2\\...\\X0\\)に委ねる設計(export.py の `_stamp_provenance` docstring
     参照)。日本語を含むsource_name(例: 図面データ.ifc)を渡しても、出力を

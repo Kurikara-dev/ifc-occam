@@ -20,6 +20,10 @@ The full suite must pass (all green) before any change is merged. New behavior s
 
 Large IFC test fixtures (multi-hundred-MB to multi-GB models) are not included in this repository; they are excluded via `.gitignore` (`*.ifc`). Use your own sample files, or the small fixtures under `tests/`, when working locally.
 
+## Documentation
+
+Some docstrings reference internal design and planning documents (`docs/design.md`, `docs/cui-design.md`, `docs/plans/`); those are not included in this public distribution.
+
 ## Commit style
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) (e.g. `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`) for commit subjects.

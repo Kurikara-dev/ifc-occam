@@ -60,7 +60,7 @@ def test_find_free_port_skips_occupied_port():
         assert result >= occupied_port
 
 
-# --- cui サブコマンド (cui-design.md §6 cli.py節、task-6-brief.md) ---
+# --- cui サブコマンド (cui-design.md §6 cli.py節、docs/plans/2026-07-24-cui-phase1.md Task 6) ---
 #
 # repl.run自体のTDDはtest_repl.pyが担う。ここではargparseの配線
 # (`cui <path> [--output <path>] [--scan-only]` → repl.run呼び出し)だけを確認する。
@@ -69,7 +69,7 @@ def test_find_free_port_skips_occupied_port():
 def test_cui_subcommand_calls_run_cui_with_parsed_args(monkeypatch):
     captured = {}
 
-    def _fake_run_cui(path, *, output=None, scan_only=False):
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False):
         captured["path"] = path
         captured["output"] = output
         captured["scan_only"] = scan_only
@@ -84,7 +84,7 @@ def test_cui_subcommand_calls_run_cui_with_parsed_args(monkeypatch):
 def test_cui_subcommand_defaults_output_none_and_scan_only_false(monkeypatch):
     captured = {}
 
-    def _fake_run_cui(path, *, output=None, scan_only=False):
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False):
         captured["path"] = path
         captured["output"] = output
         captured["scan_only"] = scan_only
@@ -96,8 +96,27 @@ def test_cui_subcommand_defaults_output_none_and_scan_only_false(monkeypatch):
     assert captured == {"path": "model.ifc", "output": None, "scan_only": False}
 
 
+def test_cui_subcommand_forwards_text_flag_to_run_cui(monkeypatch):
+    """--text フラグが run_cui(= repl.run)の text= に渡ること
+    (docs/plans/2026-07-25-cui-phase3.md Task5)。既存フラグ(output/scan_only)
+    は無変更のまま同時に渡ることも確認する。"""
+    captured = {}
+
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False):
+        captured["path"] = path
+        captured["output"] = output
+        captured["scan_only"] = scan_only
+        captured["text"] = text
+
+    monkeypatch.setattr(cli, "run_cui", _fake_run_cui)
+
+    main(["cui", "model.ifc", "--text"])
+
+    assert captured == {"path": "model.ifc", "output": None, "scan_only": False, "text": True}
+
+
 def test_cui_scan_only_on_real_small_ifc_prints_ranking_via_cli_main(small_ifc_path, capsys):
-    """task-6-brief.md 統合テスト: `cui --scan-only` (CLI経由) が small.ifc で
+    """docs/plans/2026-07-24-cui-phase1.md Task 6 統合テスト: `cui --scan-only` (CLI経由) が small.ifc で
     ランキングを出力する。repl.run自体の詳細はtest_repl.pyが担うため、ここでは
     argparse配線を通してもこの結果が変わらないことだけを確認する。"""
     main(["cui", str(small_ifc_path), "--scan-only"])

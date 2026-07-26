@@ -1,0 +1,644 @@
+* { box-sizing: border-box; }
+:root {
+  --sidebar-width: 340px;
+}
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #202020;
+  color: #e0e0e0;
+}
+#layout {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+#sidebar {
+  width: var(--sidebar-width);
+  flex: 0 0 var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  background: #262626;
+  border-right: 1px solid #3a3a3a;
+  overflow: hidden;
+}
+#sidebar-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+}
+/* 操作バー。中身(選択チップ/選択情報/操作/操作リスト/操作パターン/出力)は
+   状態によって伸び縮みするので上限を持たせ、超えた分はこのブロック内で
+   スクロールさせる。50vh では選択中に出力ブロックが隠れたため 60vh へ広げた
+   (フェーズ最終レビュー I-1)。一覧側(#list-panels)にも独立の上限があるので、
+   ここを広げても一覧が読めなくなることはない。 */
+#ops-dock {
+  flex: 0 0 auto;
+  border-top: 1px solid #3a3a3a;
+  padding: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+#sidebar-resizer {
+  flex: 0 0 6px;
+  width: 6px;
+  cursor: col-resize;
+  background: #2a2a2a;
+}
+#sidebar-resizer:hover,
+body.sidebar-resizing #sidebar-resizer {
+  background: #3b6fd6;
+}
+body.sidebar-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+body.sidebar-collapsed #sidebar,
+body.sidebar-collapsed #sidebar-resizer {
+  display: none;
+}
+/* ビューポート左辺の中央に貼り付く「取っ手」。左上には置かないこと——
+   #error-banner が上端に全幅で出るため、実測でエラー文言の先頭がこのボタンの
+   下に隠れた(Task 1 レビュー Important-1)。上下中央なら banner と交差しない。 */
+#sidebar-toggle {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  transform: translateY(-50%);
+  z-index: 11;
+  padding: 12px 4px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 0 4px 4px 0;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+#sidebar-toggle:hover { background: #555; }
+#viewport {
+  flex: 1 1 auto;
+  position: relative;
+}
+#viewport canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+#error-banner {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  background: #b91c1c;
+  color: #fff;
+  padding: 8px 12px;
+  font-size: 13px;
+  z-index: 10;
+}
+/* 3Dビュー右上のステージ(床・壁・グリッド・軸)表示切替(GUI改修Task9)。
+   #error-bannerは上端全幅・#sidebar-toggleは左辺中央なので、右上に置けば
+   左上/左辺中央とは重ならない。banner表示時(高さ実測約32px)とも重ならない
+   よう、上端から44pxのオフセットを取っている。 */
+#stage-toggle-button {
+  position: absolute;
+  top: 44px;
+  right: 12px;
+  z-index: 11;
+  padding: 6px 10px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+#stage-toggle-button:hover { background: #555; }
+#stage-toggle-button[aria-pressed="false"] {
+  background: #2a2a2a;
+  color: #7a7f84;
+}
+h1 { font-size: 15px; margin: 0 0 10px; }
+h2 { font-size: 13px; margin: 16px 0 6px; color: #9aa0a6; }
+#path-input {
+  width: 100%;
+  padding: 6px;
+  background: #1c1c1c;
+  color: #e0e0e0;
+  border: 1px solid #444;
+  border-radius: 4px;
+}
+#load-button {
+  margin-top: 8px;
+  width: 100%;
+  padding: 7px;
+  background: #3b6fd6;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#load-button:disabled { background: #555; cursor: default; }
+#status-line, #export-status-line {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #9aa0a6;
+  min-height: 16px;
+}
+#diagnostics-summary {
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* --- 一覧の共通テーブル部品(GUI改修Task2: datatable.js) ---
+   クラス別ランキング/レイヤー/重複形状グループの3パネルが共有する。 */
+#list-hint {
+  font-size: 10px;
+  color: #6f7579;
+  margin: 8px 0 4px;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.data-table th, .data-table td {
+  text-align: left;
+  padding: 2px 4px;
+  border-bottom: 1px solid #3a3a3a;
+  white-space: nowrap;
+}
+.data-table th.col-right, .data-table td.col-right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.data-table th {
+  color: #9aa0a6;
+  cursor: pointer;
+  user-select: none;
+}
+.data-table th:hover { color: #e0e0e0; }
+.data-table th.sorted { color: #e0e0e0; }
+.data-table th.sorted[data-sort-dir="desc"]::after { content: " \25bc"; font-size: 9px; }
+.data-table th.sorted[data-sort-dir="asc"]::after { content: " \25b2"; font-size: 9px; }
+.data-table tbody tr { cursor: pointer; }
+.data-table tbody tr:hover { background: #333; }
+.data-table tbody tr.selected-row { background: #5a2a2a; }
+.data-table tbody tr.row-disabled { cursor: default; color: #555; }
+.data-table td.row-actions {
+  display: flex;
+  gap: 3px;
+  justify-content: flex-end;
+  white-space: nowrap;
+}
+/* クイックボタンは既定でopacity:0(見た目の基調を変えないため常時表示にしない)。
+   hoverだけで出す実装はキーボード操作で永久に押せなくなるため、行内フォーカス
+   でも出す。**実際に効いているのは tr の :focus-within の方**で、ボタン自身の
+   :focus-visible はこの経路では発火しない(Task 2 レビューで実測: ボタンに
+   focus() を当てても btn.matches(":focus-visible") は false、
+   tr.matches(":focus-within") が true)。:focus-visible の行はマウス以外の
+   モダリティに対する保険として残してあるだけなので、:focus-within を消すと
+   キーボード到達性が失われる。 */
+.row-quick-button {
+  opacity: 0;
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 10px;
+}
+.data-table tbody tr:hover .row-quick-button,
+.data-table tbody tr:focus-within .row-quick-button,
+.row-quick-button:focus-visible {
+  opacity: 1;
+}
+.row-quick-button:hover { background: #3b6fd6; }
+.datatable-empty {
+  font-size: 11px;
+  color: #9aa0a6;
+  padding: 4px;
+}
+#list-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 16px 0 0;
+}
+#list-tabs button {
+  flex: 1 1 0;
+  padding: 6px 4px;
+  font-size: 11px;
+  background: #1c1c1c;
+  color: #9aa0a6;
+  border: 1px solid #444;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+}
+#list-tabs button:hover:not(:disabled) { background: #333; }
+#list-tabs button:disabled { color: #555; cursor: default; }
+#list-tabs button.active-tab { background: #333; color: #e0e0e0; }
+#list-tabs button.active-tab:disabled { color: #ccc; }
+#list-panels {
+  border: 1px solid #444;
+  padding: 6px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.list-panel { display: none; }
+.list-panel.active-panel { display: block; }
+#duplicates-note {
+  font-size: 11px;
+  color: #9aa0a6;
+  margin-top: 4px;
+}
+#layerless-note {
+  font-size: 11px;
+  color: #9aa0a6;
+  margin-top: 4px;
+}
+/* 「操作パターン」セクション(GUI改修Task6で #ops-dock の操作リスト直後へ
+   移動。旧「プリセット」の見た目の基調は変えていない)。
+   フェーズ最終レビュー I-1: このブロックは畳んでいても95px占め、出力ブロックを
+   dock(max-height:50vh)の外へ押し出していた。常用する道具ではない(保存済みの
+   パターンを呼び出すときだけ開く)ので <details> にして既定で閉じる。見出しは
+   他セクションの h2 と同じ見た目に揃える。 */
+#preset-section > summary {
+  font-size: 13px;
+  margin: 16px 0 6px;
+  color: #9aa0a6;
+  cursor: pointer;
+  list-style: revert;
+}
+#preset-section > summary:hover { color: #e0e0e0; }
+#preset-desc {
+  font-size: 11px;
+  color: #9aa0a6;
+  margin: 2px 0 8px;
+}
+/* 操作パターンの一覧だけが高さ無制限だと、#ops-dock(max-height:50vh)の中で
+   出力ブロックを押し出してしまう。実測(1280x800)では2件で239px、5件で577pxが
+   dock の外へはみ出し、**出力ボタンにスクロールなしで届かなくなっていた**
+   ——「操作導線をスクロールなしで完結させる」というこのフェーズの目的に
+   正面から反する(フェーズ最終レビュー I-1)。一覧側に上限を持たせ、増えても
+   出力が押し出されないようにする。 */
+#preset-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 11px;
+  max-height: 14vh;
+  overflow-y: auto;
+}
+#preset-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px;
+  border-bottom: 1px solid #3a3a3a;
+}
+.preset-name { font-weight: bold; }
+.preset-desc { color: #9aa0a6; font-size: 10px; }
+.preset-actions { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.preset-apply-button, #preset-load-samples-button, #preset-save-button {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.preset-apply-button:hover, #preset-load-samples-button:hover, #preset-save-button:hover {
+  background: #3b6fd6;
+}
+/* 削除(×)ボタン: 適用ボタンと並べる小さな正方形寄りのボタン。誤操作の
+   コストが高い(取り消せない)ため、hoverで警告色に寄せる(.op-cancel-button
+   と同じ配色方針)。verbatim確認モーダルを必ず経由するので単発クリックでは
+   削除されない。 */
+.preset-delete-button {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+}
+.preset-delete-button:hover { background: #5a2a2a; }
+#preset-load-samples-button, #preset-save-button {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+}
+#preset-empty-notice {
+  font-size: 11px;
+  color: #9aa0a6;
+}
+.rule-count-warning { color: #f0a020; font-weight: bold; }
+.rule-error { color: #e05252; font-weight: bold; }
+/* --- 選択チップ(GUI改修Task8): #ops-dock先頭に常時表示する選択件数+全解除。
+   既存の「選択をクリア」ボタン(#clear-button)はこの×に統合して撤去した。 */
+#selection-chip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #3a3a3a;
+  font-size: 12px;
+}
+#selection-chip-label { color: #e0e0e0; }
+#selection-chip-label.selection-chip-empty { color: #6f7579; }
+#selection-chip-clear-button {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.3;
+}
+#selection-chip-clear-button:hover { background: #5a2a2a; }
+#selection-chip-outline-note {
+  font-size: 11px;
+  color: #9aa0a6;
+}
+#info-panel {
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+#selection-notice {
+  display: none;
+  margin-top: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: #4a3a1c;
+  color: #f0d9a0;
+  border-radius: 4px;
+}
+#excluded-line {
+  color: #9aa0a6;
+}
+#ops-controls { display: flex; flex-direction: column; gap: 6px; }
+#ops-controls button, #op-simplify-row select, #op-simplify-row input {
+  padding: 6px;
+  background: #1c1c1c;
+  color: #e0e0e0;
+  border: 1px solid #444;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+#op-simplify-row { display: flex; gap: 4px; }
+#op-simplify-row select { flex: 1 1 auto; cursor: pointer; }
+#op-simplify-row input { width: 64px; cursor: text; }
+#op-simplify-row button { flex: 0 0 auto; }
+#op-delete-button:hover, #op-simplify-button:hover, #op-keep-button:hover { background: #333; }
+/* 簡略化手法の説明・ratio欄の補足・効果の目安(GUI改修Task7)。既存の
+   補助テキスト色(#9aa0a6系、#preset-descと同じ基調)に合わせる。 */
+#simplify-desc, #simplify-ratio-desc, #simplify-estimate {
+  font-size: 11px;
+  color: #9aa0a6;
+  margin: 2px 0;
+}
+#ops-panel-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+#ops-panel-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 3px 4px;
+  border-bottom: 1px solid #3a3a3a;
+}
+#ops-panel-list li span { overflow: hidden; text-overflow: ellipsis; }
+.op-cancel-button {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.op-cancel-button:hover { background: #5a2a2a; }
+#ops-clear-button {
+  margin-top: 6px;
+  width: 100%;
+  padding: 6px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#ops-clear-button:hover { background: #555; }
+#export-path-input {
+  width: 100%;
+  padding: 6px;
+  background: #1c1c1c;
+  color: #e0e0e0;
+  border: 1px solid #444;
+  border-radius: 4px;
+  margin-bottom: 6px;
+}
+#export-path-error {
+  margin: -2px 0 6px;
+  font-size: 11px;
+}
+#export-button {
+  width: 100%;
+  padding: 7px;
+  background: #3b6fd6;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#export-button:disabled { background: #555; cursor: default; }
+#export-result {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.export-stage-seconds {
+  color: #9aa0a6;
+  font-size: 11px;
+}
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal-box {
+  background: #262626;
+  color: #e0e0e0;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 16px;
+  max-width: 420px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.modal-box h3 { margin: 0 0 10px; font-size: 14px; }
+.modal-body { font-size: 12px; line-height: 1.5; }
+.modal-body ul { max-height: 260px; overflow-y: auto; padding-left: 18px; margin: 6px 0; }
+.modal-warning { color: #f0a020; font-weight: bold; margin-top: 10px; }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.modal-actions button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  background: #444;
+  color: #e0e0e0;
+}
+.modal-actions button.modal-btn-primary { background: #3b6fd6; color: #fff; }
+.modal-actions button:hover { opacity: 0.9; }
+
+/* --- ファイル選択ダイアログの起動導線(GUI改修Task4)。出力側の保存先ダイアログ
+   導線(GUI改修Task5)も見た目の基調を変えないため同じセレクタに相乗りする。 */
+#file-pick-button, #export-path-pick-button {
+  width: 100%;
+  padding: 7px;
+  background: #3b6fd6;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#file-pick-button:hover, #export-path-pick-button:hover { background: #4a7de0; }
+#file-pick-button:disabled, #export-path-pick-button:disabled { background: #555; cursor: default; }
+#selected-path, #export-selected-path {
+  margin-top: 6px;
+  padding: 6px;
+  background: #1c1c1c;
+  border: 1px solid #444;
+  border-radius: 4px;
+  font-size: 12px;
+  word-break: break-all;
+  color: #cfd3d6;
+}
+#manual-path-toggle, #export-manual-path-toggle {
+  margin-top: 8px;
+  width: 100%;
+  padding: 5px;
+  background: transparent;
+  color: #9aa0a6;
+  border: 1px dashed #444;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+}
+#manual-path-toggle:hover, #export-manual-path-toggle:hover { color: #e0e0e0; border-color: #666; }
+#manual-path-row, #export-manual-path-row { margin-top: 6px; }
+#load-estimate {
+  margin-top: 8px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  background: #1c1c1c;
+  border-radius: 4px;
+}
+.load-estimate-warning {
+  margin-top: 4px;
+  color: #f0a020;
+  font-weight: bold;
+  word-break: break-all;
+}
+
+/* --- ファイル選択/保存ダイアログ本体(GUI改修Task4) --- */
+.filedialog-box {
+  width: 640px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+.filedialog-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.filedialog-breadcrumb-segment {
+  padding: 2px 6px;
+  background: transparent;
+  color: #9aa0a6;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.filedialog-breadcrumb-segment:hover { background: #333; color: #e0e0e0; }
+.filedialog-breadcrumb-sep { color: #555; }
+.filedialog-error {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: #4a1c1c;
+  color: #f5b0b0;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.filedialog-list {
+  flex: 1 1 auto;
+  min-height: 200px;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 4px;
+}
+.filedialog-dirs { margin-bottom: 4px; }
+.filedialog-dir-row {
+  padding: 4px 6px;
+  font-weight: bold;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.filedialog-dir-row:hover, .filedialog-dir-row:focus-visible {
+  background: #333;
+  outline: none;
+}
+.filedialog-filename-row { margin-top: 10px; font-size: 12px; }
+.filedialog-filename-row label { display: block; }
+.filedialog-filename-input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px;
+  background: #1c1c1c;
+  color: #e0e0e0;
+  border: 1px solid #444;
+  border-radius: 4px;
+}
+/* 監督者裁定2: 保存ダイアログのファイル名入力欄で読込中のファイルと衝突した
+   ときの赤字(色/太字は.rule-errorを流用、ここではレイアウトのみ)。 */
+.filedialog-filename-error {
+  margin-top: 6px;
+  font-size: 11px;
+}

@@ -1,4 +1,4 @@
-"""scan/aggregate.py(参照グラフ集計)のTDD (cui-design.md §4、task-3-brief.md)。
+"""scan/aggregate.py(参照グラフ集計)のTDD (cui-design.md §4、docs/plans/2026-07-24-cui-phase1.md Task 3)。
 
 合成 RawScan フィクスチャで以下を担保する:
   - 製品同定: IFCPRODUCTDEFINITIONSHAPE を参照するエンティティ=製品。
@@ -213,7 +213,7 @@ def test_diamond_within_single_product_does_not_double_count_in_expanded():
 
 def test_duplicate_ref_within_single_entity_refs_tuple_does_not_double_count():
     """1エンティティの refs タプル自体に同じidが重複して現れるケース(parserは
-    重複除去しない設計、cui-task-2-report.md参照)。aggregate側でdedupする。"""
+    重複除去しない設計、docs/plans/2026-07-24-cui-phase1.md Task 2 参照)。aggregate側でdedupする。"""
     raw = _raw(
         entities=[
             _entity(2, "IFCPRODUCTDEFINITIONSHAPE"),
@@ -317,7 +317,7 @@ def test_proxy_names_skips_none_name_and_truncates_to_top_20():
     assert names == {f"Proxy{i}" for i in range(20)}
 
 
-# --- 7b. proxy_names: タグ接頭辞集計 (task-3-brief.md, cui-p2-task-3-report.md) ---
+# --- 7b. proxy_names: タグ接頭辞集計 (docs/plans/2026-07-25-cui-phase2.md Task 3) ---
 #
 # 背景(Task 8実測、docs/cui-measurements.md「Task 8」章・「5. 鉄骨ファブ系の所見」):
 # 実データのproxy Nameは連番付き(例「【曲折円柱】曲折円柱 (1903)」)で、素朴な
@@ -602,7 +602,7 @@ def test_scan_file_end_to_end_on_tiny_synthetic_file(tmp_path):
 #
 # 旧 `_Graph.raw_id_to_full_index`(dict[int, int])はモジュールdocstring §1が
 # 明示する「id→index の Python dict は一切構築しない」という設計規則に反しており、
-# large.ifc で実測21.8MB消費していた(cui-task-4-brief.md 前段修正)。
+# large.ifc で実測21.8MB消費していた(docs/plans/2026-07-24-cui-phase1.md Task 4 前段修正)。
 # np.searchsorted一括解決(`_resolve_full_indices`)に置換する。
 #
 # 集計結果そのもの(数値の正しさ)は上記の全テストで既に担保されているため
@@ -653,7 +653,7 @@ def test_resolve_full_indices_resolves_known_raw_ids_to_their_own_position():
 
 # --- 統合テスト: small.ifc / large.ifc と GUI版 diagnose の順位相関 ---
 #
-# cui-design.md §4-4(検証手段)・task-3-brief.md(Spearman rho >= 0.6 目安、
+# cui-design.md §4-4(検証手段)・docs/plans/2026-07-24-cui-phase1.md Task 3(Spearman rho >= 0.6 目安、
 # 実測値を報告)。real側(ifcopenshellフルオープン+診断)は small.ifc で約21秒・
 # large.ifcで約109秒かかる(事前実測)。ブリーフが明示的に許可する「session
 # 単位でキャッシュ、または根拠付きで定数化」のうち、本実装はどちらも取らず
