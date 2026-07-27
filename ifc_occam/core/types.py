@@ -30,6 +30,11 @@ class ElementInfo:
     representation_types: tuple[str, ...]  # 例 ("SweptSolid",)
     layer: str | None  # IfcPresentationLayerAssignment 名
     placement: np.ndarray | None = None  # (4,4) float64 同次変換行列。幾何なし要素は None
+    color: tuple[float, float, float] | None = None
+    """IFCのスタイルから解決した拡散色(sRGB, 0..1)。スタイルが無ければ None。
+
+    値は IfcColourRgb の生値(表示色=sRGB)。線形化はしない。表示側の責務とする。
+    """
 
 
 @dataclass

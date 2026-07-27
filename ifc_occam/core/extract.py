@@ -11,6 +11,11 @@ import numpy as np
 
 from ifc_occam.core.types import ElementInfo, ModelData, ShapeInfo
 
+# geomが子アイテムのみのスタイルを解決できない場合のフォールバックに、simplify.pyの
+# 既存スタイル探索ヘルパ(Task3で作成・テスト済み)を再利用する。同じ探索ロジックを
+# ここに複製しない。
+from ifc_occam.core.simplify import _resolve_surface_rgb, _styled_items_in_subtree
+
 
 def _analyze_representation(
     rep,
@@ -60,6 +65,70 @@ def _shape_from_geometry(geometry) -> ShapeInfo:
     return ShapeInfo(shape_id=shape_id, vertices=verts, faces=faces)
 
 
+def _dominant_diffuse(geometry) -> tuple[float, float, float] | None:
+    """shape の geometry から、面数が最も多い material の拡散色を返す。
+
+    要素内で面ごとに色が違う場合は多数決で1色に潰す。ビューアの塗り分けが
+    要素単位(vertex_start/vertex_count)であり、面単位の色を保持できないため。
+    materials が空、または diffuse が取れなければ None。
+
+    ifcopenshell 0.8.5 の style.diffuse は colour オブジェクトで、r/g/b は
+    プロパティではなく *メソッド* である(`diffuse.r()`)。tuple() では展開できない。
+    """
+    materials = list(geometry.materials)
+    if not materials:
+        return None
+    ids = np.asarray(geometry.material_ids, dtype=np.int64)
+    valid = ids[(ids >= 0) & (ids < len(materials))]
+    if valid.size:
+        index = int(np.bincount(valid).argmax())
+    elif ids.size == 0 and len(materials) == 1:
+        # 面ごとの割り当てが無く material が1つだけなら、それが形状全体の色。
+        index = 0
+    else:
+        # 面が1つも指していない material しか無い。支持のない色を「多数決の勝者」と
+        # して返すと、色情報が無いのに色があることになるため None を返す。
+        return None
+    diffuse = getattr(materials[index], "diffuse", None)
+    if diffuse is None:
+        return None
+    return (float(diffuse.r()), float(diffuse.g()), float(diffuse.b()))
+
+
+def _graph_fallback_diffuse(product) -> tuple[float, float, float] | None:
+    """_dominant_diffuse が None を返した要素だけに使う、エンティティグラフ直接探索の
+    フォールバック。
+
+    geom(ifcopenshell.geom)は IfcStyledItem がトップレベルの representation item
+    ではなく内側の子アイテム(IfcClosedShell等)に付いている場合、そのスタイルを
+    解決できない(実測で確認: 合成フィクスチャで geometry.materials が空になる。
+    small.ifc実データではRebroがトップレベルにも同じスタイルを冗長に付けているため
+    表面化していなかったが、他の作図ツールの出力では黙って色が抜ける恐れがある)。
+
+    product の Body representation の Items を起点に _styled_items_in_subtree
+    (simplify.py、Task3で作成・テスト済み)で子孫まで辿り、最初に見つかった
+    IfcStyledItem の Styles から _resolve_surface_rgb で RGB を取る。
+    _styled_items_in_subtree は自分(トップレベル)->子の先行順で返すため、
+    トップレベルにスタイルがあればそれが優先される。取れなければ None。
+
+    全要素で毎回エンティティグラフを辿ると読込時間が伸びるため、呼び出し側
+    (extract_model)は _dominant_diffuse が None を返した要素にだけ限定して呼ぶこと。
+    """
+    rep = getattr(product, "Representation", None)
+    if rep is None:
+        return None
+    for r in getattr(rep, "Representations", []) or []:
+        if getattr(r, "RepresentationIdentifier", None) != "Body":
+            continue
+        for item in getattr(r, "Items", []) or []:
+            for styled_item in _styled_items_in_subtree(item):
+                for style in styled_item.Styles or []:
+                    rgb = _resolve_surface_rgb(style)
+                    if rgb is not None:
+                        return rgb
+    return None
+
+
 def _placement_from_matrix(matrix) -> np.ndarray:
     """ifcopenshell の transformation.matrix を (4,4) 同次行列に正規化する。
 
@@ -88,6 +157,14 @@ def extract_model(source: str | Path | ifcopenshell.file) -> tuple[ModelData, li
     settings = ifcopenshell.geom.settings()
     settings.set("weld-vertices", True)
     # use-world-coords はデフォルトで無効(ローカル座標を使う)。明示的に有効化しない。
+    # apply-default-materials を False にすると、スタイルを解決できなかった要素に
+    # 無彩色の "DefaultMaterial"(実測値: diffuse=(0.7, 0.7, 0.7))を合成しなくなり、
+    # geometry.materials が単に空になる。これにより「本物の色が無い」ことを
+    # 誤りなく判定でき、_graph_fallback_diffuse を呼ぶべきかどうかの判断に使える。
+    # small.ifc の全1381要素(bulk iterator経由)で True/False を比較し、
+    # vertices/faces/material_ids/materials件数のいずれも変化しないことを実測で
+    # 確認済み(実データはこの合成に依存していない)。
+    settings.set("apply-default-materials", False)
 
     products = list(model.by_type("IfcProduct"))
 
@@ -95,6 +172,7 @@ def extract_model(source: str | Path | ifcopenshell.file) -> tuple[ModelData, li
     shapes: dict[str, ShapeInfo] = {}
     guid_to_shape_id: dict[str, str] = {}
     guid_to_placement: dict[str, np.ndarray] = {}
+    guid_to_color: dict[str, tuple[float, float, float] | None] = {}
 
     num_threads = os.cpu_count() or 1
     iterator = ifcopenshell.geom.iterator(settings, model, num_threads)
@@ -110,6 +188,7 @@ def extract_model(source: str | Path | ifcopenshell.file) -> tuple[ModelData, li
                 guid_to_placement[elem.guid] = _placement_from_matrix(
                     elem.transformation.matrix
                 )
+                guid_to_color[elem.guid] = _dominant_diffuse(geometry)
             except Exception as exc:  # noqa: BLE001 - イテレータ途中の失敗は警告に積んで継続する
                 warnings.append(
                     f"ジオメトリイテレータが要素の処理中に失敗しました: {exc}"
@@ -144,6 +223,7 @@ def extract_model(source: str | Path | ifcopenshell.file) -> tuple[ModelData, li
             guid_to_placement[global_id] = _placement_from_matrix(
                 shape.transformation.matrix
             )
+            guid_to_color[global_id] = _dominant_diffuse(shape.geometry)
         except Exception as exc:  # noqa: BLE001 - 幾何化失敗は警告に積んで続行する
             warnings.append(
                 f"GlobalId={global_id} ({product.is_a()}): 幾何生成に失敗しました: {exc}"
@@ -153,16 +233,32 @@ def extract_model(source: str | Path | ifcopenshell.file) -> tuple[ModelData, li
     for product in products:
         rep = getattr(product, "Representation", None)
         representation_types, is_mapped, layer = _analyze_representation(rep)
+        shape_id = guid_to_shape_id.get(product.GlobalId)
+        color = guid_to_color.get(product.GlobalId)
+        if color is None and shape_id is not None:
+            # geom は幾何(shape_id)は作れたが色は解決できなかった。子アイテムのみの
+            # スタイルを見落としている可能性があるため、エンティティグラフを直接
+            # 辿って探す(幾何が無い要素はどうせ描画されないので試さない)。
+            try:
+                color = _graph_fallback_diffuse(product)
+            except Exception as exc:  # noqa: BLE001 - 色が取れないだけで抽出全体を止めない
+                # 上の2つのループと同じ方針。壊れたスタイルグラフを持つ1要素のせいで
+                # ファイル全体の読込が0要素で失敗するのを防ぐ(色は None のまま続行)。
+                warnings.append(
+                    f"GlobalId={product.GlobalId} ({product.is_a()}): "
+                    f"スタイルからの色の解決に失敗しました: {exc}"
+                )
         elements.append(
             ElementInfo(
                 global_id=product.GlobalId,
                 ifc_class=product.is_a(),
                 name=getattr(product, "Name", None),
-                shape_id=guid_to_shape_id.get(product.GlobalId),
+                shape_id=shape_id,
                 is_mapped=is_mapped,
                 representation_types=representation_types,
                 layer=layer,
                 placement=guid_to_placement.get(product.GlobalId),
+                color=color,
             )
         )
 

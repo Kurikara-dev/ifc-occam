@@ -16,7 +16,17 @@ import {
   fetchFileList,
   fetchConfig,
 } from "./api.js";
-import { initViewer, shouldOutline, isClickNotDrag, shouldDim } from "./viewer.js";
+import {
+  initViewer,
+  shouldOutline,
+  isClickNotDrag,
+  shouldDim,
+  resolveBaseColor,
+  ifcColorToLinear,
+  dimColor,
+  COLOR_MODE_IFC,
+  COLOR_MODE_CLASS,
+} from "./viewer.js";
 import { SelectionModel, triangleToElement } from "./selection.js";
 import { OperationList, resolveEffective } from "./operations.js";
 import { renderDataTable, readClickMode } from "./datatable.js";
@@ -28,6 +38,7 @@ import {
 import { estimateLoad, formatDuration, formatBytes } from "./estimate.js";
 import { roundToNiceStep, buildStage } from "./stage.js";
 import * as THREE from "./vendor/three.module.js"; // ?selftest=1でbuildStageにTHREE.Box3を渡すためだけに使う。
+import { measureRenderedColors } from "./rendercheck.js";
 
 const canvas = document.getElementById("canvas");
 const filePickButton = document.getElementById("file-pick-button");
@@ -82,6 +93,7 @@ const sidebarEl = document.getElementById("sidebar");
 const sidebarResizer = document.getElementById("sidebar-resizer");
 const sidebarToggle = document.getElementById("sidebar-toggle");
 const stageToggleButton = document.getElementById("stage-toggle-button");
+const colorModeSelect = document.getElementById("color-mode-select");
 const listTabButtons = {
   class: document.getElementById("tab-class"),
   layer: document.getElementById("tab-layer"),
@@ -129,6 +141,19 @@ let pollHandle = null;
 let lastLoadedPath = ""; // 読込に使ったパス文字列(export既定パスの元名導出に使う)
 let currentMeta = null; // /api/mesh の meta (elements配列を含む)
 let gidToElement = new Map(); // global_id -> element (meta.elements の1件)
+// 配色モード(色task Task5): COLOR_MODE_IFC(既定)/COLOR_MODE_CLASS。値そのものは
+// COLOR_MODE_IFCで初期化しておき、起動シーケンス終盤のrestoreColorMode()
+// (サイドバー幅と同じ「宣言はここ、localStorageからの復元呼び出しは起動
+// シーケンス末尾」の構成)がlocalStorageの値で上書きする。
+let colorModeValue = COLOR_MODE_IFC;
+
+/** 現在の配色モードを返す。viewer.repaintColors/viewer.setMeshの呼び出し全箇所が
+ *  これを渡す(1箇所でも渡し忘れると、その経路だけモード切替が効かなくなる)。
+ * @returns {string}
+ */
+function currentColorMode() {
+  return colorModeValue;
+}
 let selectionNoticeTimer = null;
 // クラス/レイヤーの行ハイライトをO(全要素)全走査せずに判定するための前計算索引。
 // onModelReadyで構築し、renderSelectionでは各クラス/レイヤー自身の要素数分だけを見る。
@@ -382,7 +407,7 @@ async function onModelReady() {
     renderLayers(diagnostics.layer_stats || [], diagnostics.layerless_element_count || 0);
     renderDuplicates(diagnostics.duplicate_groups || []);
     activateTab("class");
-    viewer.setMesh(meshData.meta, meshData.positions, meshData.indices);
+    viewer.setMesh(meshData.meta, meshData.positions, meshData.indices, currentColorMode());
     // 新規読込ではサーバ側の操作リストも空(state.set_readyでリセット済み)なので
     // フロントも追従させる(古いgidの色戻し試行はel未検出で黙って無視される)。
     exportResult.innerHTML = "";
@@ -568,12 +593,21 @@ function renderDiagnostics(diagnostics) {
       ? `<div id="excluded-line">描画対象外: ${excludedCount}要素</div>`
       : "";
 
+  // 色task Task5 手順4: IFC配色時にグレー表示になる(色情報を持たない)要素数を
+  // 知らせる。0件なら何も表示しない(黙って効いているだけで十分)。
+  const noColorCount = currentMeta ? currentMeta.elements.filter((el) => !el.color).length : 0;
+  const noColorLine =
+    noColorCount > 0
+      ? `<div id="no-color-line">色情報なし: ${noColorCount}要素(IFCの色ではグレーで表示します)</div>`
+      : "";
+
   diagnosticsSummary.innerHTML = `
     <div>スキーマ: ${escapeHtml(diagnostics.schema)}</div>
     <div>要素数: ${diagnostics.element_count}</div>
     <div>総三角形数: ${diagnostics.total_triangles}</div>
     <div>警告数: ${diagnostics.warnings.length}</div>
     ${excludedLine}
+    ${noColorLine}
   `;
 
   const stats = diagnostics.class_stats || [];
@@ -742,8 +776,11 @@ function buildEffectiveOpsForPaint() {
  * 選択・有効操作の現在値からviewer.repaintColorsを1回呼ぶ(GUI改修Task8)。
  * 「前回選択との差分だけ塗る」旧方式は廃止した(減光は選択0件/1件以上で
  * 全要素の明るさが変わるため、差分方式では成立しない)。選択が変わった時
- * (renderSelection)・操作リストが変わった時(operationList.onChange)の
- * どちらの経路からも必ずこの関数を呼び、単一の描画ロジックに揃える。
+ * (renderSelection)・操作リストが変わった時(operationList.onChange)・
+ * 配色モードが変わった時(colorModeSelectのchange)のどの経路からも必ず
+ * この関数を呼び、単一の描画ロジックに揃える(色task Task5: colorModeを
+ * 渡し忘れるとモード切替がその経路だけ効かなくなるため、呼び出しはここ
+ * 1箇所に集約している)。
  */
 function repaintViewerColors() {
   const selected = selectionModel.selected;
@@ -751,6 +788,7 @@ function repaintViewerColors() {
     selectedGids: selected,
     effectiveOps: buildEffectiveOpsForPaint(),
     dim: shouldDim(selected.size),
+    colorMode: currentColorMode(),
   });
 }
 
@@ -1943,9 +1981,21 @@ function applySidebarWidth(px) {
   document.documentElement.style.setProperty("--sidebar-width", `${px}px`);
 }
 
-/** 起動時にlocalStorageから幅を復元する(無ければCSS既定の340pxのまま)。 */
+/** 起動時にlocalStorageから幅を復元する(無ければCSS既定の340pxのまま)。
+ *
+ * localStorage が例外を投げる環境(プライベートモードやストレージ無効設定)でも
+ * 落ちないようにする。ここはモジュールのトップレベルから呼ばれるため、例外が
+ * 漏れると以降の初期化(ボタンの結線・window.__debug・selftest)が全部止まり、
+ * ページが操作不能になる。restoreColorMode 側だけ守っても、先に走るこちらで
+ * 死ぬので意味がなかった(フェーズ最終レビュー M-3)。
+ */
 function restoreSidebarWidth() {
-  const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+  let saved;
+  try {
+    saved = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+  } catch (_err) {
+    return; // 読めなければCSS既定のまま
+  }
   if (Number.isFinite(saved) && saved > 0) {
     applySidebarWidth(clampSidebarWidth(saved));
   }
@@ -1994,13 +2044,42 @@ sidebarToggle.addEventListener("click", () => {
   localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
 });
 
-// --- ステージ(床・壁・グリッド・軸)表示トグル(GUI改修Task9 監督者裁定8) ---
+// --- ステージ(床・グリッド・軸)表示トグル(GUI改修Task9 監督者裁定8) ---
 // 既定は表示(index.htmlのaria-pressed="true"とviewer.js内のstageVisible既定値
 // が一致しているため、初期化時に明示的な同期呼び出しは不要)。
 stageToggleButton.addEventListener("click", () => {
   const nextVisible = stageToggleButton.getAttribute("aria-pressed") !== "true";
   viewer.setStageVisible(nextVisible);
   stageToggleButton.setAttribute("aria-pressed", String(nextVisible));
+});
+
+// --- 配色モード切替(色task Task5): 「IFCの色」/「クラス別」 ---
+const COLOR_MODE_STORAGE_KEY = "ifc-occam.colorMode";
+
+/**
+ * 起動時にlocalStorageから配色モードを復元する(不正値/未設定はCOLOR_MODE_IFCのまま)。
+ * localStorageへのアクセスが例外を投げる環境(プライベートブラウジング等でストレージが
+ * 無効化されている場合等)でも、この関数の失敗でそれ以降の初期化(ボタン結線・
+ * window.__debug・selftest)まで止まってはならないため、try/catchで包み既定値
+ * (COLOR_MODE_IFC)のままフォールバックする(色task Task5 レビュー Minor)。
+ */
+function restoreColorMode() {
+  try {
+    const saved = localStorage.getItem(COLOR_MODE_STORAGE_KEY);
+    if (saved === COLOR_MODE_IFC || saved === COLOR_MODE_CLASS) {
+      colorModeValue = saved;
+    }
+  } catch (_err) {
+    colorModeValue = COLOR_MODE_IFC;
+  }
+}
+
+restoreColorMode();
+colorModeSelect.value = colorModeValue; // 復元した値をセレクトの表示にも反映する。
+colorModeSelect.addEventListener("change", () => {
+  colorModeValue = colorModeSelect.value;
+  localStorage.setItem(COLOR_MODE_STORAGE_KEY, colorModeValue);
+  repaintViewerColors(); // 現在の選択・操作状態を保ったまま塗り直す(setMeshは呼ばない)。
 });
 
 restoreSidebarWidth();
@@ -2113,6 +2192,9 @@ window.__debug = {
   // 自動操作等)向けに、pollOnceを手動で1回発火させる。本番の操作導線では
   // 使わない(startPollingの1秒間隔が唯一の呼び出し元)。
   forcePoll: () => pollOnce(),
+  // 描画結果の実測(この環境ではスクリーンショットが撮れないための代替手段。
+  // docs/testing-guide.md「オフスクリーン描画で色を確認する」を参照)。
+  measureRender: (options) => measureRenderedColors(viewer.getScene(), THREE, options),
 };
 
 /**
@@ -2460,7 +2542,110 @@ function runSelftest() {
     stageFloor.geometry.parameters.height > stageTestBox.max.z - stageTestBox.min.z,
     true
   );
+  // 壁はユーザーの実機確認により削除した(グリッド付きの床だけで広がりと天地が
+  // 読み取れ、壁は黒く重くモデルの視認性を下げていたため)。うっかり復活させない
+  // ための番人。
+  check(
+    "buildStage: ステージの子は床・グリッド・軸だけ(壁を作らない)",
+    stageTest.group.children.map((c) => c.name).sort().join(","),
+    "stage-axes,stage-floor,stage-grid"
+  );
   stageTest.dispose();
 
-  console.log(`[selftest] buildStage: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
+  console.log(`[selftest] buildStage: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- ifcColorToLinear(色task Task5 必須アサーション: sRGB→linear変換) ---
+  // sRGB 0.5 -> linear ((0.5+0.055)/1.055)^2.4 = 0.2140(手計算)。
+  // sRGB 0.0 -> 0.0、sRGB 1.0 -> 1.0 は境界。
+  const lin = ifcColorToLinear([0.5, 0.0, 1.0]);
+  check("ifcColorToLinear(sRGB 0.5 -> linear 0.2140付近)", Math.abs(lin[0] - 0.214) < 0.001, true);
+  check("ifcColorToLinear(sRGB 0.0 -> linear 0.0)", lin[1], 0);
+  check("ifcColorToLinear(sRGB 1.0 -> linear 1.0付近)", Math.abs(lin[2] - 1.0) < 0.001, true);
+
+  console.log(`[selftest] ifcColorToLinear: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- resolveBaseColor(色task Task5 必須アサーション: 真理値表4通り) ---
+  // 色(3要素配列)を許容誤差付きで比較するローカルヘルパ。ifcColorToLinearの
+  // ガンマ変換で生じる浮動小数の誤差を吸収するため、完全一致ではなく各成分の
+  // 差が0.001未満かで判定する(passed/totalの集計はcheckと共有する)。
+  function checkColor(label, actual, expected) {
+    total++;
+    const ok = actual.every((v, i) => Math.abs(v - expected[i]) < 0.001);
+    console.assert(ok, `[selftest] ${label}: expected [${expected}], got [${actual}]`);
+    if (ok) passed++;
+  }
+
+  // (a) 操作あり -> ステータス色(simplifyは[0.3,0.5,1.0])。colorMode/colorの
+  //     値に関わらず最優先で勝つことを、両方に「該当しない値」を与えて確認する。
+  const rbcOp = resolveBaseColor(
+    { color: null, ifc_class: "IfcWall" },
+    { operation: { op: "simplify" }, colorMode: COLOR_MODE_IFC }
+  );
+  checkColor("resolveBaseColor(a: 操作ありはcolorModeより優先してステータス色を返す)", rbcOp, [0.3, 0.5, 1.0]);
+
+  // (b) IFC配色 + 色あり -> その色を線形化したもの。ifcColorToLinearと同じ入力・
+  //     同じ手計算リテラルを流用する(「同じ色を線形化した値を返す」ことの確認)。
+  const rbcIfcWithColor = resolveBaseColor(
+    { color: [0.5, 0.0, 1.0], ifc_class: "IfcWall" },
+    { operation: null, colorMode: COLOR_MODE_IFC }
+  );
+  checkColor(
+    "resolveBaseColor(b: IFC配色+色ありはifcColorToLinearした値を返す)",
+    rbcIfcWithColor,
+    [0.214, 0.0, 1.0]
+  );
+
+  // (c) IFC配色 + 色なし -> NO_IFC_COLOR。[0.55,0.55,0.55]はviewer.jsの定義値を
+  //     ここでもliteralで書く(importした定数同士の比較にすると、定数の値を
+  //     書き換えるバグまで素通しするため)。
+  const rbcIfcNoColor = resolveBaseColor(
+    { color: null, ifc_class: "IfcWall" },
+    { operation: null, colorMode: COLOR_MODE_IFC }
+  );
+  checkColor("resolveBaseColor(c: IFC配色+色なしはNO_IFC_COLORを返す)", rbcIfcNoColor, [0.55, 0.55, 0.55]);
+
+  // (d) クラス配色 -> classColor(ifc_class)。ハッシュ値そのものをliteralで書くと
+  //     実装追従になるため(ブリーフの指示どおり)、「同じクラス名なら常に同じ値」
+  //     「違うクラス名なら違う値」という性質だけを検証する。
+  const rbcClassWall1 = resolveBaseColor(
+    { color: null, ifc_class: "IfcWall" },
+    { operation: null, colorMode: COLOR_MODE_CLASS }
+  );
+  const rbcClassWall2 = resolveBaseColor(
+    { color: [0.9, 0.1, 0.1], ifc_class: "IfcWall" },
+    { operation: null, colorMode: COLOR_MODE_CLASS }
+  );
+  checkColor(
+    "resolveBaseColor(d: クラス配色は同じクラス名なら常に同じ値。colorフィールドは無視される)",
+    rbcClassWall2,
+    rbcClassWall1
+  );
+  const rbcClassDoor = resolveBaseColor(
+    { color: null, ifc_class: "IfcDoor" },
+    { operation: null, colorMode: COLOR_MODE_CLASS }
+  );
+  const rbcClassDiffers = rbcClassWall1.some((v, i) => v !== rbcClassDoor[i]);
+  check("resolveBaseColor(d: クラス配色は違うクラス名なら違う値)", rbcClassDiffers, true);
+
+  console.log(`[selftest] resolveBaseColor: 5件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- dimColor(色task Task5 レビュー Important 必須アサーション: 減光の下限) ---
+  // DIM_FACTOR=0.25, DIM_FLOOR=0.06での手計算(実装から逆算していない。0.06は
+  // offscreen pixel-diffの実測から選んだ値——詳細は報告書「減光の下限」節)。
+  //   [0.8, 0.0, 0.4] -> [0.8*0.25+0.06, 0.0*0.25+0.06, 0.4*0.25+0.06]
+  //                    = [0.2+0.06, 0+0.06, 0.1+0.06] = [0.26, 0.06, 0.16]
+  checkColor("dimColor([0.8, 0.0, 0.4]) === [0.26, 0.06, 0.16](手計算)", dimColor([0.8, 0.0, 0.4]), [
+    0.26, 0.06, 0.16,
+  ]);
+  // 下限の効果そのものの確認: 元が真っ黒(0)でも0(=DIM_FLOOR)未満には落ちず、
+  // レビューで問題になった「暗い色が壁のalbedo(0.023)未満まで沈む」ことがない
+  // (0.06 > 0.023)。
+  checkColor("dimColor([0, 0, 0]) === [DIM_FLOOR, DIM_FLOOR, DIM_FLOOR] = [0.06, 0.06, 0.06]", dimColor([0, 0, 0]), [
+    0.06, 0.06, 0.06,
+  ]);
+  // 元が最大輝度(1)でも1.0を超えない([0.25+0.06=0.31] < 1.0)ことの確認
+  // (色の飽和・クランプが必要ないことの裏付け)。
+  checkColor("dimColor([1, 1, 1]) === [0.31, 0.31, 0.31](手計算)", dimColor([1, 1, 1]), [0.31, 0.31, 0.31]);
+
+  console.log(`[selftest] dimColor: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
 }

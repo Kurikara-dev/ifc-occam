@@ -183,24 +183,134 @@ def _styled_items_for_item(item) -> list:
     return list(getattr(item, "StyledByItem", []) or [])
 
 
+# 走査を打ち切る型。スタイルが付くことは実質なく、数だけが爆発する
+# (small.ifc の IfcCartesianPoint は61,716件)。ここで刈らないと1要素あたり
+# 数千ノードを辿ることになる。
+_STYLE_SEARCH_LEAF_TYPES = ("IfcCartesianPoint", "IfcCartesianPointList3D", "IfcDirection")
+
+
+def _iter_child_entities(value):
+    """属性値からエンティティだけを取り出す(入れ子のタプル/リストを平坦化する)。"""
+    if isinstance(value, ifcopenshell.entity_instance):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for child in value:
+            yield from _iter_child_entities(child)
+
+
+def _map_is_exclusive(mapped_item) -> bool:
+    """この IfcMappedItem が参照する IfcRepresentationMap を、他の誰も使っていないか。
+
+    IfcRepresentationMap の inverse 属性 MapUsage が、そのマップを参照している
+    IfcMappedItem の集合。自分1件だけなら「専有している」とみなす。
+    """
+    source = getattr(mapped_item, "MappingSource", None)
+    if source is None:
+        return False
+    return len(getattr(source, "MapUsage", []) or []) <= 1
+
+
+def _styled_items_in_subtree(item) -> list:
+    """item とその子孫に付いた IfcStyledItem を重複なく返す(先行順)。
+
+    IfcStyledItem.Item は必ずしもトップレベルの representation item ではない。
+    Rebro出力では IfcFacetedBrep ではなく内側の IfcClosedShell に付く。
+    トップレベルしか見ないとスタイルの付け替えが空振りし、旧形状が IfcStyledItem に
+    参照されたまま残って remove_deep2 で消えなくなる(出力が入力より太る原因)。
+
+    走査の規則:
+      - _STYLE_SEARCH_LEAF_TYPES では止まる(点・方向にスタイルは付かない)。
+      - IfcMappedItem からは、共有 IfcRepresentationMap を他の要素も使っている場合、
+        その内部へは入らない。入って付け替えると他の要素の色を奪うため。
+        自分だけが使っているマップ(= この差し替えで丸ごとゴミになるマップ)には入る。
+      - それ以外は深さ制限なしで辿る。深さで打ち切ると、深い位置に付いたスタイルを
+        黙って取りこぼす(= 旧形状が黙って残る)。
+
+    戻り値の先頭は、トップレベルにスタイルが付いていれば必ずそれになる
+    (「自分 -> 子」の先行順。呼び出し側が先頭を代表として使う)。
+    """
+    found: list = []
+    seen_styled: set[int] = set()
+    seen_nodes: set[int] = set()
+
+    def visit(node) -> None:
+        if not isinstance(node, ifcopenshell.entity_instance):
+            return
+        node_id = node.id()
+        if node_id in seen_nodes:
+            return
+        seen_nodes.add(node_id)
+        for styled_item in _styled_items_for_item(node):
+            if styled_item.id() not in seen_styled:
+                seen_styled.add(styled_item.id())
+                found.append(styled_item)
+        if node.is_a() in _STYLE_SEARCH_LEAF_TYPES:
+            return
+        if node.is_a("IfcMappedItem"):
+            # 共有マップを他の要素も使っている場合、その内部(MappingSource)には
+            # 入らない。入って付け替え/削除すると他の要素の色を奪ってしまうため。
+            # MappingTarget(変換行列側)にスタイルが付くことは通常ないが、
+            # 塞ぐ理由も無いので通常どおり辿る。
+            if _map_is_exclusive(node):
+                visit(node.MappingSource)
+            visit(node.MappingTarget)
+            return
+        for value in node:
+            for child in _iter_child_entities(value):
+                visit(child)
+
+    visit(item)
+    return found
+
+
 def _resolve_surface_rgb(style) -> tuple[float, float, float] | None:
     """IfcSurfaceStyle から IfcSurfaceStyleShading(のサブタイプ Rendering含む)の
-    SurfaceColour(RGB)を取り出す。最初に見つかったものを返す。取れなければNone。"""
-    for sub_style in getattr(style, "Styles", []) or []:
-        if sub_style.is_a("IfcSurfaceStyleShading"):
-            colour = sub_style.SurfaceColour
-            if colour is not None:
-                return (float(colour.Red), float(colour.Green), float(colour.Blue))
+    SurfaceColour(RGB)を取り出す。最初に見つかったものを返す。取れなければNone。
+
+    IfcStyledItem.Styles の要素は IfcSurfaceStyle が直接入っている場合(合成フィクスチャは
+    この形)と、IFC2X3由来のdeprecatedなラッパー IfcPresentationStyleAssignment を
+    経由する場合がある。実測: small.ifc(Rebro2026出力)の IfcStyledItem 4,053件は
+    全てこのラッパー経由だった(展開しないと一度もRGBが取れず、style_signatureの
+    「同一RGB」経由の一致判定が実データで機能していなかった不具合)。ラッパーは
+    はがしてから同じ探索を行う。
+
+    ラッパーは入れ子にも循環にもなり得る(スキーマ上妥当な多段連鎖も、壊れた
+    ファイルの相互参照も、ifcopenshell は生成時に止めない)。再帰で書くと
+    2000段程度の連鎖で RecursionError になり、呼び出し元のファイル読込ごと
+    失敗させてしまうため、明示スタックで反復する。深さで打ち切ると深い位置の
+    色を黙って取りこぼすので、上限は設けず訪問済みidだけで循環を止める。
+    探索順は再帰版と同じ先行順(スタックには逆順に積む)。
+    """
+    seen: set[int] = set()
+    stack = [style]
+    while stack:
+        current = stack.pop()
+        if current is None or current.id() in seen:
+            continue
+        seen.add(current.id())
+        if current.is_a("IfcPresentationStyleAssignment"):
+            stack.extend(reversed(list(getattr(current, "Styles", []) or [])))
+            continue
+        for sub_style in getattr(current, "Styles", []) or []:
+            if sub_style.is_a("IfcSurfaceStyleShading"):
+                colour = sub_style.SurfaceColour
+                if colour is not None:
+                    return (float(colour.Red), float(colour.Green), float(colour.Blue))
     return None
 
 
 def style_signature(items) -> frozenset | None:
-    """items(representation itemのリスト)に付いた全IfcStyledItemから比較用
-    シグネチャを作る((styleのentity id, RGB or None)のペア集合)。付いたスタイルが
-    1つもなければNone。"""
+    """items(representation itemのリスト)とその部分木に付いた全IfcStyledItemから
+    比較用シグネチャを作る((styleのentity id, RGB or None)のペア集合)。
+    付いたスタイルが1つもなければNone。
+
+    部分木まで見るのは、Rebro出力ではスタイルが IfcClosedShell 等の子アイテムに
+    付くため。トップレベルしか見ないと色付き要素同士が「スタイル無し同士」と
+    誤判定され、色の違う形状が consolidate で1つに統合されてしまう。
+    """
     sig: set[tuple[int, tuple[float, float, float] | None]] = set()
     for item in items:
-        for styled_item in _styled_items_for_item(item):
+        for styled_item in _styled_items_in_subtree(item):
             for style in styled_item.Styles or []:
                 sig.add((style.id(), _resolve_surface_rgb(style)))
     return frozenset(sig) if sig else None
@@ -223,27 +333,81 @@ def styles_match(sig_a, sig_b) -> bool:
     return bool(rgb_a & rgb_b)
 
 
-def _transfer_styled_items(ifc_file, old_items, new_items) -> None:
-    """old_items 上の IfcStyledItem を new_items へ付け替える(Item属性を再指定)。
+def _remove_styled_item(ifc_file, styled_item) -> None:
+    """IfcStyledItem を削除する。参照元の IfcStyledRepresentation が空になったら
+    そちらも削除し、孤立した Styles(IfcSurfaceStyle等)も併せて削除する。
 
-    old_items→new_itemsの差し替えでは、new_itemsが1つ(_build_representation_items
-    は常に単一アイテムを返す)であれば、old_items全体に付いていたスタイルを1つに
-    集約してそこへ付け替える(「単一新アイテムへ全スタイルが移る」という契約上の
-    マッピング規則)。new_itemsが複数ある場合はインデックスで対応付ける(はみ出す分は
-    末尾のアイテムへ)。new_itemsが空(呼び出し元の異常系)の場合は付け替え先が無いため、
-    ぶら下がりを避けて対象のIfcStyledItemを削除する。
+    IFC4 の IfcRepresentation.Items は SET[1:?] であり、空集合はスキーマ違反。
+    ifcopenshell の remove() は inverse 参照を自動でパッチするため dangling は
+    生まれないが、空の IfcStyledRepresentation が黙って残ってしまう。
+
+    owner側の削除は ifcopenshell.util.element.remove_deep2 ではなく素の
+    ifc_file.remove() を使う(ブリーフのコードから変更、詳細は fix-report参照)。
+    remove_deep2 は「開始要素が他から参照されていないこと」が前提
+    (ソースコメント: "The start element must have no inverses.")で、他に
+    inverse参照が1つでもあり also_consider で説明できなければ即座に何もせず
+    returnする。owner(IfcStyledRepresentation)は通常
+    IfcProductDefinitionShape.Representationsから参照されているため、この
+    前提を常に破りremove_deep2が無言のno-opになる(実測で確認済み: レビュアの
+    攻撃フィクスチャで再現)。owner.Itemsは既に空(cascadeで消すべき子が無い)
+    ので、素のremove()で十分かつ正しい(inverse参照側は自動でパッチされる)。
+
+    Styles側はこれとは逆にremove_deep2を使う(ブリーフのコードには無かった処理。
+    詳細はfix-report参照)。styled_item.Item(旧形状)は呼び出し元が別途
+    cleanup_targetsで掃除する前提なので、ここではItemには触れずStylesだけを
+    見る。他のIfcStyledItemがまだ参照している(=共有元)styleはremove_deep2が
+    「他から参照されている」として自動的に保護しno-opになるため、本当に孤立した
+    ものだけが削除される。consolidateで代表メンバーの色を共有ソース側の新規
+    IfcStyledItemへ引き継いだ後、代表メンバー自身の旧IfcStyledItemを破棄する
+    ケースでは、styleは新規IfcStyledItemからまだ参照されているため保護される。
+    一方、色は同じだがentityが別(RGB一致のみ)の非代表メンバーのstyleは、
+    削除後に他から参照されなくなるため、ここで正しく掃除される
+    (掃除しないとIfcSurfaceStyle/IfcSurfaceStyleRendering/IfcColourRgbが孤立して
+    残り、consolidateしたのにファイルサイズが純増する)。
     """
+    owners = [
+        inverse
+        for inverse in ifc_file.get_inverse(styled_item)
+        if inverse.is_a("IfcStyledRepresentation")
+    ]
+    styles = list(getattr(styled_item, "Styles", []) or [])
+    ifc_file.remove(styled_item)
+    for owner in owners:
+        if not owner.Items:
+            ifc_file.remove(owner)
+    for style in styles:
+        ifcopenshell.util.element.remove_deep2(ifc_file, style)
+
+
+def _transfer_styled_items(ifc_file, old_items, new_items) -> int:
+    """old_items(とその部分木)上の IfcStyledItem を new_items へ付け替える。
+
+    新アイテムは1つ(_build_representation_items は常に単一アイテムを返す)なので、
+    1アイテムにつき引き継げるスタイルも1つ。部分木で複数見つかった場合は先頭
+    (トップレベルに付いていたものがあればそれ)を付け替え、残りは削除する。
+    残したまま放置すると旧形状を参照し続け、remove_deep2 が旧形状を消せなくなる。
+    IfcStyledItem を参照する記録は存在しない(small.ifc で実測0件)ため削除は安全。
+
+    new_items が空(呼び出し元の異常系)の場合は付け替え先が無いため全て削除する。
+
+    戻り値: 引き継げずに破棄した IfcStyledItem の数。
+    """
+    discarded = 0
     for i, old_item in enumerate(old_items):
-        styled_items = _styled_items_for_item(old_item)
+        styled_items = _styled_items_in_subtree(old_item)
         if not styled_items:
             continue
         if not new_items:
             for styled_item in styled_items:
-                ifc_file.remove(styled_item)
+                _remove_styled_item(ifc_file, styled_item)
+                discarded += 1
             continue
         target = new_items[0] if len(new_items) == 1 else new_items[min(i, len(new_items) - 1)]
-        for styled_item in styled_items:
-            styled_item.Item = target
+        styled_items[0].Item = target
+        for extra in styled_items[1:]:
+            _remove_styled_item(ifc_file, extra)
+            discarded += 1
+    return discarded
 
 
 def _cleanup_items(ifc_file, old_items) -> list[str]:
@@ -262,10 +426,16 @@ def _cleanup_items(ifc_file, old_items) -> list[str]:
 
 def _replace_items_in_place(ifc_file, shape_representation, new_items) -> list[str]:
     old_items = list(shape_representation.Items)
-    _transfer_styled_items(ifc_file, old_items, new_items)
+    discarded = _transfer_styled_items(ifc_file, old_items, new_items)
     shape_representation.Items = new_items
     shape_representation.RepresentationType = _representation_type_for_schema(ifc_file.schema)
-    return _cleanup_items(ifc_file, old_items)
+    warnings = _cleanup_items(ifc_file, old_items)
+    if discarded:
+        warnings.append(
+            f"新形状は単一アイテムのため、複数あったスタイルのうち1件だけを引き継ぎました"
+            f"(破棄 {discarded}件)"
+        )
+    return warnings
 
 
 def _transform_operator_matrix(op) -> np.ndarray | None:
@@ -351,7 +521,10 @@ def _unshare_and_replace(ifc_file, element, body_rep, verts: np.ndarray, faces: 
     差し替える(scope="element" 本体、および scope="shared" の逆変換フォールバック
     先としても再利用する)。"""
     new_items = _build_representation_items(ifc_file, verts, faces)
-    _transfer_styled_items(ifc_file, list(body_rep.Items), new_items)
+    # 破棄件数は scope="shared" 側(_replace_items_in_place)と同じく警告に出す。
+    # ここだけ黙って捨てていると、「深さで打ち切ると黙って取りこぼす」を理由に
+    # 探索の深さ上限を撤廃したこのフェーズの方針と矛盾する(フェーズ最終レビュー M-1)。
+    discarded = _transfer_styled_items(ifc_file, list(body_rep.Items), new_items)
     new_body_rep = ifc_file.create_entity(
         "IfcShapeRepresentation",
         ContextOfItems=body_rep.ContextOfItems,
@@ -368,7 +541,13 @@ def _unshare_and_replace(ifc_file, element, body_rep, verts: np.ndarray, faces: 
     # 古い個別ラッパー(body_rep)はこの要素からしか参照されていないはずなので、
     # まずそれを起点に掃除する。共有マップ/ジオメトリが他から参照されていれば
     # remove_deep2 が自動的に保護する。
-    return _cleanup_items(ifc_file, [body_rep])
+    warnings = _cleanup_items(ifc_file, [body_rep])
+    if discarded:
+        warnings.append(
+            f"新形状は単一アイテムのため、複数あったスタイルのうち1件だけを引き継ぎました"
+            f"(破棄 {discarded}件)"
+        )
+    return warnings
 
 
 def replace_representation(

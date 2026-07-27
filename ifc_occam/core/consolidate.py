@@ -30,8 +30,9 @@ from ifc_occam.core.simplify import (
     _build_representation_items,
     _cleanup_items,
     _find_body_shape_representation,
+    _remove_styled_item,
     _representation_type_for_schema,
-    _styled_items_for_item,
+    _styled_items_in_subtree,
     _verts_to_native_units,
     style_signature,
     styles_match,
@@ -222,9 +223,10 @@ def consolidate_duplicates(
         source_verts = rep_shape.vertices - rep_centroid
 
         # 代表メンバーに付いていたIfcStyledItemのStyles(既存のstyleエンティティを
-        # 再利用、複製しない)を共有ソースアイテムへ引き継ぐ。
+        # 再利用、複製しない)を共有ソースアイテムへ引き継ぐ。トップレベルだけでなく
+        # 部分木(Rebro出力ではIfcClosedShell等の子アイテム)まで見る(F1)。
         rep_styled_items = [
-            si for item in rep_old_items for si in _styled_items_for_item(item)
+            si for item in rep_old_items for si in _styled_items_in_subtree(item)
         ]
         rep_styles = rep_styled_items[0].Styles if rep_styled_items else None
 
@@ -245,19 +247,19 @@ def consolidate_duplicates(
 
             old_items = list(body_rep.Items)
             # 個々のメンバーのIfcStyledItemは共有ソース側へ集約済みなので冗長。
-            # remove_deep2で削除する(代表メンバーのスタイルは新規StyledItemからも
-            # 参照されているため保護され、削除対象外になる)。IfcStyledItemを
-            # 削除するとforward参照先の旧形状アイテムも(他から参照されなければ)
-            # 連鎖的に削除されるため、スタイルが付いていたアイテムはcleanup対象から
-            # 外す(remove_deep2で既に削除済みのエンティティを二重に渡すとクラッシュ
-            # するため)。スタイルが付いていないアイテムだけ個別にcleanupする。
             cleanup_targets: list = []
             for item in old_items:
-                styled_items = _styled_items_for_item(item)
-                if styled_items:
-                    cleanup_targets.extend(styled_items)
-                else:
-                    cleanup_targets.append(item)
+                # 部分木に付いた IfcStyledItem を先に外す。残したままだと旧形状を
+                # 参照し続け、remove_deep2 が旧形状を消せない(このフェーズで直した
+                # simplify 側と同じ理屈)。
+                # styleエンティティ本体(IfcSurfaceStyle)がどうなるかはメンバー次第。
+                # 代表メンバーの style は共有ソース側の新しい IfcStyledItem からも
+                # 参照されるため残る。RGB一致だけで同一群に入った非代表メンバーは
+                # 別の style エンティティを持つので、そちらは参照が無くなり削除される
+                # (それが正しい。孤立した style を残さないため)。
+                for styled_item in _styled_items_in_subtree(item):
+                    _remove_styled_item(ifc_file, styled_item)
+                cleanup_targets.append(item)
 
             body_rep.Items = [mapped_item]
             body_rep.RepresentationType = "MappedRepresentation"

@@ -8,12 +8,13 @@
 
 meta:
     {"vertex_count": N, "triangle_count": M,
-     "elements": [{"global_id", "ifc_class", "name", "layer",
+     "elements": [{"global_id", "ifc_class", "name", "layer", "color",
                    "tri_start", "tri_count", "vertex_start", "vertex_count"}, ...]}
     elements は tri_start 昇順(要素の走査順そのまま)。
     頂点は要素間では共有しないが、要素内では溶接済み(vertex_count は
     tri_count*3 と一致しない)。要素単位の色変更は vertex_start/vertex_count
-    の範囲を塗ること。
+    の範囲を塗ること。"color" は IFCのスタイルから解決した拡散色
+    (sRGB, 0..1 の [r,g,b])。スタイルが無ければ null。
 """
 
 import json
@@ -67,6 +68,7 @@ def build_mesh_payload(model: ModelData) -> bytes:
                 "ifc_class": element.ifc_class,
                 "name": element.name,
                 "layer": element.layer,
+                "color": list(element.color) if element.color is not None else None,
                 "tri_start": tri_offset,
                 "tri_count": tri_count,
                 "vertex_start": vertex_offset,

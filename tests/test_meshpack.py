@@ -26,7 +26,9 @@ def _triangle_shape(shape_id: str) -> ShapeInfo:
     return ShapeInfo(shape_id=shape_id, vertices=vertices, faces=faces)
 
 
-def _make_element(global_id, ifc_class, name, layer, shape_id, placement) -> ElementInfo:
+def _make_element(
+    global_id, ifc_class, name, layer, shape_id, placement, color=None
+) -> ElementInfo:
     return ElementInfo(
         global_id=global_id,
         ifc_class=ifc_class,
@@ -36,6 +38,7 @@ def _make_element(global_id, ifc_class, name, layer, shape_id, placement) -> Ele
         representation_types=("SweptSolid",),
         layer=layer,
         placement=placement,
+        color=color,
     )
 
 
@@ -263,6 +266,46 @@ def test_build_mesh_payload_meta_fields():
     assert e0["ifc_class"] == "IfcWall"
     assert e0["name"] == "Wall A"
     assert e0["layer"] == "L1"
+
+
+def test_build_mesh_payload_includes_color_when_present():
+    """色付き要素の meta には color が [r,g,b] で入る。"""
+    shapes = {"s1": _triangle_shape("s1")}
+    elements = [
+        _make_element(
+            "GID1",
+            "IfcWall",
+            "Wall A",
+            "L1",
+            "s1",
+            _translation_matrix(0, 0, 0),
+            color=(0.0, 0.25, 1.0),
+        ),
+    ]
+    model = ModelData(schema="IFC4", elements=elements, shapes=shapes)
+
+    payload = build_mesh_payload(model)
+    meta, _, _ = _parse_payload(payload)
+
+    e0 = meta["elements"][0]
+    assert e0["color"] == [0.0, 0.25, 1.0]
+
+
+def test_build_mesh_payload_color_is_none_without_style():
+    """色が無い要素(ElementInfo.color=None)の meta では color が null になる。"""
+    shapes = {"s1": _triangle_shape("s1")}
+    elements = [
+        _make_element(
+            "GID1", "IfcWall", "Wall A", "L1", "s1", _translation_matrix(0, 0, 0)
+        ),
+    ]
+    model = ModelData(schema="IFC4", elements=elements, shapes=shapes)
+
+    payload = build_mesh_payload(model)
+    meta, _, _ = _parse_payload(payload)
+
+    e0 = meta["elements"][0]
+    assert e0["color"] is None
 
 
 def test_build_mesh_payload_skips_element_without_shape_id():

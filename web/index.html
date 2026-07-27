@@ -127,7 +127,12 @@
     <div id="viewport">
       <button id="sidebar-toggle" type="button" title="サイドバーの表示切替">«</button>
       <div id="error-banner"></div>
-      <button id="stage-toggle-button" type="button" title="床と壁の表示切替" aria-pressed="true">ステージ</button>
+      <label id="color-mode-label" for="color-mode-select">配色</label>
+      <select id="color-mode-select" title="モデルの色の決め方">
+        <option value="ifc">IFCの色</option>
+        <option value="class">クラス別</option>
+      </select>
+      <button id="stage-toggle-button" type="button" title="床とグリッドの表示切替" aria-pressed="true">ステージ</button>
       <canvas id="canvas"></canvas>
     </div>
   </div>

@@ -3,8 +3,19 @@ import pytest
 import ifcopenshell.api
 import ifcopenshell.geom
 
-from ifc_occam.core.extract import extract_elements_light, extract_model
-from tests.fixtures_ifc import build_wall_with_window_ifc
+from ifc_occam.core.extract import (
+    _dominant_diffuse,
+    _graph_fallback_diffuse,
+    extract_elements_light,
+    extract_model,
+)
+from tests.fixtures_ifc import (
+    build_millimeter_single_element_ifc,
+    build_single_element_with_child_styled_brep_ifc,
+    build_single_element_with_different_top_and_child_styles_ifc,
+    build_single_element_with_styled_item_ifc,
+    build_wall_with_window_ifc,
+)
 
 
 _IDENTITY_MATRIX_FLAT = [
@@ -20,6 +31,7 @@ class _FakeGeometry:
         self.id = gid
         self.verts = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
         self.faces = [0, 1, 2]
+        self.materials = ()  # _dominant_diffuse が触れる属性。空なら None を返す。
 
 
 class _FakeTransformation:
@@ -235,6 +247,81 @@ def test_per_element_fallback_real_coverage_full_small_ifc(small_ifc_path, monke
         np.testing.assert_allclose(e.placement[3], [0.0, 0.0, 0.0, 1.0])
 
 
+def test_extract_reads_the_diffuse_colour_from_styles():
+    """IfcStyledItem の色が ElementInfo.color に入る。"""
+    f = build_single_element_with_styled_item_ifc(rgb=(1.0, 0.0, 0.0))
+    model, _warnings = extract_model(f)
+    element = model.elements[0]
+    assert element.color is not None
+    r, g, b = element.color
+    assert (round(r, 3), round(g, 3), round(b, 3)) == (1.0, 0.0, 0.0)
+
+
+def test_extract_reads_colour_when_the_style_is_on_a_child_item():
+    """スタイルが内側の IfcClosedShell に付いていても色が取れる(Rebro出力の形)。"""
+    f = build_single_element_with_child_styled_brep_ifc(rgb=(0.0, 0.25, 1.0))
+    model, _warnings = extract_model(f)
+    r, g, b = model.elements[0].color
+    assert (round(r, 3), round(g, 3), round(b, 3)) == (0.0, 0.25, 1.0)
+
+
+def test_extract_leaves_colour_none_without_styles():
+    """幾何はあるがスタイルが無い要素の color は None。
+
+    以前は build_millimeter_single_element_ifc を使っていたが、あれは Body の
+    Items が空で幾何生成自体が失敗する(shape_id=None)ため、色の解決を一度も
+    通らずに color is None が自明に成立していた(レビュー指摘: テストが何も
+    検証していなかった)。スタイルの有無だけが違う状態を作るため、子アイテムに
+    スタイルが付いたフィクスチャから IfcStyledItem を取り除いて使う。
+    幾何が生成されていること(shape_id が None でないこと)を先に確認して、
+    同じ穴に落ちないようにする。
+    """
+    f = build_single_element_with_child_styled_brep_ifc()
+    for styled_item in list(f.by_type("IfcStyledItem")):
+        f.remove(styled_item)
+    model, _warnings = extract_model(f)
+    element = model.elements[0]
+    assert element.shape_id is not None
+    assert element.color is None
+
+
+def test_extract_prefers_top_level_colour_over_child_when_both_are_styled():
+    """トップレベルと子アイテムで色が違う場合、トップレベルの色が勝つ(統合テスト)。
+
+    この構成では geom自体がトップレベルのスタイルを直接解決するため(子は見ない)、
+    end-to-endで「トップレベルの色が勝つ」ことを固定する回帰テスト。ただし
+    この経路では _graph_fallback_diffuse は発火しない(geomが先に解決するため)。
+    _styled_items_in_subtree の「自分->子」の順序保証そのものを直接確認するのは
+    下の test_graph_fallback_diffuse_prefers_top_level_over_child。
+    """
+    f = build_single_element_with_different_top_and_child_styles_ifc(
+        top_rgb=(1.0, 0.0, 0.0), child_rgb=(0.0, 1.0, 0.0)
+    )
+    model, _warnings = extract_model(f)
+    r, g, b = model.elements[0].color
+    assert (round(r, 3), round(g, 3), round(b, 3)) == (1.0, 0.0, 0.0)
+
+
+def test_graph_fallback_diffuse_prefers_top_level_over_child():
+    """_graph_fallback_diffuse を直接呼ぶ単体テスト(geomを経由しない)。
+
+    トップレベルと子アイテムで色が違うフィクスチャの product を直接渡し、
+    _styled_items_in_subtree の「自分(トップレベル)->子」の先行順により
+    トップレベルの色が返ることを確認する。extract_model/ifcopenshell.geom を
+    経由しないため、geomの一次解決に頼らず _graph_fallback_diffuse 自体の
+    順序保証を検証できる。
+    """
+    f = build_single_element_with_different_top_and_child_styles_ifc(
+        top_rgb=(1.0, 0.0, 0.0), child_rgb=(0.0, 1.0, 0.0)
+    )
+    product = f.by_type("IfcBuildingElementProxy")[0]
+
+    rgb = _graph_fallback_diffuse(product)
+
+    assert rgb is not None
+    assert (round(rgb[0], 3), round(rgb[1], 3), round(rgb[2], 3)) == (1.0, 0.0, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # extract_elements_light (CUI Phase1 Task5): メッシュ化しない軽量要素列挙。
 # ifcopenshell.geom を一切使わないこと(呼ばれたら例外にするテストで検証)。
@@ -284,3 +371,75 @@ def test_extract_elements_light_does_not_use_geometry(monkeypatch):
     rows = extract_elements_light(f)
 
     assert len(rows) == len(f.by_type("IfcProduct"))
+
+
+# --- _dominant_diffuse の単体テスト(フェーズ最終レビュー I-2) ---
+#
+# 色の一次経路(_dominant_diffuse)と代替経路(_graph_fallback_diffuse)は
+# 互いを隠す。統合テストだけだと、一次経路を壊しても代替経路が拾ってしまい
+# GREEN のままになる(レビュアが実測: _dominant_diffuse を常に None にしても
+# 全テストが通り、実データでは全1,381要素が黙ってグラフ走査に落ちる)。
+# 一次経路を単独で固定する。
+
+
+class _FakeColour:
+    """ifcopenshell 0.8.5 の colour を模した最小オブジェクト。r/g/b はメソッド。"""
+
+    def __init__(self, rgb):
+        self._rgb = rgb
+
+    def r(self):
+        return self._rgb[0]
+
+    def g(self):
+        return self._rgb[1]
+
+    def b(self):
+        return self._rgb[2]
+
+
+class _FakeMaterial:
+    def __init__(self, rgb):
+        self.diffuse = _FakeColour(rgb) if rgb is not None else None
+
+
+class _FakeGeometryWithMaterials:
+    def __init__(self, materials, material_ids):
+        self.materials = materials
+        self.material_ids = material_ids
+
+
+def test_dominant_diffuse_returns_the_only_material():
+    geometry = _FakeGeometryWithMaterials([_FakeMaterial((0.25, 0.5, 0.75))], [0, 0, 0, 0])
+    assert _dominant_diffuse(geometry) == (0.25, 0.5, 0.75)
+
+
+def test_dominant_diffuse_picks_the_material_covering_the_most_faces():
+    """面ごとに色が違う要素は多数決で1色に潰す(ビューアが要素単位で塗るため)。"""
+    geometry = _FakeGeometryWithMaterials(
+        [_FakeMaterial((1.0, 0.0, 0.0)), _FakeMaterial((0.0, 1.0, 0.0))],
+        [0, 1, 1, 1, 0],  # index1 が3面、index0 が2面
+    )
+    assert _dominant_diffuse(geometry) == (0.0, 1.0, 0.0)
+
+
+def test_dominant_diffuse_returns_none_without_materials():
+    assert _dominant_diffuse(_FakeGeometryWithMaterials([], [])) is None
+
+
+def test_dominant_diffuse_returns_none_when_no_face_supports_any_material():
+    """面が1つも指していない material しか無ければ None。
+
+    支持のない色を「多数決の勝者」として返すと、色情報が無いのに色があることに
+    なり、「色情報なし: N要素」の件数が嘘になる。
+    """
+    geometry = _FakeGeometryWithMaterials(
+        [_FakeMaterial((1.0, 0.0, 0.0))], [-1, -1, 99]
+    )
+    assert _dominant_diffuse(geometry) is None
+
+
+def test_dominant_diffuse_uses_the_single_material_when_no_face_assignment_exists():
+    """面ごとの割り当てが無く material が1つだけなら、それが形状全体の色。"""
+    geometry = _FakeGeometryWithMaterials([_FakeMaterial((0.1, 0.2, 0.3))], [])
+    assert _dominant_diffuse(geometry) == (0.1, 0.2, 0.3)

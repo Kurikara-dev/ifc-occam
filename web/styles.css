@@ -121,6 +121,36 @@ body.sidebar-collapsed #sidebar-resizer {
   background: #2a2a2a;
   color: #7a7f84;
 }
+/* 配色モード切替(色task Task5)。#stage-toggle-buttonと同じ段(top:44px)に
+   横並びする。ボタンの右端は right:12px で固定なので、select/labelはそれより
+   大きい right値(=視覚的に左側)を与えて隙間を空ける。selectに明示的な幅を
+   与えているのは、"IFCの色"/"クラス別"のどちらを選んでも隣のボタンとの間隔が
+   ブレないようにするため。 */
+#color-mode-label {
+  position: absolute;
+  top: 47px;
+  right: 172px;
+  z-index: 11;
+  font-size: 12px;
+  color: #9aa0a6;
+  line-height: 20px;
+}
+#color-mode-select {
+  position: absolute;
+  top: 43px;
+  right: 90px;
+  z-index: 11;
+  width: 76px;
+  padding: 5px 4px;
+  background: #444;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+#color-mode-select:hover { background: #555; }
 h1 { font-size: 15px; margin: 0 0 10px; }
 h2 { font-size: 13px; margin: 16px 0 6px; color: #9aa0a6; }
 #path-input {
@@ -390,6 +420,9 @@ h2 { font-size: 13px; margin: 16px 0 6px; color: #9aa0a6; }
   border-radius: 4px;
 }
 #excluded-line {
+  color: #9aa0a6;
+}
+#no-color-line {
   color: #9aa0a6;
 }
 #ops-controls { display: flex; flex-direction: column; gap: 6px; }

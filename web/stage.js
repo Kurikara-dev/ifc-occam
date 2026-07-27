@@ -1,7 +1,11 @@
-// stage.js -- ステージ(床 + 背面2枚の壁 + グリッド + 軸)の生成。GUI改修 Task9。
+// stage.js -- ステージ(床 + グリッド + 軸)の生成。GUI改修 Task9。
+//
+// 当初は背面2枚の壁も立てていたが、ユーザーの実機確認により削除した。
+// グリッド付きの床だけで「要素がどこまで広がっているか」と「天地」の両方が
+// 読み取れるうえ、壁は黒く重くモデルの視認性を下げていたため。
 //
 // three.jsのimportはこのファイル内に閉じ込める。viewer.jsはbuildStage()を呼んで
-// 返り値のgroupをscene.add/removeするだけで、stageの内部構造(床・壁・グリッド・軸
+// 返り値のgroupをscene.add/removeするだけで、stageの内部構造(床・グリッド・軸
 // それぞれのジオメトリ/マテリアル)には関与しない。
 //
 // 生成した全オブジェクト(group自体および各子オブジェクト)にuserData.pickable=falseを
@@ -13,11 +17,9 @@ import * as THREE from "./vendor/three.module.js";
 
 const DEFAULT_MARGIN = 0.15;
 
-// 床・壁の色(監督者裁定7: 無彩色〜わずかな青みまでに留め、部材のクラス色分けを
-// 邪魔しない彩度ゼロ付近の色)。床は背景よりわずかに明るく、壁は床よりわずかに
-// 暗く奥へ退くように選んでいる。
+// 床の色(監督者裁定7: 無彩色〜わずかな青みまでに留め、部材のクラス色分けを
+// 邪魔しない彩度ゼロ付近の色)。床は背景よりわずかに明るくする。
 const FLOOR_COLOR = 0x35383d;
-const WALL_COLOR = 0x2a2d31;
 const GRID_COLOR_CENTER = 0x53575c;
 const GRID_COLOR_LINES = 0x3d4045;
 
@@ -54,20 +56,15 @@ export function roundToNiceStep(value) {
 }
 
 /**
- * モデルのAABBから、床+グリッド+背面2枚の壁+軸のGroupを作る(GUI改修Task9)。
+ * モデルのAABBから、床+グリッド+軸のGroupを作る(GUI改修Task9)。
  *
- * 壁は最小X面・最小Z面の2枚(「背面2枚」)。viewer.jsの_fitCameraToMeshが既定で
- * カメラを中心から見て+X/+Y/+Zの方向へ置くため、その対角にあたる最小X/最小Z側を
- * 「モデルの奥」とみなし、そこに壁を立てる。壁の法線はモデル側(+X/+Z方向)へ
- * 向け、material.side=THREE.FrontSideにする。これにより:
- *   - カメラがモデル側(+X/+Zの外側、既定のカメラ位置を含む)にあるときは壁の
- *     前面が描画され、モデルの背景として機能する。
- *   - カメラが壁の外側(-X/-Z側)まで回り込むと、法線が逆側を向く壁の裏側になり
- *     FrontSideは描画しない(=透過してモデルが見える)。
+ * 当初は最小X面・最小Z面に背面2枚の壁も立てていたが、ユーザーの実機確認により
+ * 削除した。グリッドを敷いた床だけで「要素がどこまで広がっているか」と「天地」の
+ * 両方が読み取れるうえ、壁は黒く重くモデルの視認性を下げていたため。
  *
  * @param {THREE.Box3} boundingBox モデルのAABB(ワールド座標)
  * @param {{margin?: number}} [options] marginはAABBの各辺に対する比率(既定0.15)。
- *   床・壁・グリッドの水平方向の広がり、および壁の高さの上端に適用する。
+ *   床・グリッドの水平方向の広がりに適用する。
  *   床のY座標そのものにはmarginを適用しない(裁定4: モデルの下端に正確に一致させ、
  *   浮いたりめり込んだりしないようにする)。
  * @returns {{group: THREE.Group, dispose(): void}}
@@ -96,8 +93,8 @@ export function buildStage(boundingBox, { margin = DEFAULT_MARGIN } = {}) {
   // Infinity/NaN はグリッドの分割数を壊す)。
   const safeMargin = Number.isFinite(margin) && margin >= 0 ? margin : DEFAULT_MARGIN;
 
+  // Y方向のmarginは壁の高さにだけ使っていたため、壁の削除にあわせて廃止した。
   const padX = safeSize.x * safeMargin;
-  const padY = safeSize.y * safeMargin;
   const padZ = safeSize.z * safeMargin;
 
   // AABB の座標そのものが非有限のときは原点に寄せる(上の safeSize と同じ理由)。
@@ -112,11 +109,9 @@ export function buildStage(boundingBox, { margin = DEFAULT_MARGIN } = {}) {
   const maxX = farX + padX;
   const minZ = originZ - padZ;
   const maxZ = farZ + padZ;
-  const topY = finiteOr(boundingBox.max.y, originY + safeSize.y) + padY;
 
-  const footprintWidthX = maxX - minX; // 床のX方向の幅(壁Zの幅もこれに揃える)
-  const footprintDepthZ = maxZ - minZ; // 床のZ方向の幅(壁Xの幅もこれに揃える)
-  const wallHeight = Math.max(topY - floorY, EPS);
+  const footprintWidthX = maxX - minX; // 床のX方向の幅
+  const footprintDepthZ = maxZ - minZ; // 床のZ方向の幅
   const centerX = (minX + maxX) / 2;
   const centerZ = (minZ + maxZ) / 2;
 
@@ -128,7 +123,7 @@ export function buildStage(boundingBox, { margin = DEFAULT_MARGIN } = {}) {
   const floorGeometry = new THREE.PlaneGeometry(footprintWidthX, footprintDepthZ);
   const floorMaterial = new THREE.MeshLambertMaterial({
     color: FLOOR_COLOR,
-    side: THREE.DoubleSide, // カメラが床下に回り込んでも消えないようにする(壁とは要件が異なる)。
+    side: THREE.DoubleSide, // カメラが床下に回り込んでも消えないようにする。
   });
   const floor = new THREE.Mesh(floorGeometry, floorMaterial);
   floor.name = "stage-floor";
@@ -150,29 +145,6 @@ export function buildStage(boundingBox, { margin = DEFAULT_MARGIN } = {}) {
   grid.userData.pickable = false;
   group.add(grid);
 
-  // --- 壁2枚(背面。side:FrontSide、法線をモデル側へ) ---
-  const wallMaterial = new THREE.MeshLambertMaterial({
-    color: WALL_COLOR,
-    side: THREE.FrontSide,
-  });
-
-  // 壁Z: 最小Z面。PlaneGeometryの既定の法線(+Z)がそのままモデル側を向くため回転不要。
-  const wallZGeometry = new THREE.PlaneGeometry(footprintWidthX, wallHeight);
-  const wallZ = new THREE.Mesh(wallZGeometry, wallMaterial);
-  wallZ.name = "stage-wall-z";
-  wallZ.position.set(centerX, floorY + wallHeight / 2, minZ);
-  wallZ.userData.pickable = false;
-  group.add(wallZ);
-
-  // 壁X: 最小X面。Y軸周りに+90度回すと法線が+Z->+Xになり、モデル側を向く。
-  const wallXGeometry = new THREE.PlaneGeometry(footprintDepthZ, wallHeight);
-  const wallX = new THREE.Mesh(wallXGeometry, wallMaterial); // wallZと同一マテリアルを共有(描画コスト削減)。
-  wallX.name = "stage-wall-x";
-  wallX.rotation.y = Math.PI / 2;
-  wallX.position.set(minX, floorY + wallHeight / 2, centerZ);
-  wallX.userData.pickable = false;
-  group.add(wallX);
-
   // --- 軸(ワールド原点。モデル中心ではない) ---
   const axes = new THREE.AxesHelper(maxDim * AXES_LENGTH_RATIO);
   axes.name = "stage-axes";
@@ -185,9 +157,6 @@ export function buildStage(boundingBox, { margin = DEFAULT_MARGIN } = {}) {
     floorMaterial.dispose();
     grid.geometry.dispose();
     grid.material.dispose();
-    wallZGeometry.dispose();
-    wallXGeometry.dispose();
-    wallMaterial.dispose(); // wallZ/wallXで共有しているため一度だけdisposeする。
     axes.geometry.dispose();
     axes.material.dispose();
   }

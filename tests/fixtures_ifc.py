@@ -602,3 +602,554 @@ def build_many_walls_with_openings_ifc(
         f.create_entity(keep_class, GlobalId=ifcopenshell.guid.new(), Name=f"Keep{i}")
 
     return f
+
+
+def build_single_element_with_child_styled_brep_ifc(
+    rgb: tuple[float, float, float] = (0.0, 0.25, 1.0),
+) -> ifcopenshell.file:
+    """要素1つ、Body表現が IfcFacetedBrep(四面体)で、IfcStyledItem が
+    トップレベルの IfcFacetedBrep ではなく内側の IfcClosedShell に付いている合成IFC4。
+
+    Rebro2026 の出力(small.ifc)がこの形をしている。実測での IfcStyledItem.Item の
+    内訳は IfcClosedShell 1,457件 / IfcOpenShell 268件 が子アイテム側だった。
+    トップレベルしか見ないスタイル探索はこのフィクスチャで空振りする。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    # 四面体。面の向きは全て外向き。
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    style = _create_surface_style(f, rgb)
+    # ここが肝: トップレベルの brep ではなく、内側の shell に付ける。
+    _attach_styled_item(f, shell, style)
+
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def build_two_translated_child_styled_cubes_ifc(
+    rgb: tuple[float, float, float] = (0.0, 0.25, 1.0),
+) -> ifcopenshell.file:
+    """2要素、各自own個別Body表現(IfcFacetedBrepの立方体、8頂点12面)を持ち、
+    互いに平行移動の関係にある合成IFC4を返す。IfcStyledItem はトップレベルの
+    IfcFacetedBrep ではなく内側の IfcClosedShell(子アイテム)に付く
+    (build_single_element_with_child_styled_brep_ifc と同じRebro形)。
+
+    core/consolidate.py のスタイル移送テスト用(Task 3修正 F1: consolidate.pyが
+    子アイテムスタイルを見落とす不具合の再現・回帰テスト)。頂点数を四面体
+    (4頂点)より増やしているのは、savings(節約バイト数)がoverhead×
+    min_benefit_ratioの経済フィルタを下回りconsolidate自体がスキップされる
+    (=スタイル移送コードに到達しない)のを避けるため。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    base_coords = [
+        (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0), (0.0, 1.0, 1.0),
+    ]
+    face_indices = [
+        (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+        (0, 5, 4), (0, 1, 5), (1, 6, 5), (1, 2, 6),
+        (2, 7, 6), (2, 3, 7), (3, 4, 7), (3, 0, 4),
+    ]
+    placements = [(100.0, 0.0, 0.0), (0.0, 200.0, 0.0)]
+
+    for i, placement in enumerate(placements):
+        points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in base_coords]
+        faces = []
+        for idx in face_indices:
+            loop = f.create_entity("IfcPolyLoop", Polygon=[points[j] for j in idx])
+            bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+            faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+        shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+        brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+        style = _create_surface_style(f, rgb)
+        _attach_styled_item(f, shell, style)  # 子アイテム(shell)にスタイル。Rebroの形。
+
+        body_rep = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body_ctx,
+            RepresentationIdentifier="Body",
+            RepresentationType="Brep",
+            Items=[brep],
+        )
+        element = ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name=f"E{i}"
+        )
+        element.Representation = f.create_entity(
+            "IfcProductDefinitionShape", Representations=[body_rep]
+        )
+        matrix = np.eye(4)
+        matrix[:3, 3] = placement
+        ifcopenshell.api.run(
+            "geometry.edit_object_placement", f, product=element, matrix=matrix
+        )
+
+    return f
+
+
+def build_single_consumer_mapped_child_styled_brep_ifc(
+    rgb: tuple[float, float, float] = (0.0, 0.25, 1.0),
+) -> ifcopenshell.file:
+    """1要素だけが使う IfcRepresentationMap(内部の IfcClosedShell に子スタイル)を
+    持つ合成IFC4を返す。要素自身の body_rep.Items は [IfcMappedItem] 1件で、
+    そのMappingSource経由で参照する共有マップを他の誰も使っていない
+    (=このマップは実質この要素専有で、scope="element"で解いたら丸ごとゴミになる)。
+
+    core/simplify.py の scope="element" テスト用(Task 3修正 F2: 深さ上限のため
+    共有マップ内部に絶対到達できず、旧形状が到達不能なまま残った不具合の
+    再現・回帰テスト)。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    style = _create_surface_style(f, rgb)
+    _attach_styled_item(f, shell, style)  # 子アイテム(shell)にスタイル。Rebroの形。
+
+    mapped_representation = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    identity = f.create_entity(
+        "IfcAxis2Placement3D",
+        Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+    )
+    rep_map = f.create_entity(
+        "IfcRepresentationMap", MappingOrigin=identity, MappedRepresentation=mapped_representation
+    )
+    mapped_item = f.create_entity(
+        "IfcMappedItem",
+        MappingSource=rep_map,
+        MappingTarget=f.create_entity(
+            "IfcCartesianTransformationOperator3D",
+            Axis1=None,
+            Axis2=None,
+            Axis3=None,
+            Scale=None,
+            LocalOrigin=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+        ),
+    )
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="MappedRepresentation",
+        Items=[mapped_item],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def build_two_consumers_mapped_child_styled_brep_ifc(
+    rgb: tuple[float, float, float] = (0.0, 0.25, 1.0),
+) -> ifcopenshell.file:
+    """2要素が同じ IfcRepresentationMap を共有し、その内部の IfcClosedShell
+    (子アイテム)に色付き IfcStyledItem が付いている合成IFC4を返す
+    (build_single_consumer_mapped_child_styled_brep_ifc の「専有」ではない版)。
+
+    core/simplify.py の scope="element" テスト用(Task 3修正 F2の副作用防止:
+    共有マップを他の要素も使っている場合、その内部のスタイルを奪ってはならない
+    ことの回帰テスト)。2要素のうち片方だけをscope="element"で差し替えても、
+    もう片方(共有マップ経由で色を見ているだけの要素)の色は無傷のまま
+    残ることを確認する用途。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    style = _create_surface_style(f, rgb)
+    _attach_styled_item(f, shell, style)  # 共有マップ内部の子アイテム(shell)にスタイル。
+
+    mapped_representation = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    identity = f.create_entity(
+        "IfcAxis2Placement3D",
+        Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+    )
+    rep_map = f.create_entity(
+        "IfcRepresentationMap", MappingOrigin=identity, MappedRepresentation=mapped_representation
+    )
+
+    for name in ("Elem1", "Elem2"):
+        mapped_item = f.create_entity(
+            "IfcMappedItem",
+            MappingSource=rep_map,
+            MappingTarget=f.create_entity(
+                "IfcCartesianTransformationOperator3D",
+                Axis1=None,
+                Axis2=None,
+                Axis3=None,
+                Scale=None,
+                LocalOrigin=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+            ),
+        )
+        body_rep = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body_ctx,
+            RepresentationIdentifier="Body",
+            RepresentationType="MappedRepresentation",
+            Items=[mapped_item],
+        )
+        element = ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name=name
+        )
+        element.Representation = f.create_entity(
+            "IfcProductDefinitionShape", Representations=[body_rep]
+        )
+        ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def build_brep_with_styles_at_every_subtree_depth_ifc() -> ifcopenshell.file:
+    """要素1つ、Body表現の部分木の各階層(brep深さ0/shell深さ1/face深さ2/
+    faceOuterBound深さ3/polyLoop深さ4)に、それぞれ別の色の IfcStyledItem が
+    付いている合成IFC4を返す。
+
+    core/simplify.py の深さ上限撤廃テスト用(Task 3修正 F2/F3)。深さ2までしか
+    見ない実装ではdepth3/4のスタイルを取りこぼし、旧形状(IfcFaceOuterBound/
+    IfcPolyLoop)が到達不能なまま残った。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    bounds = []
+    loops = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        face = f.create_entity("IfcFace", Bounds=[bound])
+        loops.append(loop)
+        bounds.append(bound)
+        faces.append(face)
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    _attach_styled_item(f, brep, _create_surface_style(f, (1.0, 0.0, 0.0)))  # 深さ0
+    _attach_styled_item(f, shell, _create_surface_style(f, (0.0, 1.0, 0.0)))  # 深さ1
+    _attach_styled_item(f, faces[0], _create_surface_style(f, (0.0, 0.0, 1.0)))  # 深さ2
+    _attach_styled_item(f, bounds[1], _create_surface_style(f, (0.5, 0.0, 0.5)))  # 深さ3
+    _attach_styled_item(f, loops[2], _create_surface_style(f, (1.0, 1.0, 0.0)))  # 深さ4
+
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def build_element_with_a_discarded_style_referenced_by_a_styled_representation_ifc() -> (
+    ifcopenshell.file
+):
+    """要素1つ、Body表現の部分木に2つの色(brep深さ0=kept想定、shell深さ1=discard
+    対象)を持ち、discard対象になる方の IfcStyledItem が、要素の
+    IfcProductDefinitionShape に紐づく別の IfcStyledRepresentation.Items からも
+    参照されている合成IFC4を返す(legacy style-assignment pattern)。
+
+    core/simplify.py のTask 3修正 F4テスト用: IfcStyledItem削除で
+    IfcStyledRepresentation.Itemsが空リストになり、IFC4のSET[1:?]制約に
+    違反するオブジェクトが黙って残る不具合の再現・回帰テスト。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    _attach_styled_item(f, brep, _create_surface_style(f, (1.0, 0.0, 0.0)))  # 深さ0(kept想定)
+    si_discarded = _attach_styled_item(
+        f, shell, _create_surface_style(f, (0.0, 1.0, 0.0))
+    )  # 深さ1(discard対象)
+
+    styled_rep = f.create_entity(
+        "IfcStyledRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Style",
+        RepresentationType="Material",
+        Items=[si_discarded],
+    )
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep, styled_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def build_single_element_with_different_top_and_child_styles_ifc(
+    top_rgb: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    child_rgb: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> ifcopenshell.file:
+    """要素1つ、Body表現が IfcFacetedBrep(四面体)で、トップレベルの brep と
+    内側の IfcClosedShell の両方に、別々の色の IfcStyledItem が付いている合成IFC4。
+
+    color-task-4 追補: geom(ifcopenshell.geom)はトップレベルの item に付いた
+    スタイルを直接解決できるため、この構成では geom 自体が top_rgb を返す
+    (子の child_rgb は見ない)。トップレベルの色が勝つことをエンドツーエンドで
+    固定するための回帰テスト用フィクスチャ。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    _attach_styled_item(f, brep, _create_surface_style(f, top_rgb))  # トップレベル
+    _attach_styled_item(f, shell, _create_surface_style(f, child_rgb))  # 子(無視される想定)
+
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def _wrap_in_style_assignment(f: ifcopenshell.file, style):
+    """IfcSurfaceStyle を IfcPresentationStyleAssignment(IFC2X3由来のdeprecated
+    wrapper)で包む。color-task-4 追補: small.ifc(Rebro2026出力)の IfcStyledItem
+    4,053件は実測で全てこの形(IfcStyledItem.Styles -> IfcPresentationStyleAssignment
+    -> IfcSurfaceStyle)だった。直接 IfcSurfaceStyle を持つ既存フィクスチャとは別に、
+    このwrapper経由の形を再現するために使う。
+    """
+    return f.create_entity("IfcPresentationStyleAssignment", Styles=[style])
+
+
+def build_single_element_with_wrapped_child_styled_brep_ifc(
+    rgb: tuple[float, float, float] = (0.0, 0.25, 1.0),
+) -> ifcopenshell.file:
+    """build_single_element_with_child_styled_brep_ifc と同じ形(四面体の
+    IfcFacetedBrep、スタイルは内側の IfcClosedShell)だが、IfcStyledItem.Styles が
+    IfcSurfaceStyle を直接ではなく IfcPresentationStyleAssignment 経由で持つ合成IFC4。
+
+    small.ifc(Rebro2026出力)の実際の形(実測: IfcStyledItem 4,053件は全てこの
+    wrapper経由)。_resolve_surface_rgb/style_signature がラッパーを展開できず
+    RGBを一度も返せていなかった不具合(color-task-4 追補)の再現・回帰テスト用。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coords = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    points = [f.create_entity("IfcCartesianPoint", Coordinates=c) for c in coords]
+    face_indices = [(0, 2, 1), (0, 3, 2), (0, 1, 3), (1, 2, 3)]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    style = _create_surface_style(f, rgb)
+    wrapped = _wrap_in_style_assignment(f, style)
+    _attach_styled_item(f, shell, wrapped)  # 子アイテム(shell)に、wrapper経由でスタイル。
+
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f

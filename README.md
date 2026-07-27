@@ -14,6 +14,8 @@ Reviewing such a model element by element is not realistic. What works is decidi
 
 A measured example. A 102 MB fabrication model with 11,273 elements and 2.23 million triangles: deleting one accessory class (2,728 elements) and reducing a fitting class (1,784 elements) to bounding boxes produced a 94 MB file with 1.43 million triangles — **36% fewer triangles** — with no dangling references and no new geometry warnings. The byte count barely moved; the triangle count is what decides whether a viewer can handle the model.
 
+Byte-count impact varies by model and by which classes you touch. On a 21.5 MB building-services model, reducing 305 pipe-fitting elements to convex hulls (propagated across their shared geometry) produced a 17.5 MB file — **18.7% smaller** — again with zero dangling geometry references, and with colour information intact on every simplified element.
+
 ## Before you start
 
 | | |
@@ -61,7 +63,7 @@ The rule of thumb behind the middle row: opening a model with `ifcopenshell` nee
 python -m ifc_occam serve
 ```
 
-Open the printed URL. Pick a model through the **file dialog** (browsing is confined to the folder you launched the server from; a collapsed manual-path field is still there if you'd rather type it). The sidebar has three tabs — class, layer, and duplicate-shape groups — each row showing element/shape/triangle counts, with delete/simplify/keep quick-action buttons that appear on hover. Select elements in the viewer or act on a whole class/layer at once; delete, reduce to a bounding box, take a convex hull, or decimate; save named **operation patterns** (reusable rule sets, applied with a per-rule count you confirm first) for reuse across models. Export goes through a **save dialog** too, and it refuses a filename that resolves to the file you loaded. The 3D view sits the model on a floor with two back walls for a sense of scale (toggle with the "ステージ" button); selecting something dims everything else and outlines the selection. If port 8000 is busy the server picks the next free port and prints it.
+Open the printed URL. Pick a model through the **file dialog** (browsing is confined to the folder you launched the server from; a collapsed manual-path field is still there if you'd rather type it). The sidebar has three tabs — class, layer, and duplicate-shape groups — each row showing element/shape/triangle counts, with delete/simplify/keep quick-action buttons that appear on hover. Select elements in the viewer or act on a whole class/layer at once; delete, reduce to a bounding box, take a convex hull, or decimate; save named **operation patterns** (reusable rule sets, applied with a per-rule count you confirm first) for reuse across models. Export goes through a **save dialog** too, and it refuses a filename that resolves to the file you loaded. The 3D view sits the model on a gridded floor sized to its bounding box, which gives both the extent and which way is up (toggle with the "ステージ" button); selecting something dims everything else and outlines the selection. A colour-mode toggle switches the view between the model's own IFC colours and automatic per-class colours. If port 8000 is busy the server picks the next free port and prints it.
 
 <!-- Screenshot: GUI overview (sidebar tabs + docked operation bar + 3D view) — pending -->
 

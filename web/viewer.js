@@ -22,6 +22,44 @@ export function classColor(str) {
   return [color.r, color.g, color.b];
 }
 
+// --- 配色モード(色task Task5)に関する定数・純粋関数 ---
+
+export const COLOR_MODE_IFC = "ifc";
+export const COLOR_MODE_CLASS = "class";
+// IFCの色を持たない要素の代替色(無彩色。クラス色と混ざって誤読されないように
+// 彩度を持たせない)。
+export const NO_IFC_COLOR = [0.55, 0.55, 0.55];
+
+const _srgbScratch = new THREE.Color();
+
+/**
+ * IfcColourRgb の値(sRGB表示色)を three.js の working color space(linear-sRGB)へ
+ * 変換する。three.jsは頂点カラー属性を linear として解釈するため、sRGB値をそのまま
+ * 入れると明るく転ぶ。
+ * @param {[number,number,number]} rgb 0..1 のsRGB
+ * @returns {[number,number,number]} 0..1 のlinear-sRGB
+ */
+export function ifcColorToLinear([r, g, b]) {
+  _srgbScratch.setRGB(r, g, b, THREE.SRGBColorSpace);
+  return [_srgbScratch.r, _srgbScratch.g, _srgbScratch.b];
+}
+
+/**
+ * 要素の基本色(選択・減光を適用する前の色)を決める。
+ * 優先順: 有効な操作があればステータス色 -> IFC配色ならIFCの色(無ければ無彩色)
+ *         -> クラス色。
+ * @param {object} element meta.elements の1要素
+ * @param {{operation: object|null|undefined, colorMode: string}} params
+ * @returns {[number,number,number]}
+ */
+export function resolveBaseColor(element, { operation, colorMode }) {
+  if (operation) return statusColor(operation);
+  if (colorMode === COLOR_MODE_IFC) {
+    return element.color ? ifcColorToLinear(element.color) : NO_IFC_COLOR;
+  }
+  return classColor(element.ifc_class);
+}
+
 // --- 選択の可視化(GUI改修 Task8)に関する定数・純粋関数 ---
 // DOM/Three.jsの状態に一切触れない(?selftest=1から直接呼べる)。
 
@@ -29,6 +67,19 @@ export function classColor(str) {
 export const SELECTION_COLOR = [1.0, 0.35, 0.15];
 // 非選択かつdim===trueの要素に掛ける係数(監督者裁定2)。
 export const DIM_FACTOR = 0.25;
+// 減光の下限(linear)。掛け算だけで落とすと、元が暗い色(IFCの実測値には
+// linear 0.07 程度のものが普通にある)が壁の albedo 0.023 と同じ明るさになり、
+// 背景に沈んで見えなくなる(レビュー実測: IFC配色×減光でモデル画素の47.8%が
+// 背景との輝度差10未満)。下限を足して、減光しても背景からは必ず浮かせる
+// (色task Task5 レビュー Important)。値は small.ifc の offscreen pixel-diff で
+// 実測して決めた(背景との輝度差が10未満のモデル画素の割合):
+//   0.03=20.2% / 0.035=16.4% / 0.04=13.55% / 0.05=3.9% / 0.06=3.4%
+// 受け入れ基準(<15%)を満たす最小値は0.04だが、0.06を採る。0.04と0.06で
+// 減光済み要素の最大輝度は 0.24 と 0.26 しか違わず(選択色は常に1.0なので
+// 強調の落差はほぼ変わらない)、一方で背景に沈む画素は 13.6% から 3.4% へ
+// 4分の1になる。コストがほぼ平坦で効果が急なので、最小値を選ぶ理由がない
+// (「基準を満たす最小値を選べ」という当初の監督者指示を撤回した)。
+export const DIM_FLOOR = 0.06;
 // 縁取りの外観(監督者裁定4)。
 export const OUTLINE_COLOR = 0xffd24a;
 export const OUTLINE_THRESHOLD_DEGREES = 30;
@@ -97,6 +148,24 @@ export function shouldDim(selectedCount) {
 }
 
 /**
+ * 非選択要素の色を減光する(色task Task5 レビュー Important)。単純な乗算
+ * (`* DIM_FACTOR`)だけだと、元の色が既に暗い場合(IFCの実測値には linear 0.07
+ * 程度のものが普通にある)に結果が壁の albedo(0.023)と同程度まで沈み、背景と
+ * 見分けが付かなくなる。乗算に `DIM_FLOOR` を加算することで、元の明るさに
+ * 関わらず必ず一定以上の明るさを残す。選択色には適用しない(呼び出し側で
+ * 選択中の要素には呼ばない)。
+ * @param {[number,number,number]} rgb
+ * @returns {[number,number,number]}
+ */
+export function dimColor([r, g, b]) {
+  return [
+    r * DIM_FACTOR + DIM_FLOOR,
+    g * DIM_FACTOR + DIM_FLOOR,
+    b * DIM_FACTOR + DIM_FLOOR,
+  ];
+}
+
+/**
  * Three.jsシーンを初期化する。
  * @param {HTMLCanvasElement} canvas
  * @returns {object} viewer インターフェース
@@ -116,7 +185,7 @@ export function initViewer(canvas) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio || 1);
 
-  // ステージ(床・壁)の追加でシーンに反射的な明るさが増えるため、既存のAmbientは
+  // ステージ(床)の追加でシーンに反射的な明るさが増えるため、既存のAmbientは
   // 0.6->0.45に少し下げてHemisphereLightに明暗差の役割を譲る(監督者裁定7:
   // 「白飛びするなら強度を調整しろ」)。Directionalは既存のまま(0.8)。落ち影は
   // 付けない(コストと利点が釣り合わないという監督者裁定7の判断による)。
@@ -171,10 +240,12 @@ export function initViewer(canvas) {
    * @param {object} meshMeta /api/mesh の meta JSON
    * @param {Float32Array} positions
    * @param {Uint32Array} indices
+   * @param {string} [colorMode] 初期塗りに使う配色モード(COLOR_MODE_IFC/COLOR_MODE_CLASS)。
+   *   未指定ならCOLOR_MODE_IFC(既定は「IFCの色」)。
    */
-  function setMesh(meshMeta, positions, indices) {
+  function setMesh(meshMeta, positions, indices, colorMode) {
     _disposeOutline(); // 前のモデルの縁取りは新しいモデルでは無意味なので必ず消す。
-    _disposeStage(); // 前のモデルのステージ(床・壁・グリッド・軸)も同様に作り直す(GUI改修Task9 監督者裁定9)。
+    _disposeStage(); // 前のモデルのステージ(床・グリッド・軸)も同様に作り直す(GUI改修Task9 監督者裁定9)。
     if (mesh) {
       scene.remove(mesh);
       mesh.geometry.dispose();
@@ -187,11 +258,12 @@ export function initViewer(canvas) {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-    geometry.computeBoundingBox(); // GUI改修Task9: ステージ(床・壁)のサイズ算出に使うAABB。以前は外接球しか求めていなかった。
+    geometry.computeBoundingBox(); // GUI改修Task9: ステージ(床)のサイズ算出に使うAABB。以前は外接球しか求めていなかった。
 
+    const mode = colorMode ?? COLOR_MODE_IFC;
     const colors = new Float32Array(positions.length);
     for (const el of meta.elements) {
-      const [r, g, b] = classColor(el.ifc_class);
+      const [r, g, b] = resolveBaseColor(el, { operation: null, colorMode: mode });
       // 要素内は溶接済み頂点のため vertex_start/vertex_count を使う
       // (要素間では頂点は共有されないが、要素内では溶接が普通)。
       const vertexStart = el.vertex_start;
@@ -205,16 +277,22 @@ export function initViewer(canvas) {
     }
     geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 
+    // flatShading: geometry に normal 属性を張っていないため必須。法線が無いまま
+    // スムーズシェーディングを使うと normalize(vec3(0)) が NaN になり、モデル全体が
+    // 真っ黒に潰れる(このフェーズで発見したバグ)。flatShading はフラグメント側で
+    // 微分から面法線を作るので normal 属性が要らず、頂点あたり12バイトを節約でき、
+    // かつ溶接済み頂点でも直角のエッジが丸まらない。
     const material = new THREE.MeshLambertMaterial({
       vertexColors: true,
       side: THREE.DoubleSide,
+      flatShading: true,
     });
 
     mesh = new THREE.Mesh(geometry, material);
     scene.add(mesh);
 
-    // GUI改修Task9: モデルのAABBから床+背面2枚の壁+グリッド+軸を作る。stage.js側で
-    // group及び全ての子にuserData.pickable=falseが立つ(床や壁をレイキャストの対象に
+    // GUI改修Task9: モデルのAABBから床+グリッド+軸を作る。stage.js側で
+    // group及び全ての子にuserData.pickable=falseが立つ(床をレイキャストの対象に
     // しないための保険。現状のraycastはraycaster.intersectObject(mesh, false)で単一
     // メッシュのみを対象にしており、_performClickもmesh以外を一切見ないため、stageを
     // scene.addしてもレイキャストには当たらない。下のonBackgroundClick経由の動作
@@ -235,7 +313,7 @@ export function initViewer(canvas) {
   }
 
   /**
-   * ステージ(床・壁・グリッド・軸)の表示/非表示を切り替える(GUI改修Task9 監督者
+   * ステージ(床・グリッド・軸)の表示/非表示を切り替える(GUI改修Task9 監督者
    * 裁定8)。モデル読込前に呼ばれた場合は次回setMesh時に反映される状態だけを保持する。
    * @param {boolean} visible
    */
@@ -271,18 +349,19 @@ export function initViewer(canvas) {
   /**
    * 選択状態を反映して全要素の色を1パスで塗り直す(GUI改修 Task8)。増分更新は
    * しない(前回選択との差分だけ塗る旧方式は減光と両立しないため廃止した)。
-   * 決定順: 選択中 → 選択色(SELECTION_COLOR)。そうでなく有効操作があれば
-   * → statusColor(operation)。どちらでもなければ → クラス色。
-   * dim===trueのときは非選択の要素のみDIM_FACTOR倍に落とす(選択色は常に
+   * 決定順: 選択中 → 選択色(SELECTION_COLOR)。そうでなければ resolveBaseColor
+   * (有効操作があればステータス色、無ければ colorMode に応じてIFCの色/クラス色)。
+   * dim===trueのときは非選択の要素のみdimColor()で減光する(選択色は常に
    * フル輝度のまま)。color属性へのneedsUpdate=trueは1回だけ立てる。
-   * @param {{selectedGids: Set<string>, effectiveOps: Map<string, object>, dim: boolean}} params
+   * @param {{selectedGids: Set<string>, effectiveOps: Map<string, object>, dim: boolean, colorMode: string}} params
    */
-  function repaintColors({ selectedGids, effectiveOps, dim } = {}) {
+  function repaintColors({ selectedGids, effectiveOps, dim, colorMode } = {}) {
     if (!mesh || !meta) return;
     const t0 = performance.now();
 
     const selected = selectedGids ?? new Set();
     const ops = effectiveOps ?? new Map();
+    const mode = colorMode ?? COLOR_MODE_IFC;
     const colorAttr = mesh.geometry.getAttribute("color");
     const array = colorAttr.array;
 
@@ -291,12 +370,9 @@ export function initViewer(canvas) {
       if (selected.has(el.global_id)) {
         [r, g, b] = SELECTION_COLOR;
       } else {
-        const operation = ops.get(el.global_id);
-        [r, g, b] = operation ? statusColor(operation) : classColor(el.ifc_class);
+        [r, g, b] = resolveBaseColor(el, { operation: ops.get(el.global_id), colorMode: mode });
         if (dim) {
-          r *= DIM_FACTOR;
-          g *= DIM_FACTOR;
-          b *= DIM_FACTOR;
+          [r, g, b] = dimColor([r, g, b]);
         }
       }
       const vertexStart = el.vertex_start;
