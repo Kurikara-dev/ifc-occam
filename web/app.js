@@ -39,6 +39,12 @@ import { estimateLoad, formatDuration, formatBytes } from "./estimate.js";
 import { roundToNiceStep, buildStage } from "./stage.js";
 import * as THREE from "./vendor/three.module.js"; // ?selftest=1でbuildStageにTHREE.Box3を渡すためだけに使う。
 import { measureRenderedColors } from "./rendercheck.js";
+import {
+  resolveDragAction,
+  clampPolarDelta,
+  orbitAroundPivot,
+  worldUnitsPerPixel,
+} from "./camera-math.js";
 
 const canvas = document.getElementById("canvas");
 const filePickButton = document.getElementById("file-pick-button");
@@ -2527,19 +2533,27 @@ function runSelftest() {
 
   console.log(`[selftest] roundToNiceStep: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
 
-  // --- buildStage(GUI改修Task9 必須アサーション: margin適用寸法と床Yの一致) ---
+  // --- buildStage(GUI改修Task9→Z-up修正 必須アサーション: margin適用寸法と床Zの一致) ---
+  // Z-up修正: IFCは+Zが上のため、床の垂直座標はY→Z、marginを適用する水平2方向は
+  // (X,Z)の組→(X,Y)の組に読み替えた。期待値はbuildStageを呼ばずに手計算した
+  // literal(size=(10,4,6), margin=0.15 -> padX=1.5, padY=0.6 -> 床X幅=10+2*1.5=13、
+  // 床Y幅=4+2*0.6=5.2)。
   const stageTestBox = new THREE.Box3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(10, 4, 6));
   const stageTest = buildStage(stageTestBox, { margin: 0.15 });
   const stageFloor = stageTest.group.children.find((c) => c.name === "stage-floor");
-  check("buildStage: 床のY座標がAABBの最小Yと一致する(裁定4)", stageFloor.position.y, 0);
+  check(
+    "buildStage: 床のZ座標がAABBの最小Zと一致する(裁定4、IFCはZ-up)",
+    stageFloor.position.z,
+    0
+  );
   check(
     "buildStage: margin適用後の床のX幅(13)がAABBのX幅(10)より大きい",
     stageFloor.geometry.parameters.width > stageTestBox.max.x - stageTestBox.min.x,
     true
   );
   check(
-    "buildStage: margin適用後の床のZ幅(7.8)がAABBのZ幅(6)より大きい",
-    stageFloor.geometry.parameters.height > stageTestBox.max.z - stageTestBox.min.z,
+    "buildStage: margin適用後の床のY幅(5.2)がAABBのY幅(4)より大きい",
+    stageFloor.geometry.parameters.height > stageTestBox.max.y - stageTestBox.min.y,
     true
   );
   // 壁はユーザーの実機確認により削除した(グリッド付きの床だけで広がりと天地が
@@ -2553,6 +2567,19 @@ function runSelftest() {
   stageTest.dispose();
 
   console.log(`[selftest] buildStage: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- camera.up(Z-up修正 必須アサーション: うっかりY-upに戻したら赤くなる番人) ---
+  // IFCは+Zが上(仕様)。three.jsの既定+Y上のままだとモデルが90度倒れて表示される
+  // (このタスクで直したバグそのもの)。initViewerの戻り値からcamera.up自体は
+  // 取れないため、検証専用の最小限のgetter`getCameraUp()`をviewer.jsに追加した。
+  const cameraUp = viewer.getCameraUp();
+  check(
+    "camera.upが(0,0,1)である(Z-up修正: IFCの+Zをthree.jsの上方向として扱う)",
+    `${cameraUp.x},${cameraUp.y},${cameraUp.z}`,
+    "0,0,1"
+  );
+
+  console.log(`[selftest] camera.up: 1件の境界ケースを含む合計 ${passed}/${total} passed`);
 
   // --- ifcColorToLinear(色task Task5 必須アサーション: sRGB→linear変換) ---
   // sRGB 0.5 -> linear ((0.5+0.055)/1.055)^2.4 = 0.2140(手計算)。
@@ -2648,4 +2675,156 @@ function runSelftest() {
   checkColor("dimColor([1, 1, 1]) === [0.31, 0.31, 0.31](手計算)", dimColor([1, 1, 1]), [0.31, 0.31, 0.31]);
 
   console.log(`[selftest] dimColor: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- resolveDragAction(3Dビュー操作入替Cam Task1 必須アサーション: ボタン→操作割り当て) ---
+  check("resolveDragAction(0=左は視点移動)", resolveDragAction(0), "look");
+  check("resolveDragAction(1=中/ホイールはパン)", resolveDragAction(1), "pan");
+  check("resolveDragAction(2=右は回転)", resolveDragAction(2), "orbit");
+  check("resolveDragAction(割り当てのないボタンはnull)", resolveDragAction(3), null);
+
+  console.log(`[selftest] resolveDragAction: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- clampPolarDelta(Cam Task1 必須アサーション: 極角の可動範囲クランプ) ---
+  // 期待値はclampPolarDeltaを呼ばずに手計算したliteral。加算後に減算する実装のため
+  // (例: 1.0+0.2を計算してから-1.0する)、JSの浮動小数点表現では厳密等価(===)が
+  // 保証されない(実測: 1.2-1.0が0.19999999999999996になるなど)。ifcColorToLinear等
+  // 既存の浮動小数点比較と同じ「Math.abs(差)<閾値をcheckに通す」パターンに合わせる。
+  check(
+    "clampPolarDelta(範囲の真ん中では変化量がそのまま通る)",
+    Math.abs(clampPolarDelta(1.0, 0.2) - 0.2) < 1e-9,
+    true
+  );
+  check(
+    "clampPolarDelta(上限を越える分は切り詰められる。手計算: 3.0+1.0=4.0は上限3.1を越えるので3.1-3.0=0.1)",
+    Math.abs(clampPolarDelta(3.0, 1.0, 0.001, 3.1) - 0.1) < 1e-9,
+    true
+  );
+  check(
+    "clampPolarDelta(下限を越える分も同様に切り詰められる。手計算: 0.1-1.0=-0.9は下限0.05未満なので0.05-0.1=-0.05)",
+    Math.abs(clampPolarDelta(0.1, -1.0, 0.05, 3.1) - -0.05) < 1e-9,
+    true
+  );
+
+  console.log(`[selftest] clampPolarDelta: 3件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- orbitAroundPivot(Cam Task1 必須アサーション: 原点を軸に+X側10の位置からyaw90度) ---
+  // 入力: position(10,0,0)、quaternionは単位、pivot(0,0,0)、yaw=Math.PI/2、pitch=0。
+  // 期待値はorbitAroundPivotを呼ばずに手計算したliteral(手計算の手順・符号の判断根拠は
+  // 報告書「回転の符号をどう決めたか」節を参照。Task 2 Step 3の実機確認で符号を確定させた)。
+  const orbitResult = orbitAroundPivot({
+    position: new THREE.Vector3(10, 0, 0),
+    quaternion: new THREE.Quaternion(),
+    pivot: new THREE.Vector3(0, 0, 0),
+    yaw: Math.PI / 2,
+    pitch: 0,
+    THREE,
+  });
+  check(
+    "orbitAroundPivot(yaw90度: position.xが0付近、誤差1e-6以内)",
+    Math.abs(orbitResult.position.x - 0) < 1e-6,
+    true
+  );
+  check(
+    "orbitAroundPivot(yaw90度: position.yが-10付近、誤差1e-6以内)",
+    Math.abs(orbitResult.position.y - -10) < 1e-6,
+    true
+  );
+  check(
+    "orbitAroundPivot(yaw90度: position.zが0付近、誤差1e-6以内)",
+    Math.abs(orbitResult.position.z - 0) < 1e-6,
+    true
+  );
+  // 符号に依存しない不変量: 回転なのでpivotからの距離(10)は保存される。
+  check(
+    "orbitAroundPivot(pivotからの距離は回転で保存される。手計算: 10)",
+    Math.abs(orbitResult.position.distanceTo(new THREE.Vector3(0, 0, 0)) - 10) < 1e-6,
+    true
+  );
+
+  // ここまでのアサーションは position しか見ていなかった。レビューで、
+  // orbitAroundPivot が「向きを一切変えない」実装に改竄しても全て通ってしまう
+  // (= 左ドラッグの視点移動が完全な no-op になっても気付けない)ことが実証された。
+  // このモジュールの存在理由そのものである「位置と向きに同じ回転を掛ける」を
+  // 以下3件で固定する。
+  //
+  // (1) yaw90度のquaternion。手計算: qYaw = axis(0,0,1)を角度 -π/2 で回す
+  //     -> (x,y,z,w) = (0, 0, sin(-π/4), cos(-π/4)) = (0, 0, -0.70710678, 0.70710678)。
+  //     入力quaternionが単位なので、結果はこれそのもの。
+  check(
+    "orbitAroundPivot(yaw90度: quaternionが(0,0,-0.70710678,0.70710678)付近)",
+    Math.abs(orbitResult.quaternion.x - 0) < 1e-6 &&
+      Math.abs(orbitResult.quaternion.y - 0) < 1e-6 &&
+      Math.abs(orbitResult.quaternion.z - -0.70710678) < 1e-6 &&
+      Math.abs(orbitResult.quaternion.w - 0.70710678) < 1e-6,
+    true
+  );
+
+  // (2) pivot === position のときは位置が動かず、向きだけが変わる。
+  //     これが左ドラッグ(視点移動)が成立する条件そのもの。
+  const lookStart = new THREE.Vector3(3, 4, 5);
+  const lookQuat = new THREE.Quaternion();
+  const lookResult = orbitAroundPivot({
+    position: lookStart.clone(),
+    quaternion: lookQuat.clone(),
+    pivot: lookStart.clone(),
+    yaw: 0.3,
+    pitch: 0.2,
+    THREE,
+  });
+  check(
+    "orbitAroundPivot(pivot=positionなら位置は不動。手計算: (3,4,5)のまま)",
+    lookResult.position.distanceTo(lookStart) < 1e-12,
+    true
+  );
+  check(
+    "orbitAroundPivot(pivot=positionでも向きは変わる。回転角>0.1rad)",
+    lookResult.quaternion.angleTo(lookQuat) > 0.1,
+    true
+  );
+
+  // (3) pitch を掛けた分だけ極角(ワールド+Zから見た視線の角度)がちょうど増える。
+  //     コントローラ側の極角追跡(currentPolar += pitch)が成り立つ前提であり、
+  //     ここが崩れると可動範囲の制限が逆の極に効く。
+  //     注意: 単位quaternionは「真下を向く」退化姿勢(極角π)なので使わない。
+  //     極角2.0の現実的な姿勢を作ってから0.1だけpitchする -> 2.1(手計算)。
+  const polarOf = (q) => {
+    const f = new THREE.Vector3(0, 0, -1).applyQuaternion(q).normalize();
+    return Math.acos(Math.min(1, Math.max(-1, f.z)));
+  };
+  const pitchCam = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  pitchCam.up.set(0, 0, 1);
+  pitchCam.position.set(0, 0, 0);
+  pitchCam.lookAt(new THREE.Vector3(Math.sin(2.0), 0, Math.cos(2.0)));
+  pitchCam.updateMatrixWorld(true);
+  const pitchResult = orbitAroundPivot({
+    position: pitchCam.position.clone(),
+    quaternion: pitchCam.quaternion.clone(),
+    pivot: pitchCam.position.clone(),
+    yaw: 0,
+    pitch: 0.1,
+    THREE,
+  });
+  check(
+    "orbitAroundPivot(極角2.0からpitch0.1で極角2.1になる。手計算)",
+    Math.abs(polarOf(pitchResult.quaternion) - 2.1) < 1e-6,
+    true
+  );
+
+  console.log(`[selftest] orbitAroundPivot: 8件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- worldUnitsPerPixel(Cam Task1 必須アサーション: 画面1pxが何ワールド単位か) ---
+  // 手計算: worldUnitsPerPixel(10, 50, 600) = 2*10*tan(25°)/600。
+  // tan(25°) = 0.4663076582。よって 2*10*0.4663076582 = 9.326153164 -> /600 = 0.01554359(手計算)。
+  check(
+    "worldUnitsPerPixel(10,50,600)は手計算値0.01554359付近(誤差1e-6)",
+    Math.abs(worldUnitsPerPixel(10, 50, 600) - 0.01554359) < 1e-6,
+    true
+  );
+  check(
+    "worldUnitsPerPixel(viewportHeightPx=0は0除算を防いで0を返す)",
+    worldUnitsPerPixel(10, 50, 0),
+    0
+  );
+
+  console.log(`[selftest] worldUnitsPerPixel: 2件の境界ケースを含む合計 ${passed}/${total} passed`);
 }

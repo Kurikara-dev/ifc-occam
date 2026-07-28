@@ -62,10 +62,11 @@ export function roundToNiceStep(value) {
  * 削除した。グリッドを敷いた床だけで「要素がどこまで広がっているか」と「天地」の
  * 両方が読み取れるうえ、壁は黒く重くモデルの視認性を下げていたため。
  *
- * @param {THREE.Box3} boundingBox モデルのAABB(ワールド座標)
+ * @param {THREE.Box3} boundingBox モデルのAABB(ワールド座標。IFCはZ-upのため
+ *   Zが上方向)
  * @param {{margin?: number}} [options] marginはAABBの各辺に対する比率(既定0.15)。
- *   床・グリッドの水平方向の広がりに適用する。
- *   床のY座標そのものにはmarginを適用しない(裁定4: モデルの下端に正確に一致させ、
+ *   床・グリッドの水平方向(X・Y)の広がりに適用する。
+ *   床のZ座標そのものにはmarginを適用しない(裁定4: モデルの下端に正確に一致させ、
  *   浮いたりめり込んだりしないようにする)。
  * @returns {{group: THREE.Group, dispose(): void}}
  */
@@ -93,55 +94,62 @@ export function buildStage(boundingBox, { margin = DEFAULT_MARGIN } = {}) {
   // Infinity/NaN はグリッドの分割数を壊す)。
   const safeMargin = Number.isFinite(margin) && margin >= 0 ? margin : DEFAULT_MARGIN;
 
-  // Y方向のmarginは壁の高さにだけ使っていたため、壁の削除にあわせて廃止した。
+  // marginは水平2方向(X・Y)に適用する。垂直方向(Z)は壁の高さにだけ使っていたが、
+  // 壁の削除にあわせて廃止した(Z-up修正: 水平面はX・Y、垂直はZ)。
   const padX = safeSize.x * safeMargin;
-  const padZ = safeSize.z * safeMargin;
+  const padY = safeSize.y * safeMargin;
 
   // AABB の座標そのものが非有限のときは原点に寄せる(上の safeSize と同じ理由)。
   const originX = finiteOr(boundingBox.min.x, 0);
   const originY = finiteOr(boundingBox.min.y, 0);
   const originZ = finiteOr(boundingBox.min.z, 0);
   const farX = finiteOr(boundingBox.max.x, originX + safeSize.x);
-  const farZ = finiteOr(boundingBox.max.z, originZ + safeSize.z);
+  const farY = finiteOr(boundingBox.max.y, originY + safeSize.y);
 
-  const floorY = originY; // 裁定4: marginを適用せず、AABBの最小Yに正確に一致させる。
+  const floorZ = originZ; // 裁定4: marginを適用せず、AABBの最小Zに正確に一致させる(IFCはZ-up)。
   const minX = originX - padX;
   const maxX = farX + padX;
-  const minZ = originZ - padZ;
-  const maxZ = farZ + padZ;
+  const minY = originY - padY;
+  const maxY = farY + padY;
 
   const footprintWidthX = maxX - minX; // 床のX方向の幅
-  const footprintDepthZ = maxZ - minZ; // 床のZ方向の幅
+  const footprintWidthY = maxY - minY; // 床のY方向の幅
   const centerX = (minX + maxX) / 2;
-  const centerZ = (minZ + maxZ) / 2;
+  const centerY = (minY + maxY) / 2;
 
   const group = new THREE.Group();
   group.name = "stage";
   group.userData.pickable = false;
 
   // --- 床 ---
-  const floorGeometry = new THREE.PlaneGeometry(footprintWidthX, footprintDepthZ);
+  // PlaneGeometryは既定でXY平面(法線+Z)に作られる。IFCはZ-upのため、この既定の
+  // ままで回転が要らない(以前はY-up前提でXZ平面へ-90°回転させていた)。
+  const floorGeometry = new THREE.PlaneGeometry(footprintWidthX, footprintWidthY);
   const floorMaterial = new THREE.MeshLambertMaterial({
     color: FLOOR_COLOR,
     side: THREE.DoubleSide, // カメラが床下に回り込んでも消えないようにする。
   });
   const floor = new THREE.Mesh(floorGeometry, floorMaterial);
   floor.name = "stage-floor";
-  floor.rotation.x = -Math.PI / 2; // 既定はXY平面(法線+Z) -> XZ平面(法線+Y、上向き)に直す。
-  floor.position.set(centerX, floorY, centerZ);
+  floor.position.set(centerX, centerY, floorZ);
   floor.userData.pickable = false;
   group.add(floor);
 
   // --- グリッド ---
   const gridStep = roundToNiceStep(maxDim / GRID_STEP_DIVISOR);
-  const gridExtent = Math.max(footprintWidthX, footprintDepthZ);
+  const gridExtent = Math.max(footprintWidthX, footprintWidthY);
   const gridDivisions = Math.max(1, Math.round(gridExtent / gridStep));
   const gridSize = gridDivisions * gridStep;
   const grid = new THREE.GridHelper(gridSize, gridDivisions, GRID_COLOR_CENTER, GRID_COLOR_LINES);
   grid.name = "stage-grid";
+  // GridHelperは既定でXZ平面(法線+Y)に作られる。IFCのZ-upではXY平面(法線+Z)に
+  // 倒す必要があるため、X軸周りに+90°回転させる(法線だった局所Yが世界+Zへ、
+  // 局所Zが世界-Yへ移る。グリッド自体は原点対称なので見た目には影響しない)。
+  grid.rotation.x = Math.PI / 2;
   // 床と厳密に同一平面だとz-fightingが起きるため、モデル規模に対する相対値で
-  // ごく僅かに浮かせる(絶対値だとmm単位モデルで消え、m単位モデルで浮きすぎる)。
-  grid.position.set(centerX, floorY + maxDim * 0.0005, centerZ);
+  // ごく僅かに(+Z方向へ)浮かせる(絶対値だとmm単位モデルで消え、m単位モデルで
+  // 浮きすぎる)。
+  grid.position.set(centerX, centerY, floorZ + maxDim * 0.0005);
   grid.userData.pickable = false;
   group.add(grid);
 

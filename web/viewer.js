@@ -2,7 +2,7 @@
 // DOM(サイドバー等)には関与しない。
 
 import * as THREE from "./vendor/three.module.js";
-import { OrbitControls } from "./vendor/OrbitControls.js";
+import { createCameraControls } from "./cameracontrols.js";
 import { statusColor } from "./operations.js";
 import { buildStage } from "./stage.js";
 
@@ -181,6 +181,13 @@ export function initViewer(canvas) {
     100000
   );
   camera.position.set(10, 10, 10);
+  // IFCは+Zが上(仕様)。three.jsの既定は+Y上のため、camera.upを明示する
+  // (Z-up修正)。専用カメラコントローラ(cameracontrols.js)のorbitAroundPivotは
+  // yawをワールド+Zまわりで回す前提で書かれており、camera.lookAt()もcamera.upを
+  // 読んで正しい向き(ロール)を決めるため、この値が(0,0,1)であることが必要
+  // (以前はOrbitControls生成前に設定する順序が重要だったが、3Dビュー操作入替で
+  // OrbitControlsは撤去した。camera.up自体の必要性そのものは変わらない)。
+  camera.up.set(0, 0, 1);
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio || 1);
@@ -191,14 +198,34 @@ export function initViewer(canvas) {
   // 付けない(コストと利点が釣り合わないという監督者裁定7の判断による)。
   const ambient = new THREE.AmbientLight(0xffffff, 0.45);
   const directional = new THREE.DirectionalLight(0xffffff, 0.8);
+  // Z-up修正: この値はY-up前提で選ばれたが、3成分中Zが最大(3)のため、Z-upの
+  // 「上」として読んでも仰角53.3°(atan2(3,√(1²+2²)))の斜め上から差す向きを保つ
+  // (旧Y-up解釈での仰角32.3°より急だが、どちらも「上から」の範囲)。
+  // _fitCameraToMeshの既定カメラ方向(1,1,0.6)を向く面法線との内積は実測0.835
+  // (正で大きい=カメラに正対する面が明るく照らされる)。変更しない。
   directional.position.set(1, 2, 3);
   // 上方向(sky)を明るい無彩色、下方向(ground)を暗い無彩色にして、モデル上面と
-  // 下面の明暗差を作る(監督者裁定7)。
+  // 下面の明暗差を作る(監督者裁定7)。HemisphereLightの上下は「position」が指す
+  // 方向で決まり、既定値はTHREE.Object3D.DEFAULT_UP(=+Y)がコンストラクタで
+  // コピーされる。IFCはZ-upのためここで明示的に+Zへ差し替える(Z-up修正。忘れると
+  // 上下の明暗が横向きになる)。
   const hemisphere = new THREE.HemisphereLight(0xffffff, 0x2b2f33, 0.5);
+  hemisphere.position.set(0, 0, 1);
   scene.add(ambient, directional, hemisphere);
 
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
+  // 専用カメラコントローラ(3Dビュー操作入替 Task2)。OrbitControlsは撤去した
+  // (web/vendor/OrbitControls.js自体はthree.jsのベンダリング物として残すが、
+  // このファイルからは使わない。理由はdocs/plans/2026-07-28-camera-controls.md
+  // 参照)。pickPointには_pickPoint(このファイル内で後述)を渡す。関数宣言は
+  // hoistされるため、この時点ではまだ本体を読んでいなくても参照として渡せる
+  // (実際に呼ばれるのは右ドラッグのpointerdown時点であり、その頃にはmesh/
+  // raycaster/pointerの宣言はすべて実行済み)。
+  const controls = createCameraControls({
+    camera,
+    domElement: renderer.domElement,
+    THREE,
+    pickPoint: _pickPoint,
+  });
 
   let mesh = null;
   let meta = null;
@@ -228,8 +255,12 @@ export function initViewer(canvas) {
   }
   _resize();
 
+  // 裁定D4: 新コントローラは減衰(damping)を持たない1:1の直接操作のため、
+  // OrbitControls.update()相当の毎フレーム積分処理が不要になった。カメラの
+  // 位置・向きはpointermove/wheelのイベントハンドラの中で直接書き換えている
+  // ため、ここではrenderer.render()だけで描画は最新の状態を反映する
+  // (controls.update()を削除してよい理由)。
   function _animate() {
-    controls.update();
     renderer.render(scene, camera);
     requestAnimationFrame(_animate);
   }
@@ -334,7 +365,12 @@ export function initViewer(canvas) {
     if (!sphere) return;
 
     const radius = Math.max(sphere.radius, 0.01);
-    const direction = new THREE.Vector3(1, 0.6, 1).normalize();
+    // Z-up修正: 水平成分(X・Y)を大きく、仰角成分(Z)を小さくした向き。旧来の
+    // Y-up向け(1, 0.6, 1)(第2成分=高さ)から差し替えた。camera.upの(0,0,1)と
+    // 平行にならない値を選んでいる(真上/真下から見下ろす向きだと、直後の
+    // camera.lookAt(sphere.center)の向き(ロール)が不定になる。3Dビュー操作入替
+    // 以前はOrbitControlsの内部球面座標変換が破綻する、という同趣旨の理由だった)。
+    const direction = new THREE.Vector3(1, 1, 0.6).normalize();
     const distance = radius / Math.sin((camera.fov * Math.PI) / 360);
 
     camera.position.copy(sphere.center).addScaledVector(direction, distance * 1.2);
@@ -342,8 +378,11 @@ export function initViewer(canvas) {
     camera.far = distance * 1000;
     camera.updateProjectionMatrix();
 
-    controls.target.copy(sphere.center);
-    controls.update();
+    // OrbitControls.update()が毎フレームやっていた「target を向く」処理を、
+    // ここで明示的に行う(新コントローラはlookAtを強制しないため、この
+    // 呼び出し側の責務になった)。
+    camera.lookAt(sphere.center);
+    controls.setFocus(sphere.center, camera.position.distanceTo(sphere.center));
   }
 
   /**
@@ -480,23 +519,59 @@ export function initViewer(canvas) {
   }
 
   /**
+   * client座標(clientX/clientY)からメッシュへのraycastを行う共通処理。
+   * _performClick(クリック判定)とpickPoint(cameracontrols.jsへ渡す、右ドラッグの
+   * 回転軸決定に使う)の両方がここを通る(raycast処理そのものを重複させない)。
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {THREE.Intersection|null} 最も近い交点。当たらなければnull。
+   */
+  function _raycastAtClient(clientX, clientY) {
+    if (!mesh) return null;
+    // raycaster.setFromCamera は camera.matrixWorld を直接読むだけで、更新はしない
+    // (web/vendor/three.module.js の Raycaster.setFromCamera 実装を確認済み)。
+    // matrixWorld は通常 renderer.render() 内で毎フレーム更新されるが、タブが
+    // バックグラウンド扱いになる環境では requestAnimationFrame が止まる/間引かれ、
+    // _fitCameraToMesh 等でcamera.position/quaternionを直接書き換えた直後に
+    // まだ古いmatrixWorldのままraycastされることがある(実測で確認したレビュー
+    // Important。3Dビュー操作入替Task2)。描画ループの実行タイミングに依存させず
+    // ここで明示的に更新することで、いつ呼ばれても正しい結果を返すようにする。
+    camera.updateMatrixWorld();
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObject(mesh, false);
+    return hits.length > 0 ? hits[0] : null;
+  }
+
+  /**
    * pointerdown〜pointerupがクリックと判定された場合のみ呼ばれる。raycastして
    * 要素に当たればclickCallback、当たらなければbackgroundClickCallbackを呼ぶ。
    * @param {PointerEvent} event
    */
   function _performClick(event) {
     if (!mesh) return;
-    const rect = renderer.domElement.getBoundingClientRect();
-    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-    raycaster.setFromCamera(pointer, camera);
-    const hits = raycaster.intersectObject(mesh, false);
-    if (hits.length > 0 && hits[0].faceIndex !== undefined) {
-      if (clickCallback) clickCallback(hits[0].faceIndex);
+    const hit = _raycastAtClient(event.clientX, event.clientY);
+    if (hit && hit.faceIndex !== undefined) {
+      if (clickCallback) clickCallback(hit.faceIndex);
     } else if (backgroundClickCallback) {
       backgroundClickCallback();
     }
+  }
+
+  /**
+   * カーソル直下のモデル表面点を返す(cameracontrols.jsのpickPoint。右ドラッグの
+   * 回転軸決定(裁定D1)に使う)。_performClickと同じ_raycastAtClientを使うため、
+   * raycast処理そのものは重複しない。
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {THREE.Vector3|null}
+   */
+  function _pickPoint(clientX, clientY) {
+    const hit = _raycastAtClient(clientX, clientY);
+    return hit ? hit.point.clone() : null;
   }
 
   // ドラッグ(視点操作)とクリックを区別する(GUI改修 Task8 監督者裁定6)。
@@ -546,6 +621,32 @@ export function initViewer(canvas) {
     return mesh.geometry.getAttribute("color").array.slice();
   }
 
+  /**
+   * 現在のcamera.upを返す(検証/デバッグ用途。Z-up修正の番人アサーション
+   * `?selftest=1` から、うっかりY-upに戻す変更が入ったら赤くなるようにするために
+   * 追加した最小限のgetter)。
+   * @returns {THREE.Vector3}
+   */
+  function getCameraUp() {
+    return camera.up.clone();
+  }
+
+  /**
+   * カメラの現在状態を返す(検証/デバッグ用途。3Dビュー操作入替Task2 Step3の
+   * 実機確認で使う)。
+   * @returns {{position: THREE.Vector3, quaternion: THREE.Quaternion,
+   *   focus: THREE.Vector3, focusDistance: number}}
+   */
+  function getCameraState() {
+    const { point, distance } = controls.getFocus();
+    return {
+      position: camera.position.clone(),
+      quaternion: camera.quaternion.clone(),
+      focus: point,
+      focusDistance: distance,
+    };
+  }
+
   return {
     setMesh,
     repaintColors,
@@ -558,5 +659,7 @@ export function initViewer(canvas) {
     getScene,
     setStageVisible,
     isStageVisible,
+    getCameraUp,
+    getCameraState,
   };
 }
