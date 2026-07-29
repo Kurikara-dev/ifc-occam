@@ -6,7 +6,7 @@ import ifc_occam.cli as cli
 from ifc_occam.core.diagnose import aggregate_by_class
 from ifc_occam.core.duplicates import find_duplicates
 from ifc_occam.core.types import ElementInfo, ModelData, ShapeInfo
-from ifc_occam.cli import _find_free_port, format_report, main
+from ifc_occam.cli import _find_free_port, format_report, main, resolve_entry_argv
 
 
 def _model():
@@ -124,3 +124,56 @@ def test_cui_scan_only_on_real_small_ifc_prints_ranking_via_cli_main(small_ifc_p
     out = capsys.readouterr().out
     assert "クラス別ランキング" in out
     assert "スキーマ" in out
+
+
+def test_resolve_entry_argv_defaults_to_serve_when_empty():
+    """無引数(start-exe.bat のダブルクリック)は GUI を起動する。"""
+    assert resolve_entry_argv([]) == ["serve"]
+
+
+def test_resolve_entry_argv_prepends_serve_for_bare_options():
+    """従来の使い方(exe --port 8100)を壊さない(serve への素通し)。"""
+    assert resolve_entry_argv(["--port", "8100"]) == ["serve", "--port", "8100"]
+    assert resolve_entry_argv(["--no-browser"]) == ["serve", "--no-browser"]
+
+
+def test_resolve_entry_argv_passes_known_subcommands_through():
+    """cui / diagnose / serve は exe からそのまま使える(このタスクの目的)。"""
+    assert resolve_entry_argv(["cui", "small.ifc", "--scan-only"]) == [
+        "cui", "small.ifc", "--scan-only"
+    ]
+    assert resolve_entry_argv(["diagnose", "x.ifc"]) == ["diagnose", "x.ifc"]
+    assert resolve_entry_argv(["serve", "--port", "8100"]) == ["serve", "--port", "8100"]
+
+
+def test_resolve_entry_argv_passes_help_through():
+    """-h / --help はトップレベルのヘルプ(全サブコマンド一覧)を出す。
+    serve を前置すると serve のヘルプになってしまい、cui の存在が見えない。"""
+    assert resolve_entry_argv(["-h"]) == ["-h"]
+    assert resolve_entry_argv(["--help"]) == ["--help"]
+
+
+def test_resolve_entry_argv_prepends_serve_for_unknown_first_arg():
+    """未知の第1引数(例: IFCファイルをexeにドラッグ)は serve に渡し、
+    argparse の usage エラー(exit 2)に落とす。黙って何かを推測しない。"""
+    assert resolve_entry_argv(["model.ifc"]) == ["serve", "model.ifc"]
+
+
+def test_entry_subcommands_stay_in_sync_with_the_parser(capsys):
+    """_ENTRY_SUBCOMMANDS(exe用の手書きリスト)と main() の add_parser 群の一致を固定する。
+
+    両者は単一のソースを持たない二重管理になっている(レビュー指摘 Minor)。
+    parser にサブコマンドを足して _ENTRY_SUBCOMMANDS を忘れると、python -m では
+    動くのに exe からだけ serve が前置されて usage エラーで落ちる。この非対称は
+    手元では再現しないため、ズレた瞬間にここで赤くする。
+    """
+    import re
+
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(["-h"])
+    help_text = capsys.readouterr().out
+    match = re.search(r"\{([a-z,]+)\}", help_text)
+    assert match is not None, f"ヘルプにサブコマンド一覧が見つからない: {help_text!r}"
+    assert set(match.group(1).split(",")) == set(cli._ENTRY_SUBCOMMANDS)

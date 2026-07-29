@@ -66,6 +66,25 @@ def format_report(
     return "\n".join(lines)
 
 
+# packaging/entry.py(PyInstaller exe)が使う。exe は歴史的に serve 決め打ちで
+# 配布されてきたため、無引数・オプションだけの起動は serve として扱い、
+# 既知のサブコマンドが来たときだけ素通しする(docs/plans/2026-07-29-exe-cui-packaging.md D1)。
+_ENTRY_SUBCOMMANDS = ("serve", "cui", "diagnose")
+
+
+def resolve_entry_argv(args: list[str]) -> list[str]:
+    """exe エントリポイントの引数を main() 用に正規化する(純粋関数)。
+
+    - 無引数 -> ["serve"](start-exe.bat のダブルクリック = GUI)
+    - 第1引数が既知のサブコマンドまたは -h/--help -> そのまま
+    - それ以外(--port 等のオプションや未知の値) -> serve を前置して素通し
+      (従来の exe --port 8100 という使い方を壊さないため)
+    """
+    if args and (args[0] in _ENTRY_SUBCOMMANDS or args[0] in ("-h", "--help")):
+        return list(args)
+    return ["serve", *args]
+
+
 def main(argv: list[str] | None = None) -> None:
     sys.stdout.reconfigure(encoding="utf-8")
 

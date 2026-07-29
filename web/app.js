@@ -294,8 +294,9 @@ function renderLoadEstimate(bytes, config, path) {
   let html = `<div>推定読込時間 ${rangeText} / 推定メモリ 約${memText}(実測2点からの目安です)</div>`;
   if (est.warn) {
     const cuiCommand = `python -m ifc_occam cui "${path}" --scan-only`;
+    const exeCommand = `ifc_occam.exe cui "${path}" --scan-only`;
     html += `<div class="load-estimate-warning">${escapeHtml(
-      `このサイズはフルオープンに失敗する可能性があります。CUI なら開かずに診断できます: ${cuiCommand}`
+      `このサイズはフルオープンに失敗する可能性があります。CUI なら開かずに診断できます: ${cuiCommand}(exe版: ${exeCommand})`
     )}</div>`;
   }
   loadEstimateEl.innerHTML = html;
