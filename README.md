@@ -4,6 +4,10 @@
 
 A workbench for cutting oversized IFC (ISO 16739) models down to a size that ordinary BIM tools can actually open. You decide what goes — **by IFC class, not element by element** — and the tool writes a smaller derivative file. Your original file is never modified.
 
+![A torus decimated in stages; the silhouette survives](docs/images/decimate-steps.png)
+
+*Decimation applied in stages. The triangle count drops but you can still read what is where — cutting only as far as the model stays readable is the whole job.*
+
 > **Two things to know before you read further.** The user interface — both the web UI and the interactive command loop — is **Japanese only**; the code, comments, and design notes are Japanese too. Development and testing happen on Windows. Everything else below still applies, but if neither of those works for you, this probably isn't the tool you want.
 
 ## The problem
@@ -65,7 +69,13 @@ python -m ifc_occam serve
 
 Open the printed URL. Pick a model through the **file dialog** (browsing is confined to the folder you launched the server from; a collapsed manual-path field is still there if you'd rather type it). The sidebar has three tabs — class, layer, and duplicate-shape groups — each row showing element/shape/triangle counts, with delete/simplify/keep quick-action buttons that appear on hover. Select elements in the viewer or act on a whole class/layer at once; delete, reduce to a bounding box, take a convex hull, or decimate; save named **operation patterns** (reusable rule sets, applied with a per-rule count you confirm first) for reuse across models. Export goes through a **save dialog** too, and it refuses a filename that resolves to the file you loaded. The 3D view sits the model on a gridded floor sized to its bounding box, which gives both the extent and which way is up (toggle with the "ステージ" button); selecting something dims everything else and outlines the selection. Camera controls: right-drag to rotate around the point under the cursor, left-drag to look around without moving the camera, drag the wheel button to pan, and scroll the wheel to zoom; a plain left-click (no movement) selects. A colour-mode toggle switches the view between the model's own IFC colours and automatic per-class colours. If port 8000 is busy the server picks the next free port and prints it.
 
-<!-- Screenshot: GUI overview (sidebar tabs + docked operation bar + 3D view) — pending -->
+![The GUI: class ranking on the left, 3D view on the right](docs/images/gui-overview.png)
+
+*Just after loading. The sidebar ranks classes by triangle count; the 3D view is coloured per class.*
+
+![IfcWall selected with decimation queued; the selection is highlighted and outlined](docs/images/gui-simplify.png)
+
+*Selecting IfcWall (642 elements) from the list highlights it in the 3D view and dims everything else. Queued operations collect in the operation list — nothing touches the source file until you export.*
 
 ### CUI
 
