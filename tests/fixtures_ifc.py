@@ -1159,8 +1159,8 @@ def attach_layer_assignment(f, targets, name: str = "レイヤーA"):
     """targets(IfcRepresentation / IfcRepresentationItem のリスト)を
     AssignedItems に持つ IfcPresentationLayerAssignment を1つ作って返す。
 
-    test-donuts_mini.ifc の実データでは1つの割当が全456要素の
-    IfcShapeRepresentation を束ねていた(#6344857「汎用 - 図形」)。複数
+    実務データでは1つの割当が多数要素の IfcShapeRepresentation を束ねる
+    構成が観測されている(合成例。実レコードidではない)。複数
     targets を渡せるのはその形を再現するため。
     """
     return f.create_entity(

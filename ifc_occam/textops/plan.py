@@ -111,6 +111,8 @@ _FILLS_CLASS = "IFCRELFILLSELEMENT"
 _AGGREGATES_CLASS = "IFCRELAGGREGATES"
 _OWNER_HISTORY_CLASS = "IFCOWNERHISTORY"
 _REL_PREFIX = "IFCREL"
+_PLA_CLASS = "IFCPRESENTATIONLAYERASSIGNMENT"
+_STYLED_ITEM_CLASS = "IFCSTYLEDITEM"
 # I3(Important、フェーズ最終レビュー): `_generic_rel_candidates` は
 # クラス名が `_REL_PREFIX` で始まるレコードだけを patch 候補にする——kept
 # (dead でない)かつ非 `IfcRel*` のレコードが dead を参照していても、この
@@ -175,6 +177,80 @@ def _bounded_class_mask(graph: FullGraph, predicate) -> np.ndarray:
         return np.zeros(n, dtype=bool)
     per_class = np.array([predicate(name) for name in graph.class_table], dtype=bool)
     return per_class[graph.class_codes]
+
+
+def _is_style_class_name(name: str) -> bool:
+    """IfcStyledItem.Styles に入り得る「スタイル側」クラスか。
+
+    IFC4/IFC2X3 のスタイル系クラスは全て名前が STYLE で終わる
+    (IFCSURFACESTYLE / IFCCURVESTYLE / IFCFILLAREASTYLE / IFCTEXTSTYLE /
+    IFCSYMBOLSTYLE)か、deprecated ラッパー IFCPRESENTATIONSTYLEASSIGNMENT
+    (STYLE で終わらない唯一の仲間)。幾何アイテムのクラス名が STYLE で
+    終わることはないため、この2条件で StyledItem の Item(anchor)と
+    Styles をターゲットのクラス名だけで見分けられる。
+
+    誤判定の倒れ方に注意: スタイルを anchor と誤認すると、生きた
+    IfcStyledItem からの参照先が回収されて dangling になり得る。逆に
+    anchor をスタイルと誤認しても「ピン留めが続く」(肥大側)だけで安全。
+    条件は迷ったらスタイル側に倒れるよう広めに取ってある。
+    """
+    return name.endswith("STYLE") or name.startswith("IFCPRESENTATIONSTYLE")
+
+
+def _annotation_anchor_edges(graph: FullGraph) -> np.ndarray:
+    """「アノテーションが対象を掴んでいるだけ」の参照(anchor 参照)の
+    エッジマスク(ref_targets と同じ長さの bool)を返す。
+
+    対象:
+    - IFCPRESENTATIONLAYERASSIGNMENT(完全一致): 参照は AssignedItems のみ
+      (Name/Description/Identifier は文字列)なので全参照が anchor。
+      サブタイプ IFCPRESENTATIONLAYERWITHSTYLE は LayerStyles 参照が混ざり、
+      平坦な参照列から位置で区別できないため対象外(従来どおりピン留め=
+      保守側。既知の限界)。
+    - IFCSTYLEDITEM: ターゲットがスタイル側クラスでない参照が anchor
+      (_is_style_class_name 参照。Item が $ の場合は anchor 0本になる)。
+
+    どちらの条件にも `anchor_root`(そのアノテーション行自身が入力で誰からも
+    参照されていない、`in_degree == 0`)を AND する(2026-07-30、フェーズ
+    最終レビュー I1)。参照されているアノテーション(IfcStyledRepresentation.
+    Items や IfcPresentationLayerWithStyle.AssignedItems 配下の
+    IfcStyledItem 等)を殺すと、参照元は IFCREL でも PLA 完全一致でもないため
+    パッチされず無音の dangling になる(フェーズ最終レビュー I1 で実測)。
+    参照されているアノテーションはピン留めを続ける(肥大側=安全側)。
+
+    anchor 参照は sweep の被参照カウントから除外される(=アノテーションは
+    幾何を延命させない)。対の規則として、anchor が全滅したアノテーション
+    自身は _reap_dead_annotations が回収し、部分的に死んだ PLA は
+    _generic_rel_candidates がパッチ候補に含める。この対がそろって初めて
+    dangling なしが保証される。
+    """
+    n = graph.record_count
+    m = graph.ref_targets.size
+    anchor = np.zeros(m, dtype=bool)
+    if m == 0 or n == 0:
+        return anchor
+
+    pla_code = _class_code(graph, _PLA_CLASS)
+    styled_code = _class_code(graph, _STYLED_ITEM_CLASS)
+    if pla_code is None and styled_code is None:
+        return anchor
+
+    row_of_ref = np.repeat(np.arange(n, dtype=np.int64), np.diff(graph.ref_indptr))
+    row_codes = graph.class_codes[row_of_ref]
+    valid = graph.ref_targets >= 0
+    anchor_root = (graph.in_degree == 0)[row_of_ref]
+
+    if pla_code is not None:
+        anchor |= (row_codes == pla_code) & valid & anchor_root
+
+    if styled_code is not None:
+        style_class = np.array(
+            [_is_style_class_name(name) for name in graph.class_table], dtype=bool
+        )
+        target_codes = graph.class_codes[np.clip(graph.ref_targets, 0, n - 1)]
+        target_is_style = valid & style_class[target_codes]
+        anchor |= (row_codes == styled_code) & valid & ~target_is_style & anchor_root
+    return anchor
 
 
 def _relating_and_related(
@@ -323,26 +399,72 @@ def _run_cascade(
                     changed = True
 
 
-def _sweep(graph: FullGraph, dead: np.ndarray) -> None:
+def _sweep(graph: FullGraph, dead: np.ndarray, anchor_edges: np.ndarray | None = None) -> None:
     """専有サブグラフ回収(カウントダウン)。dead を破壊的に更新する
-    (モジュール docstring 参照)。"""
+    (モジュール docstring 参照)。
+
+    anchor_edges(_annotation_anchor_edges の戻り値)を渡すと、その参照を
+    (a) 初期の被参照カウントに数えず (b) dead 行からの減算にも使わない。
+    アノテーション(PLA / IfcStyledItem)は幾何を延命させない、という
+    2026-07-30 の修正。副作用として、入力に元から存在した「アノテーション
+    だけに参照される孤児」も初期カウント0になり、最初の反復で回収される
+    (何も削除しない実行では sweep 自体が走らないので従来どおり)。
+    """
     n = graph.record_count
     if n == 0:
         return
     row_of_ref = np.repeat(np.arange(n, dtype=np.int64), np.diff(graph.ref_indptr))
-    alive_ref_count = graph.in_degree.copy()
+    if anchor_edges is None:
+        alive_ref_count = graph.in_degree.copy()
+        countable = graph.ref_targets >= 0
+    else:
+        countable = (graph.ref_targets >= 0) & ~anchor_edges
+        alive_ref_count = np.bincount(
+            graph.ref_targets[countable], minlength=n
+        ).astype(np.int64)
 
     pending = np.nonzero(dead)[0]
     while pending.size:
         pending_mask = np.zeros(n, dtype=bool)
         pending_mask[pending] = True
-        emitted = pending_mask[row_of_ref] & (graph.ref_targets >= 0)
+        emitted = pending_mask[row_of_ref] & countable
         targets = graph.ref_targets[emitted]
         if targets.size:
             alive_ref_count = alive_ref_count - np.bincount(targets, minlength=n)
         newly_dead_mask = (alive_ref_count == 0) & (graph.in_degree > 0) & ~dead
         pending = np.nonzero(newly_dead_mask)[0]
         dead[pending] = True
+
+
+def _reap_dead_annotations(
+    graph: FullGraph, dead: np.ndarray, anchor_edges: np.ndarray
+) -> None:
+    """anchor が1本以上あり、その全てが dead になったアノテーション
+    (PLA / IfcStyledItem)自身を dead にし、それが解放した参照
+    (IfcStyledItem の Styles 等)の分を追加の sweep で回収する。
+    不動点まで反復(通常1周で収束するが、コストが軽いので保険)。
+    反復回数の上界はアノテーション連鎖(あるアノテーションの Styles が
+    さらに別のアノテーションを anchor する、といったネスト)の深さに比例する
+    ——実データでは1〜2周で収束する(M3、フェーズ最終レビュー)。
+    dead を破壊的に更新する。
+    """
+    n = graph.record_count
+    if n == 0 or not anchor_edges.any():
+        return
+    row_of_ref = np.repeat(np.arange(n, dtype=np.int64), np.diff(graph.ref_indptr))
+    anchor_rows = row_of_ref[anchor_edges]
+    anchor_targets = graph.ref_targets[anchor_edges]
+    anchor_total = np.bincount(anchor_rows, minlength=n)
+
+    while True:
+        alive_anchor = np.bincount(
+            anchor_rows[~dead[anchor_targets]], minlength=n
+        )
+        newly = (anchor_total > 0) & (alive_anchor == 0) & ~dead
+        if not newly.any():
+            break
+        dead[np.nonzero(newly)[0]] = True
+        _sweep(graph, dead, anchor_edges)
 
 
 def _generic_rel_candidates(graph: FullGraph, dead: np.ndarray) -> np.ndarray:
@@ -355,12 +477,20 @@ def _generic_rel_candidates(graph: FullGraph, dead: np.ndarray) -> np.ndarray:
     この「クラス名が `_REL_PREFIX` で始まるレコードのみ」という汎用規則が
     健全である前提(2つの明文化されていない不変条件)は `_REL_PREFIX` 定義
     直上のコメント参照。
+
+    IFCPRESENTATIONLAYERASSIGNMENT も含める(2026-07-30): anchor 除外で
+    回収された rep への参照を AssignedItems から抜かないと dangling になる。
+    IFCSTYLEDITEM は不要(anchor が生きていれば自身も参照先も生きており、
+    anchor が死ねば自身ごと死ぬ)。patch_rel_record はクラス不問の構造的
+    パッチなのでそのまま適用できる。
     """
     n = graph.record_count
     if n == 0:
         return np.empty(0, dtype=np.int64)
 
-    rel_mask = _bounded_class_mask(graph, lambda name: name.startswith(_REL_PREFIX))
+    rel_mask = _bounded_class_mask(
+        graph, lambda name: name.startswith(_REL_PREFIX) or name == _PLA_CLASS
+    )
     kept_rel = rel_mask & ~dead
     if not kept_rel.any():
         return np.empty(0, dtype=np.int64)
@@ -402,8 +532,12 @@ def compute_text_delete_plan(
     _run_cascade(dead, voids_edges, fills_edges, agg_edges)
     cascade_count = int(dead.sum()) - seeds_count
 
-    # --- 専有サブグラフ回収(カウントダウン) ---
-    _sweep(graph, dead)
+    # --- 専有サブグラフ回収(カウントダウン)。アノテーション(PLA/StyledItem)の
+    #     anchor 参照はカウントから除外し、anchor が全滅したアノテーション自身も
+    #     続けて回収する(2026-07-30、アノテーションピン留め修正) ---
+    anchor_edges = _annotation_anchor_edges(graph)
+    _sweep(graph, dead, anchor_edges)
+    _reap_dead_annotations(graph, dead, anchor_edges)
     swept_count = int(dead.sum()) - seeds_count - cascade_count
 
     # --- 汎用 IFCREL* パッチ候補(sweep 完了後の最終 dead 集合に対して) ---

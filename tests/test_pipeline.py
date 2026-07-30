@@ -33,7 +33,7 @@ from ifc_occam.scan.parser import (
 from ifc_occam.scan.pipeline import RawScan, scan_records
 from ifc_occam.scan.reader import iter_records
 
-_GUID = "0$fARHh251X9i3$lRrMmlo"  # 22文字のGUID形(test_parser.pyの実データ回帰値と同じ形)
+_GUID = "2Occ4mT3stGu1d$_synth0"  # 22文字のGUID形(test_parser.pyの合成値と同じ形。実データ由来ではない)
 
 
 # --- テスト用ヘルパー ---

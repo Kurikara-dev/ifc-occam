@@ -15,10 +15,10 @@ importしない)。
       集約する)。
   (d) aggregates再帰カスケード: IFCRELAGGREGATESの連鎖(Building->Storey->
       Wall)が不動点反復で多段カスケードする。この連鎖はOwnerHistoryへの
-      参照(実際のsmall.ifcの `#380500 = IFCRELAGGREGATES(guid, #209, ...,
-      #380499, (...));` と同型 — 属性1=OwnerHistoryが解決可能な参照として
-      先頭に来る)を含む形で構成し、RelatingObjectの位置解釈が
-      OwnerHistory参照を誤認しないことを固定する。
+      参照(small.ifcで観測された形を模した合成例 `#N = IFCRELAGGREGATES(guid,
+      #M, ..., #M-1, (...));` と同型 — 属性1=OwnerHistoryが解決可能な参照
+      として先頭に来る。id番号は合成、実レコードidではない)を含む形で構成し、
+      RelatingObjectの位置解釈がOwnerHistory参照を誤認しないことを固定する。
   (e) voids→fills連鎖: 壁(seed)の削除がIFCRELVOIDSELEMENTを介して開口へ、
       開口の死がIFCRELFILLSELEMENTを介して充填要素(窓)へ、不動点反復で
       連鎖する(cascade.pyのGUI版と同一意味論)。

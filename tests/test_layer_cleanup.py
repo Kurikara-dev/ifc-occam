@@ -47,7 +47,7 @@ def test_layered_rep_is_released_and_membership_moves_to_the_new_rep():
     旧形状が到達不能で残らず、レイヤー所属は新しい rep に引き継がれる。"""
     f = build_single_consumer_mapped_child_styled_brep_ifc()
     body_rep = f.by_type("IfcBuildingElementProxy")[0].Representation.Representations[0]
-    assignment = attach_layer_assignment(f, [body_rep], name="汎用 - 図形")
+    assignment = attach_layer_assignment(f, [body_rep], name="合成レイヤー - 図形")
     old_rep_id = body_rep.id()
 
     element, warnings = _replace_first_element_with_bbox(f)
@@ -58,7 +58,7 @@ def test_layered_rep_is_released_and_membership_moves_to_the_new_rep():
     assigned_ids = {x.id() for x in assignment.AssignedItems}
     assert new_rep.id() in assigned_ids
     assert old_rep_id not in assigned_ids
-    assert assignment.Name == "汎用 - 図形"
+    assert assignment.Name == "合成レイヤー - 図形"
 
 
 def test_one_assignment_bundling_many_reps_keeps_the_other_members():
@@ -377,7 +377,7 @@ def test_apply_operations_gc_path_cleans_layered_geometry(tmp_path):
     f = build_single_consumer_mapped_child_styled_brep_ifc()
     element = f.by_type("IfcBuildingElementProxy")[0]
     body_rep = element.Representation.Representations[0]
-    attach_layer_assignment(f, [body_rep], name="汎用 - 図形")
+    attach_layer_assignment(f, [body_rep], name="合成レイヤー - 図形")
     src = tmp_path / "src.ifc"
     f.write(str(src))
 
@@ -399,7 +399,7 @@ def test_apply_operations_gc_path_cleans_layered_geometry(tmp_path):
     assert unreachable_geometry(f2) == {}
     assert f2.by_type("IfcFacetedBrep") == []
     la = f2.by_type("IfcPresentationLayerAssignment")[0]
-    assert la.Name == "汎用 - 図形"
+    assert la.Name == "合成レイヤー - 図形"
     new_rep = f2.by_type("IfcBuildingElementProxy")[0].Representation.Representations[0]
     assert [x.id() for x in la.AssignedItems] == [new_rep.id()]
 

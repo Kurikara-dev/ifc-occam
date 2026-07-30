@@ -10,6 +10,7 @@ presets.json
 
 # OSS release hygiene: local test data, tool state, and agent scratch (never tracked)
 *.reb
+*.~reb
 .claude/
 
 # common editor / OS / coverage artifacts

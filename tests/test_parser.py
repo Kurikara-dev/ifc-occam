@@ -18,10 +18,10 @@ CoordIndex=属性index3 / Faces=属性index2 という位置は、ifcopenshell
 0.8.5 のスキーマ定義(IFC4 / IFC4X3 双方)を実際に問い合わせて検証済み
 (IFC4 と IFC4X3 で Closed/Normals の宣言順が入れ替わっているが、CoordIndex
 は両方とも index3、Faces は両方とも index2 で不変)。
-\\X2\\ デコードのアルゴリズムは small.ifc の実レコード(#107721
-IFCBUILDINGELEMENTPROXY の Name/Description)を ifcopenshell が復号した
-結果と一致することを事前に確認済み(このテストファイル内でも同じ実データの
-バイト列で再確認する)。
+\\X2\\ デコードのアルゴリズムは、ifcopenshell が実際の \\X2\\ エスケープ
+(IFCBUILDINGELEMENTPROXY の Name/Description相当)を復号した結果と一致する
+ことを事前に確認済み(以降のテストで使うGUID・バイト列・復号後の文字列は
+合成値。実データの形だけを模している)。
 """
 
 import re
@@ -255,11 +255,11 @@ def test_block_class_with_real_guid_shape_still_extracts_global_id_and_name():
     GlobalIdを持ちうる。GUID/Name抽出はrefs/weightの3分類と独立(形式一致
     のみ)に行われるので、ブロック分類でもglobal_id/nameは抽出される
     (refs/weightは分類どおり0のまま)。"""
-    record = f"#1=IFCPROPERTYSET('{_REAL_GUID}',#2,'PSet-01',$,(#3,#4));".encode()
+    record = f"#1=IFCPROPERTYSET('{_GUID22}',#2,'PSet-01',$,(#3,#4));".encode()
     e = parse_record(record)
     assert e.refs == ()
     assert e.weight == 0
-    assert e.global_id == _REAL_GUID
+    assert e.global_id == _GUID22
     assert e.name == "PSet-01"
 
 
@@ -341,13 +341,13 @@ def test_semicolon_and_comma_inside_string_do_not_confuse_ref_scanning():
 
 # --- 9. GUID抽出(第1属性が22文字の base64 風文字列) ---
 
-_REAL_GUID = "0$fARHh251X9i3$lRrMmlo"  # small.ifc #107721 の実GlobalId(22文字)
+_GUID22 = "2Occ4mT3stGu1d$_synth0"  # 合成値(実データ由来ではない)。22文字・GUIDアルファベットの形だけ本物と同じ
 
 
 def test_guid_extracted_when_first_attribute_matches_22char_pattern():
-    record = f"#1=IFCWALL('{_REAL_GUID}',#2,'Wall-01',$);".encode()
+    record = f"#1=IFCWALL('{_GUID22}',#2,'Wall-01',$);".encode()
     e = parse_record(record)
-    assert e.global_id == _REAL_GUID
+    assert e.global_id == _GUID22
 
 
 def test_guid_not_extracted_when_first_attribute_is_a_ref():
@@ -363,7 +363,7 @@ def test_guid_not_extracted_when_first_attribute_string_is_too_short():
 
 
 def test_guid_gate_rejects_21_and_23_char_strings():
-    for guid in (_REAL_GUID[:-1], _REAL_GUID + "X"):
+    for guid in (_GUID22[:-1], _GUID22 + "X"):
         record = f"#1=IFCWALL('{guid}',#2,'N',$);".encode()
         e = parse_record(record)
         assert e.global_id is None, guid
@@ -383,13 +383,13 @@ def test_guid_gate_accepts_alphabet_boundaries_digit_underscore_dollar():
 
 
 def test_name_extracted_as_third_attribute_when_guid_present():
-    record = f"#1=IFCWALL('{_REAL_GUID}',#2,'Wall-01',$);".encode()
+    record = f"#1=IFCWALL('{_GUID22}',#2,'Wall-01',$);".encode()
     e = parse_record(record)
     assert e.name == "Wall-01"
 
 
 def test_name_is_none_when_third_attribute_is_dollar():
-    record = f"#1=IFCWALL('{_REAL_GUID}',#2,$,$);".encode()
+    record = f"#1=IFCWALL('{_GUID22}',#2,$,$);".encode()
     e = parse_record(record)
     assert e.name is None
 
@@ -401,42 +401,43 @@ def test_name_is_none_when_no_guid_gate_match():
 
 
 def test_name_unescapes_doubled_quotes():
-    record = f"#1=IFCWALL('{_REAL_GUID}',#2,'It''s here',$);".encode()
+    record = f"#1=IFCWALL('{_GUID22}',#2,'It''s here',$);".encode()
     e = parse_record(record)
     assert e.name == "It's here"
 
 
 def test_name_decodes_x2_utf16be_escape_matching_ifcopenshell_ground_truth():
-    """small.ifc の実レコード #107721 (IFCBUILDINGELEMENTPROXY) の Name
-    フィールドと同一のバイト列。事前に ifcopenshell が復号する値
-    ('【直方体】直方体 (112979)')と一致することを確認済みの回帰値。"""
+    """\\X2\\ エスケープが正しく復号されることを固定する合成回帰値。全角文字
+    (漢字+隅付き括弧)を含む名称 + \\X0\\ 後の素通り部分(連番付き末尾)という、
+    small.ifc実データで観測された構造を模したケース。GUID・バイト列・復号後
+    の文字列はいずれも合成(実データ由来ではない)。"""
     record = (
-        b"#1=IFCWALL('" + _REAL_GUID.encode() + b"',#2,"
-        b"'\\X2\\301076F465B94F53301176F465B94F53\\X0\\ (112979)',$);"
+        b"#1=IFCWALL('" + _GUID22.encode() + b"',#2,"
+        b"'\\X2\\301030C630B930C890E867503011518667F1\\X0\\ (000001)',$);"
     )
     e = parse_record(record)
-    assert e.name == "【直方体】直方体 (112979)"
-    assert e.name == "【直方体】直方体 (112979)"
+    assert e.name == "【テスト部材】円柱 (000001)"
+    assert e.name == "【テスト部材】円柱 (000001)"
 
 
 def test_name_decodes_x2_escape_matching_description_ground_truth():
-    """同レコードの Description 相当バイト列(ifcopenshell復号値
-    '３Ｄ図形' と一致確認済み)。Name抽出と同じデコード経路を通ることの
-    追加確認として、第3属性位置にこのバイト列を置いて検証する。"""
+    """\\X2\\ エスケープのみで構成される合成バイト列(全角文字のみ、\\X0\\後の
+    素通り部分なし)。Name抽出と同じデコード経路を通ることの追加確認として、
+    第3属性位置にこのバイト列を置いて検証する(値は合成、実データ由来ではない)。"""
     record = (
-        b"#1=IFCWALL('" + _REAL_GUID.encode() + b"',#2,"
-        b"'\\X2\\FF13FF2456F35F62\\X0\\',$);"
+        b"#1=IFCWALL('" + _GUID22.encode() + b"',#2,"
+        b"'\\X2\\FF21FF2990E854C1\\X0\\',$);"
     )
     e = parse_record(record)
-    assert e.name == "３Ｄ図形"
-    assert e.name == "３Ｄ図形"
+    assert e.name == "ＡＩ部品"
+    assert e.name == "ＡＩ部品"
 
 
 def test_name_passes_through_unrecognized_escapes_like_s_and_pa():
     r"""\S\ と \PA\ はデコードせず、そのままの文字列として残す
     (\X2\ 以外は仕様上パススルーする方針)。"""
     record = (
-        b"#1=IFCWALL('" + _REAL_GUID.encode() + b"',#2,"
+        b"#1=IFCWALL('" + _GUID22.encode() + b"',#2,"
         b"'literal \\S\\X \\PA\\ end',$);"
     )
     e = parse_record(record)
