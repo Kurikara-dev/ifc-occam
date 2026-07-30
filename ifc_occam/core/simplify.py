@@ -210,6 +210,142 @@ def _map_is_exclusive(mapped_item) -> bool:
     return len(getattr(source, "MapUsage", []) or []) <= 1
 
 
+def _layer_assignments_for_node(node) -> list:
+    """node(IfcRepresentation または IfcRepresentationItem)を AssignedItems に
+    持つ IfcPresentationLayerAssignment のリストを返す(無ければ空リスト)。
+
+    inverse 属性名はスキーマと対象で異なる: rep 側は IFC4/IFC2X3 とも
+    LayerAssignments(複数形)、item 側は IFC4 が LayerAssignment(単数形)、
+    IFC2X3 が LayerAssignments。存在しない属性は AttributeError になるため
+    getattr の既定値で吸収し、両方の名前を試して重複なく集める。
+    """
+    found: list = []
+    seen: set[int] = set()
+    for attr in ("LayerAssignments", "LayerAssignment"):
+        for assignment in getattr(node, attr, None) or []:
+            if assignment.id() not in seen:
+                seen.add(assignment.id())
+                found.append(assignment)
+    return found
+
+
+def _layer_assignments_in_subtree(item) -> list[tuple]:
+    """item(IfcRepresentationItem)または rep(IfcRepresentation)を根に取り、
+    その子孫のうちレイヤー割当が付いたノードを (assignment, node) のペアで
+    返す。引数名は item だが、_unshare_and_replace からは rep(body_rep)が
+    渡される(IfcLayeredItem は rep|item の SELECT で、どちらを根にしても
+    走査規則は同じため)。
+
+    走査のリーフ刈り・共有マップガード(他の要素も使っている共有
+    IfcRepresentationMap の内部には入らない)は _styled_items_in_subtree と
+    同じ。理由も同じ:
+    (1) レイヤー割当は実データでは要素側 IfcShapeRepresentation に付くが、
+        スキーマ上は任意の IfcRepresentationItem にも付き得る(IfcLayeredItem)。
+        深さで打ち切ると黙って取りこぼし、旧形状が inverse に掴まれたまま
+        remove_deep2 が無言で退く(この修正の発端のバグと同じ形)。
+    (2) 共有マップ内部のノードは差し替え後も生き残るため、そのレイヤー所属を
+        奪ってはならない。
+
+    _styled_items_in_subtree と厳密には異なる点が1つ: rep を根に取った場合、
+    ContextOfItems 経由で表現コンテキストの部分木まで無害に歩く(IfcLayeredItem
+    は rep|item の SELECT のため、コンテキスト側にレイヤー割当が付くことは
+    スキーマ上ない。害はないが、styled側(rep を根にしない)とは走査対象が
+    完全一致するわけではないことに注意)。
+    """
+    found: list[tuple] = []
+    seen_nodes: set[int] = set()
+
+    def visit(node) -> None:
+        if not isinstance(node, ifcopenshell.entity_instance):
+            return
+        node_id = node.id()
+        if node_id in seen_nodes:
+            return
+        seen_nodes.add(node_id)
+        for assignment in _layer_assignments_for_node(node):
+            found.append((assignment, node))
+        if node.is_a() in _STYLE_SEARCH_LEAF_TYPES:
+            return
+        if node.is_a("IfcMappedItem"):
+            if _map_is_exclusive(node):
+                visit(node.MappingSource)
+            visit(node.MappingTarget)
+            return
+        for value in node:
+            for child in _iter_child_entities(value):
+                visit(child)
+
+    visit(item)
+    return found
+
+
+def _transfer_layer_assignments(ifc_file, doomed_roots, rep_target, item_target) -> None:
+    """doomed_roots(捨てる予定の rep / representation item の部分木)に付いた
+    レイヤー所属を新しい形状へ引き継ぐ。
+
+    AssignedItems から部分木内のノードを外し、代わりに同じ層の新ノードを
+    加える: IfcRepresentation に付いていた所属には rep_target、
+    IfcRepresentationItem に付いていた所属には item_target(どちらか一方が
+    None ならもう一方で代用、両方 None なら外すだけ)。extract.py の
+    _analyze_representation は rep 側の LayerAssignments しか読まないため、
+    rep の所属を rep へ返すことが GUI のレイヤー表示を保つ条件になる。
+
+    外した結果 AssignedItems が空になった割当は削除する(IFC4 の
+    AssignedItems は SET[1:?] で空はスキーマ違反。ifcopenshell は空代入を
+    検証しない(実測)ため、放置すると壊れた割当が出力に残る。空の
+    IfcStyledRepresentation を _remove_styled_item が消すのと同じ理屈)。
+    削除する割当が IfcPresentationLayerWithStyle の場合、LayerStyles
+    (IfcSurfaceStyle等)も割当と一緒に孤児化し得るため、割当を消した後で
+    各styleに ifcopenshell.util.element.remove_deep2 を掛ける(_remove_styled_item
+    の Styles 処理と同じ理屈: 他の割当からまだ参照されているstyleは
+    remove_deep2 が自動的に保護し、本当に孤立したものだけが消える)。
+
+    これをせずに旧ノードを _cleanup_items に渡すと、レイヤー割当という
+    inverse が1本残るだけで remove_deep2 が無言の no-op になり、旧形状が
+    丸ごと出力に残った上にレイヤー情報は死んだ旧ノードに付いたままになる
+    (test-donuts_mini.ifc の decimate で実測した二重欠陥、2026-07-29)。
+
+    既知の限界(スタイル側 _transfer_styled_items と同じ挙動に揃えた):
+    doomed_roots のトップアイテムが共有マップを介さず別の rep からも直接
+    共有されている場合(実データでは未観測)、生き残るノードから所属を
+    外してしまう。その場合も _cleanup_items の残置警告で可視化される。
+    """
+    if not ifc_file.by_type("IfcPresentationLayerAssignment"):
+        return  # レイヤー割当が無いファイルでは部分木走査ごと省く
+
+    doomed_by_assignment: dict[int, tuple] = {}
+    for root in doomed_roots:
+        for assignment, node in _layer_assignments_in_subtree(root):
+            entry = doomed_by_assignment.setdefault(assignment.id(), (assignment, []))
+            entry[1].append(node)
+
+    for assignment, doomed_nodes in doomed_by_assignment.values():
+        doomed_ids = {n.id() for n in doomed_nodes}
+        kept = [x for x in (assignment.AssignedItems or []) if x.id() not in doomed_ids]
+        kept_ids = {x.id() for x in kept}
+        needs_rep = any(n.is_a("IfcRepresentation") for n in doomed_nodes)
+        needs_item = any(not n.is_a("IfcRepresentation") for n in doomed_nodes)
+        for needed, primary, fallback in (
+            (needs_rep, rep_target, item_target),
+            (needs_item, item_target, rep_target),
+        ):
+            target = primary if primary is not None else fallback
+            if needed and target is not None and target.id() not in kept_ids:
+                kept.append(target)
+                kept_ids.add(target.id())
+        if kept:
+            assignment.AssignedItems = kept
+        else:
+            layer_styles = (
+                list(assignment.LayerStyles or [])
+                if assignment.is_a("IfcPresentationLayerWithStyle")
+                else []
+            )
+            ifc_file.remove(assignment)
+            for style in layer_styles:
+                ifcopenshell.util.element.remove_deep2(ifc_file, style)
+
+
 def _styled_items_in_subtree(item) -> list:
     """item とその子孫に付いた IfcStyledItem を重複なく返す(先行順)。
 
@@ -414,22 +550,74 @@ def _cleanup_items(ifc_file, old_items) -> list[str]:
     """旧 representation アイテムを、他から参照されない場合のみ再帰的に削除する。
 
     掃除の失敗は書き戻し自体を失敗させず、警告文字列として呼び出し元に返す。
+
+    remove_deep2 は開始要素に inverse が残っていると、例外を出さずに何も
+    しない(契約: "The start element must have no inverses.")。レイヤー割当
+    バグはこの無言の退出のせいで警告ゼロのまま2日間気付かれなかったため、
+    削除後に開始要素の生死を確認し、生き残っていたら参照元の型を添えて警告
+    する。この警告は正常系では出ない(出たら「何かがまだ旧形状を掴んでいる」
+    の合図であり、新たな同類バグの検出線になる)。
     """
     warnings: list[str] = []
     for item in old_items:
+        item_id = item.id()
+        item_type = item.is_a()
         try:
             ifcopenshell.util.element.remove_deep2(ifc_file, item)
         except Exception as exc:  # noqa: BLE001 - 掃除の失敗は警告に留め、書き戻し自体は成功させる
             warnings.append(f"旧形状アイテムの掃除に失敗: {exc}")
+            continue
+        if getattr(ifc_file, "to_delete", None) is not None:
+            # batch_remove_deep2 中は削除が遅延されるため、この時点で生きて
+            # いるのは正常(unbatch でまとめて消える)。残置チェックは誤検知
+            # になるのでスキップする。
+            continue
+        try:
+            survivor = ifc_file.by_id(item_id)
+        except RuntimeError:
+            continue  # 削除成功
+        referrer_types = sorted({inv.is_a() for inv in ifc_file.get_inverse(survivor)})
+        warnings.append(
+            f"旧形状 {item_type} #{item_id} が他から参照されているため"
+            f"削除できませんでした(参照元: {', '.join(referrer_types) or '不明'})"
+        )
     return warnings
 
 
-def _replace_items_in_place(ifc_file, shape_representation, new_items) -> list[str]:
+def _discard_or_collect(ifc_file, old_items, doomed_sink) -> list[str]:
+    """旧アイテムを掃除する(doomed_sink=None、従来どおり remove_deep2)か、
+    捨てたルートidを記録して後段の書き出し時GC(textops/gc.py)に委ねる
+    (doomed_sink=list)。
+
+    GC経路では要素ごとの remove_deep2 を呼ばない。donuts族データでは
+    remove_deep2 が47秒/要素かかり(2026-07-30実測、456要素で約6時間)、
+    記録+書き出し時GC(約80秒の固定費)の方が桁で速い。記録だけなら失敗も
+    残置も起きないので警告は常に空(残置の検出はGC側の doomed_survivors が
+    同じ検出線を張る)。
+    """
+    if doomed_sink is None:
+        return _cleanup_items(ifc_file, old_items)
+    doomed_sink.extend(item.id() for item in old_items)
+    return []
+
+
+def _replace_items_in_place(
+    ifc_file, shape_representation, new_items, doomed_sink=None
+) -> list[str]:
     old_items = list(shape_representation.Items)
     discarded = _transfer_styled_items(ifc_file, old_items, new_items)
+    # rep_target には生き残る shape_representation 自身を渡す(fallbackで
+    # item_target に降格させない。フェーズ最終レビュー M-1)。この経路では
+    # rep は差し替えられずItemsだけが入れ替わるため、rep直付けの所属は
+    # そのままこのrepへ返すのが正しい(_analyze_representationはrep側の
+    # LayerAssignmentsしか読まないため、item側へ降格するとGUIのレイヤー
+    # 表示が壊れる)。
+    _transfer_layer_assignments(
+        ifc_file, old_items, shape_representation, new_items[0] if new_items else None
+    )
     shape_representation.Items = new_items
     shape_representation.RepresentationType = _representation_type_for_schema(ifc_file.schema)
-    warnings = _cleanup_items(ifc_file, old_items)
+    warnings = _discard_or_collect(ifc_file, old_items, doomed_sink)
     if discarded:
         warnings.append(
             f"新形状は単一アイテムのため、複数あったスタイルのうち1件だけを引き継ぎました"
@@ -516,7 +704,9 @@ def _apply_matrix_to_verts(matrix: np.ndarray, verts: np.ndarray) -> np.ndarray:
     return transformed[:, :3]
 
 
-def _unshare_and_replace(ifc_file, element, body_rep, verts: np.ndarray, faces: np.ndarray) -> list[str]:
+def _unshare_and_replace(
+    ifc_file, element, body_rep, verts: np.ndarray, faces: np.ndarray, doomed_sink=None
+) -> list[str]:
     """共有 IfcMappedItem を解いて、この要素専用の新規 IfcShapeRepresentation に
     差し替える(scope="element" 本体、および scope="shared" の逆変換フォールバック
     先としても再利用する)。"""
@@ -538,10 +728,14 @@ def _unshare_and_replace(ifc_file, element, body_rep, verts: np.ndarray, faces: 
     reps[idx] = new_body_rep
     product_shape.Representations = reps
 
+    # 旧ラッパー(body_rep)とその配下(専有マップ含む)のレイヤー所属を
+    # 新しい rep / item へ引き継いでから掃除する。
+    _transfer_layer_assignments(ifc_file, [body_rep], new_body_rep, new_items[0])
+
     # 古い個別ラッパー(body_rep)はこの要素からしか参照されていないはずなので、
     # まずそれを起点に掃除する。共有マップ/ジオメトリが他から参照されていれば
     # remove_deep2 が自動的に保護する。
-    warnings = _cleanup_items(ifc_file, [body_rep])
+    warnings = _discard_or_collect(ifc_file, [body_rep], doomed_sink)
     if discarded:
         warnings.append(
             f"新形状は単一アイテムのため、複数あったスタイルのうち1件だけを引き継ぎました"
@@ -551,7 +745,8 @@ def _unshare_and_replace(ifc_file, element, body_rep, verts: np.ndarray, faces: 
 
 
 def replace_representation(
-    ifc_file, element, verts: np.ndarray, faces: np.ndarray, scope: str = "element"
+    ifc_file, element, verts: np.ndarray, faces: np.ndarray, scope: str = "element",
+    doomed_sink=None,
 ) -> list[str]:
     """要素の Body 表現を verts/faces の三角形メッシュに差し替える。
 
@@ -580,6 +775,10 @@ def replace_representation(
 
     戻り値: 旧アイテムの掃除中に発生した警告文字列のリスト(全成功時は空リスト)。
     書き戻し自体は掃除の失敗に関わらず成功する。
+
+    doomed_sink に list を渡すと、旧形状の掃除を行わず捨てたルートの
+    record id を記録する(呼び出し側が書き出し後に textops.gc.gc_rewrite で
+    一括回収する前提)。None(既定)は従来どおりその場で掃除する。
     """
     if scope not in ("element", "shared"):
         raise ValueError(f"不正な scope です: {scope!r}")
@@ -594,7 +793,7 @@ def replace_representation(
     if not is_mapped:
         # 個別所有の representation。scope に関わらずその場で差し替える。
         new_items = _build_representation_items(ifc_file, verts, faces)
-        return _replace_items_in_place(ifc_file, body_rep, new_items)
+        return _replace_items_in_place(ifc_file, body_rep, new_items, doomed_sink)
 
     mapped_item = old_items[0]
     mapping_source = mapped_item.MappingSource
@@ -605,16 +804,16 @@ def replace_representation(
 
         if matrix is not None and _is_identity_matrix(matrix):
             new_items = _build_representation_items(ifc_file, verts, faces)
-            return _replace_items_in_place(ifc_file, mapped_representation, new_items)
+            return _replace_items_in_place(ifc_file, mapped_representation, new_items, doomed_sink)
 
         if matrix is not None and _is_safe_similarity_matrix(matrix):
             verts_in_shared_frame = _apply_matrix_to_verts(_invert_similarity_matrix(matrix), verts)
             new_items = _build_representation_items(ifc_file, verts_in_shared_frame, faces)
-            return _replace_items_in_place(ifc_file, mapped_representation, new_items)
+            return _replace_items_in_place(ifc_file, mapped_representation, new_items, doomed_sink)
 
         # MappingTargetを安全に逆変換できない(非一様スケール等)。共有マップは
         # 変更せず、この要素だけscope="element"にフォールバックする。
-        result = _unshare_and_replace(ifc_file, element, body_rep, verts, faces)
+        result = _unshare_and_replace(ifc_file, element, body_rep, verts, faces, doomed_sink)
         result.append(
             "scope=\"shared\"の書き戻しでMappingTargetを安全に逆変換できないため、"
             f"この要素(GlobalId={getattr(element, 'GlobalId', '?')})はscope=\"element\""
@@ -623,7 +822,7 @@ def replace_representation(
         return result
 
     # scope == "element": 共有を解いて個別化する。
-    return _unshare_and_replace(ifc_file, element, body_rep, verts, faces)
+    return _unshare_and_replace(ifc_file, element, body_rep, verts, faces, doomed_sink)
 
 
 def _shared_element_group(ifc_file, gid: str) -> list:

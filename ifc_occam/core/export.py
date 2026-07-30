@@ -19,6 +19,7 @@ keep vs 連鎖削除の優先順位 (Final Review Fix2, design.md §4.5参照):
 
 from __future__ import annotations
 
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ from ifc_occam.core.simplify import (
     decimate_mesh,
     replace_representation,
 )
+from ifc_occam.textops.gc import GcReport, gc_rewrite
 
 _DANGLING_CHECK_REL_CLASSES = (
     "IfcRelVoidsElement",
@@ -61,6 +63,14 @@ ifcopenshell.util.element.batch_remove_deep2/unbatch_remove_deep2 経路を使�
 Stage Aベンチ(docs/plans/2026-07-24-cui-phase1.md Task 7, docs/cui-measurements.md)で(a)per-remove
 に対し17〜26%短縮・正当性(verify_no_dangling/GlobalId保存)は全項目パスした
 採用方式。"""
+
+_SIMPLIFY_BATCH_THRESHOLD = 100
+"""inline掃除(geometry_cleanup="inline")で batch_remove_deep2 を使う simplify
+対象数の閾値(これを**超えたら**バッチ)。2026-07-30 プローブ実測: donuts族で
+バッチは 47→13.9秒/要素だが、unbatch がファイル全体のシリアライズ+再パース
+(305MBで約28秒)を伴うため、対象が少ないときは固定費が逆転する。100 は
+暫定値(unbatch固定費 ≈ 数十要素分の節約、に安全率を掛けた判断)。既定経路は
+GC(geometry_cleanup="gc")なのでこの値がユーザー体験を左右することはない。"""
 
 
 @dataclass
@@ -338,7 +348,9 @@ def _shared_map_key(element) -> int | None:
     return None
 
 
-def _apply_simplify(ifc_file, element, op: Operation) -> tuple[bool, str | None, list[str]]:
+def _apply_simplify(
+    ifc_file, element, op: Operation, doomed_sink
+) -> tuple[bool, str | None, list[str]]:
     """1件の simplify 操作を要素に適用する。
 
     幾何取得・簡略化計算・書き戻しの全過程を例外から保護する。1要素の失敗が
@@ -360,7 +372,9 @@ def _apply_simplify(ifc_file, element, op: Operation) -> tuple[bool, str | None,
         else:
             return False, f"不正な simplify method です: {method!r}", []
 
-        warnings = replace_representation(ifc_file, element, new_verts, new_faces, scope=op.scope)
+        warnings = replace_representation(
+            ifc_file, element, new_verts, new_faces, scope=op.scope, doomed_sink=doomed_sink
+        )
         return True, None, warnings
     except Exception as exc:  # noqa: BLE001 - 1要素の簡略化失敗でexport全体を止めない
         return False, f"簡略化に失敗しました: {exc}", []
@@ -412,6 +426,7 @@ def apply_operations(
     consolidate_min_benefit_ratio: float = 1.5,
     progress: Callable[[str, int, int], None] | None = None,
     source_name: str | None = None,
+    geometry_cleanup: str = "gc",
 ) -> ExportReport:
     """src に operations を適用して output_path へ書き出す。
 
@@ -436,6 +451,12 @@ def apply_operations(
     GUI(server)は常に path を渡すため無変更で元ファイル名が自動的に入る。CUIは
     フルオープン済みの file オブジェクトを渡す経路のため、呼び出し側(repl.py)が
     入力ファイル名を明示的に source_name として渡す。
+
+    geometry_cleanup: "gc"(既定)は旧形状の掃除を書き出し時GCで一括実行する
+    (fat一時ファイルを出力の隣に作り、グラフスキャンにfatサイズの約4.8倍の
+    メモリを一時使用する)。"inline"は従来どおり要素ごとに掃除する(GCの
+    一時ファイル/メモリを避けたい場合の退避経路。Task 3 でバッチ化される)。
+    不正な値を渡すと ValueError になる。
 
     手順: resolve_effective → delete群のclosure展開→削除→simplify群を
     replace_representation で適用 → (consolidate=Trueなら)重複形状の共有化 → write。
@@ -490,6 +511,10 @@ def apply_operations(
     deleted_set = set(deleted)
     stage_seconds["deletes"] = time.monotonic() - t0
 
+    if geometry_cleanup not in ("gc", "inline"):
+        raise ValueError(f"不正な geometry_cleanup です: {geometry_cleanup!r}")
+    doomed_root_ids: list[int] | None = [] if geometry_cleanup == "gc" else None
+
     t0 = time.monotonic()
     simplified: list[str] = []
     skipped: list[SkippedItem] = list(delete_skipped)
@@ -498,59 +523,68 @@ def apply_operations(
     simplify_total = sum(1 for op in effective.values() if op.op == "simplify")
     simplify_done = 0
 
-    for gid, op in effective.items():
-        if op.op != "simplify":
-            continue
-        simplify_done += 1
-        if progress is not None:
-            progress("simplify", simplify_done, simplify_total)
-        if gid in deleted_set:
-            skipped.append(
-                SkippedItem(
-                    global_id=gid,
-                    reason="削除連鎖により対象が既に削除されたためスキップ",
+    use_batch = doomed_root_ids is None and simplify_total > _SIMPLIFY_BATCH_THRESHOLD
+    if use_batch:
+        ifcopenshell.util.element.batch_remove_deep2(ifc_file)
+    try:
+        for gid, op in effective.items():
+            if op.op != "simplify":
+                continue
+            simplify_done += 1
+            if progress is not None:
+                progress("simplify", simplify_done, simplify_total)
+            if gid in deleted_set:
+                skipped.append(
+                    SkippedItem(
+                        global_id=gid,
+                        reason="削除連鎖により対象が既に削除されたためスキップ",
+                    )
                 )
-            )
-            continue
+                continue
 
-        try:
-            element = ifc_file.by_guid(gid)
-        except RuntimeError:
-            skipped.append(
-                SkippedItem(global_id=gid, reason=f"要素が見つかりません(GlobalId={gid})")
-            )
-            continue
+            try:
+                element = ifc_file.by_guid(gid)
+            except RuntimeError:
+                skipped.append(
+                    SkippedItem(global_id=gid, reason=f"要素が見つかりません(GlobalId={gid})")
+                )
+                continue
 
-        if op.scope == "shared":
-            shared_key = _shared_map_key(element)
-            if shared_key is not None:
-                if shared_key in processed_shared_maps:
-                    # 既にこのexport実行内で同じ共有マップを処理済み。
-                    # in-place編集の複合(二重適用)を避けるため再処理しないが、
-                    # この要素の幾何は共有マップ経由で変化済みなので simplified には含める。
-                    #
-                    # Final Review Fix4 (doc-only): この guard は「1要素が同じ共有マップを
-                    # 複数回踏む」場合の重複適用を防ぐが、対象を横断した"勝者"のルールも
-                    # ここで決まる。effective(gid→Operation) を反復する順序(Pythonの
-                    # dict挿入順=最初にそのgidへ有効操作が確定した順)で、異なる2つの
-                    # simplify操作(例: 別々のUIバッチ)がそれぞれ別gid経由で同じ共有マップを
-                    # 指す場合、最初にそのマップへ到達した操作のパラメータ(method/ratio等)が
-                    # 実際に書き込まれ、後続の操作は(このgidに対しては)何もせず simplified に
-                    # 積まれるだけになる。つまり「同じ共有マップに対する複数のsimplify操作」は
-                    # 後続が上書きされるのではなく、先行が勝ってそれ以降は無視される
-                    # (list全体のlast-wins原則である resolve_effective とは別次元の勝者決定)。
-                    # 現状は警告を出していないため、ユーザからは区別できない(既知の制約)。
-                    simplified.append(gid)
-                    continue
-                processed_shared_maps.add(shared_key)
+            if op.scope == "shared":
+                shared_key = _shared_map_key(element)
+                if shared_key is not None:
+                    if shared_key in processed_shared_maps:
+                        # 既にこのexport実行内で同じ共有マップを処理済み。
+                        # in-place編集の複合(二重適用)を避けるため再処理しないが、
+                        # この要素の幾何は共有マップ経由で変化済みなので simplified には含める。
+                        #
+                        # Final Review Fix4 (doc-only): この guard は「1要素が同じ共有マップを
+                        # 複数回踏む」場合の重複適用を防ぐが、対象を横断した"勝者"のルールも
+                        # ここで決まる。effective(gid→Operation) を反復する順序(Pythonの
+                        # dict挿入順=最初にそのgidへ有効操作が確定した順)で、異なる2つの
+                        # simplify操作(例: 別々のUIバッチ)がそれぞれ別gid経由で同じ共有マップを
+                        # 指す場合、最初にそのマップへ到達した操作のパラメータ(method/ratio等)が
+                        # 実際に書き込まれ、後続の操作は(このgidに対しては)何もせず simplified に
+                        # 積まれるだけになる。つまり「同じ共有マップに対する複数のsimplify操作」は
+                        # 後続が上書きされるのではなく、先行が勝ってそれ以降は無視される
+                        # (list全体のlast-wins原則である resolve_effective とは別次元の勝者決定)。
+                        # 現状は警告を出していないため、ユーザからは区別できない(既知の制約)。
+                        simplified.append(gid)
+                        continue
+                    processed_shared_maps.add(shared_key)
 
-        success, skip_reason, op_warnings = _apply_simplify(ifc_file, element, op)
-        warnings.extend(op_warnings)
-        if not success:
-            skipped.append(SkippedItem(global_id=gid, reason=skip_reason))
-            warnings.append(f"簡略化をスキップしました(GlobalId={gid}): {skip_reason}")
-        else:
-            simplified.append(gid)
+            success, skip_reason, op_warnings = _apply_simplify(ifc_file, element, op, doomed_root_ids)
+            warnings.extend(op_warnings)
+            if not success:
+                skipped.append(SkippedItem(global_id=gid, reason=skip_reason))
+                warnings.append(f"簡略化をスキップしました(GlobalId={gid}): {skip_reason}")
+            else:
+                simplified.append(gid)
+    finally:
+        if use_batch:
+            # unbatch は新しい file オブジェクトを返す(以降のステージは
+            # 差し替え後のオブジェクトを使う。_mass_delete と同じ制約)。
+            ifc_file = ifcopenshell.util.element.unbatch_remove_deep2(ifc_file)
     stage_seconds["simplify"] = time.monotonic() - t0
 
     t0 = time.monotonic()
@@ -585,8 +619,68 @@ def apply_operations(
 
     t0 = time.monotonic()
     _stamp_provenance(ifc_file, source_name, len(deleted), len(simplified))
-    ifc_file.write(str(resolved_output_path))
-    stage_seconds["write"] = time.monotonic() - t0
+    if doomed_root_ids:
+        # 掃除は書き出し後のGC(mark-and-sweep)で一括して行う。ゴミ込みの
+        # fat ファイルをいったん出力の隣に書き、GC が最終出力へ書き換える。
+        fat_path = resolved_output_path.with_name(resolved_output_path.name + ".gc-tmp")
+        ifc_file.write(str(fat_path))
+        stage_seconds["write"] = time.monotonic() - t0
+
+        t0 = time.monotonic()
+        # GCのグラフスキャンは fat サイズの約4.8倍のメモリを使う。フルオープン中
+        # のモデル(ファイルサイズの約14倍)を先に手放してから走らせる。
+        # ifc_file だけでは足りない: 同じオブジェクトを掴んでいる残りのローカル
+        # 束縛(file オブジェクト渡し時の src パラメータ、simplify ループが最後に
+        # 束縛した element)も揃って手放さないと解放されない(修正ウェーブの
+        # weakref 実測で発見。パラメータ束縛は関数末尾まで生きる)。
+        ifc_file = None
+        src = None
+        element = None
+        gc_failed = False
+        preserve_fat = False
+        try:
+            gc_report = gc_rewrite(
+                fat_path, resolved_output_path, doomed_root_ids, source_name
+            )
+        except Exception as exc:  # noqa: BLE001 - GC失敗で数十分の適用結果を失わない
+            # fat は正しい(ゴミ込みなだけ)。GCが何かで落ちても出力として救済する。
+            gc_report = GcReport(records_dropped=0, doomed_survivors=[], aborted=True)
+            gc_failed = True
+            try:
+                if fat_path.exists():
+                    shutil.move(str(fat_path), str(resolved_output_path))
+            except Exception as move_exc:  # noqa: BLE001 - 救済自体の失敗でfatまで失わない
+                # move が失敗すると出力も未確定のまま(ゴミ込みの)fatだけが
+                # 手元に残る状態になる。ここでfatを消すと数十分の適用結果が
+                # 完全に失われるため、finallyでの無条件unlinkを止めてfatを残す。
+                preserve_fat = True
+                warnings.append(
+                    f"GCの救済にも失敗しました。ゴミ込みの出力が {fat_path} に"
+                    f"残っています: {move_exc}"
+                )
+            else:
+                warnings.append(
+                    f"書き出し時GCが失敗したため中止しました(出力は正しいものの、"
+                    f"旧形状が残ったままです): {exc}"
+                )
+        finally:
+            if not preserve_fat:
+                fat_path.unlink(missing_ok=True)
+        if gc_report.aborted and not gc_failed:
+            warnings.append(
+                "書き出し時GCを中止しました(生き残りが除去対象を参照)。"
+                "出力は正しいものの、旧形状が残ったままです。"
+            )
+        for record_id, class_name, referrer_types in gc_report.doomed_survivors:
+            warnings.append(
+                f"旧形状 {class_name} #{record_id} が他から参照されているため"
+                f"削除できませんでした(参照元: {referrer_types})"
+            )
+        stage_seconds["gc"] = time.monotonic() - t0
+    else:
+        ifc_file.write(str(resolved_output_path))
+        stage_seconds["write"] = time.monotonic() - t0
+        stage_seconds["gc"] = 0.0
 
     return ExportReport(
         deleted=deleted,

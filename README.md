@@ -127,6 +127,7 @@ Numbers below are measured, not estimated.
 - **Text mode is delete-only.**
 - **Text mode leaves a small residue.** It keeps a few unreferenced records that the full-open path removes — measured at +0.24% of records on a 380,000-record model. Surviving elements and geometry match exactly; the record count does not.
 - **Text mode's cascade equivalence is verified on synthetic models, not real ones.** The real model available for testing contains no openings or fillings at all, so the voids-and-fillings and aggregation cascades are pinned by purpose-built fixtures instead. Both agree exactly with the full-open path; neither has met a real building model.
+- **Simplify cleanup runs as a write-time sweep.** Exports that simplified geometry write a temporary `.gc-tmp` "fat" file next to the output — roughly the same size as the *input* model, not the (often much smaller) output — and briefly need roughly **4.8× the fat file's size in RAM** for the reference-graph scan that removes the replaced geometry. Measured on a 305 MB model (456 elements): the sweep itself took about 2 minutes (119.9 s); a 20-element probe on the same model measured 79.8 s, so the cost depends only weakly on element count. If a run is killed mid-sweep, the `.gc-tmp` file can be left behind next to the output; it is safe to delete.
 - **No release binaries yet**, and no CI.
 
 ## Disclaimer

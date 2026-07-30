@@ -355,6 +355,31 @@ def test_print_report_translates_stage_labels_and_skips_zero_duration_stages(cap
     assert "consolidate" not in out
 
 
+def test_stage_seconds_labels_cover_every_key_apply_operations_sets(tmp_path):
+    """_STAGE_SECONDS_LABELS が export.apply_operations の実際のキー集合を
+    網羅していることを固定する番人テスト(フェーズ最終レビューI3)。
+
+    "gc" ステージが追加された際にこの辞書への追記が漏れ、CUI/GUIの日本語
+    表示に英語キーがそのまま混ざる欠陥が実際に起きた。モックせず本物の
+    apply_operations を極小フィクスチャで1回実行し、返ってきた
+    stage_seconds の全キーがラベル辞書に存在することを確認する
+    (キーを1つ削れば赤くなることは報告書で確認済み)。"""
+    from ifc_occam.core.export import apply_operations
+    from ifc_occam.core.ops import Operation
+
+    f = build_wall_with_window_ifc()
+    wall_gid = f.by_type("IfcWall")[0].GlobalId
+    src = tmp_path / "src.ifc"
+    f.write(str(src))
+    out = tmp_path / "out.ifc"
+    ops = [Operation(op="delete", targets=[wall_gid])]
+
+    report = apply_operations(str(src), ops, str(out))
+
+    missing = set(report.stage_seconds) - set(repl._STAGE_SECONDS_LABELS)
+    assert missing == set(), f"ラベル未登録のstage_secondsキー: {missing}"
+
+
 # --- 4b. 出力ファイル名プロンプト(監督者裁定2026-07-25、要件§5モック準拠) ---
 #
 # 確認1が通った後・フルオープンの前に「出力ファイル名 [既定値]: 」を表示する
@@ -1454,3 +1479,56 @@ def test_declined_apply_after_earlier_success_does_not_claim_no_file_changed_on_
 
     out = capsys.readouterr().out
     assert "ファイルは変更されていません" not in out
+
+
+# --- summarize_warnings(警告の要約表示) ---
+
+
+def test_summarize_warnings_dedups_and_ranks():
+    """同文の警告を畳み、件数降順に上位 top 種だけ表示し、残りは合計で示す。"""
+    from ifc_occam.cui.repl import summarize_warnings
+
+    lines = summarize_warnings(["a", "b", "a", "a", "b", "c"], top=2)
+    assert lines == [
+        "警告: 6件(3種)",
+        "  - a ×3",
+        "  - b ×2",
+        "  … 他 1種 1件",
+    ]
+
+
+def test_summarize_warnings_single_and_empty():
+    """空リストは空(見出しも出さない)、1件は件数サフィックスなし。"""
+    from ifc_occam.cui.repl import summarize_warnings
+
+    assert summarize_warnings([]) == []
+    assert summarize_warnings(["x"]) == ["警告: 1件(1種)", "  - x"]
+
+
+def test_summarize_warnings_ties_keep_first_seen_order():
+    """同数の警告は初出順を保つ(表示が実行ごとに揺れない)。"""
+    from ifc_occam.cui.repl import summarize_warnings
+
+    lines = summarize_warnings(["b", "a", "b", "a"], top=5)
+    assert lines == ["警告: 4件(2種)", "  - b ×2", "  - a ×2"]
+
+
+def test_print_report_shows_summarized_warning_contents_not_just_the_count(capsys):
+    """結線レベルの番人(フェーズ最終レビュー I-2): summarize_warnings の純粋
+    関数テストだけでは、_print_report がそれを実際に使っていることを固定
+    できない。同文警告×3+別文1(=2種4件)の report を _print_report に
+    食わせ、画面出力に summarize_warnings の中身(種類の内訳・×N)が
+    実際に出ることを確認する。"""
+    report = ExportReport(
+        deleted=[],
+        simplified=[],
+        skipped=[],
+        warnings=["同文警告"] * 3 + ["別の警告"],
+        output_path="out.ifc",
+    )
+
+    repl._print_report(report)
+
+    out = capsys.readouterr().out
+    assert "警告: 4件(2種)" in out
+    assert "×3" in out

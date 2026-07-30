@@ -1153,3 +1153,18 @@ def build_single_element_with_wrapped_child_styled_brep_ifc(
     ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
 
     return f
+
+
+def attach_layer_assignment(f, targets, name: str = "レイヤーA"):
+    """targets(IfcRepresentation / IfcRepresentationItem のリスト)を
+    AssignedItems に持つ IfcPresentationLayerAssignment を1つ作って返す。
+
+    test-donuts_mini.ifc の実データでは1つの割当が全456要素の
+    IfcShapeRepresentation を束ねていた(#6344857「汎用 - 図形」)。複数
+    targets を渡せるのはその形を再現するため。
+    """
+    return f.create_entity(
+        "IfcPresentationLayerAssignment",
+        Name=name,
+        AssignedItems=list(targets),
+    )

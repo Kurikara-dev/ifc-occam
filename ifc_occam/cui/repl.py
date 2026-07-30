@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
@@ -100,8 +101,12 @@ _PROGRESS_STRIDE = 500
 _STAGE_LABELS = {"delete": "削除中", "simplify": "簡略化中", "rewrite": "書き換え中"}
 
 #: ExportReport.stage_seconds のキー(export.py 内部の英語識別子)→ 結果表示用の
-#: 日本語ラベル。keyはexport.apply_operationsが実際に設定する6種で固定
-#: (open/deletes/simplify/reextract_duplicates/consolidate/write)。
+#: 日本語ラベル。keyはexport.apply_operationsが実際に設定する7種で固定
+#: (open/deletes/simplify/reextract_duplicates/consolidate/write/gc。
+#: フェーズ最終レビューI3: "gc" ステージ追加時にここへの追記が漏れ、
+#: 日本語表示の中に英語キーがそのまま混ざっていた)。tests/test_repl.py の
+#: 番人テストが、この辞書が apply_operations の実際のキー集合を網羅している
+#: ことを固定する。
 _STAGE_SECONDS_LABELS = {
     "open": "開く",
     "deletes": "削除",
@@ -109,6 +114,7 @@ _STAGE_SECONDS_LABELS = {
     "reextract_duplicates": "重複再抽出",
     "consolidate": "重複統合",
     "write": "書き込み",
+    "gc": "ゴミ回収",
 }
 
 #: Operation(op="simplify").params["method"] → 確認2プレビュー表示用ラベル。
@@ -386,13 +392,23 @@ def _run_apply(
     # 明示的に渡す(CUI Phase2 Task1: apply_operationsにはfileオブジェクトを渡す
     # ため、既定導出"(in-memory)"では出力ヘッダの由来刻印から元ファイル名が
     # 失われてしまう)。
+    #
+    # フェーズ最終レビューI4: apply_operationsに渡すfileオブジェクトは契約上
+    # 使い捨て(以後この呼び出し側で再利用しない)。呼び出し前に自分の参照
+    # (ifc_file)をNoneにし、別名(ifc_file_to_apply)だけで渡すことで、
+    # apply_operations内部の書き出し時GC(mark-and-sweep、fatサイズの約4.8倍
+    # のメモリを使う)が走る間もこの関数のローカル変数がモデルを掴み続ける
+    # ことを避ける。呼び出し後は別名も明示的にdelする。
+    ifc_file_to_apply = ifc_file
+    ifc_file = None
     report = apply_operations(
-        ifc_file,
+        ifc_file_to_apply,
         operations,
         output_path,
         progress=_make_progress_printer(),
         source_name=Path(path).name,
     )
+    del ifc_file_to_apply
     _print_report(report)
     return True
 
@@ -585,6 +601,30 @@ def _preview_and_confirm2(ifc_file, operations) -> bool:
     return _confirm("実行しますか? (y/N): ")
 
 
+def summarize_warnings(warnings: list[str], top: int = 5) -> list[str]:
+    """警告リストを「合計件数(種類数)」の見出し+件数降順の上位 top 種に
+    要約した表示行のリストを返す(warnings が空なら空リスト)。
+
+    実データでは同じ文言の警告が要素数ぶん重複する(test-donuts_mini.ifc の
+    decimate で同文456件)。件数だけの表示では中身が判断できず、全件表示は
+    画面を流し切ってしまうため、同文を畳んで件数を付け、上位だけ出す。
+    順序は件数降順、同数なら初出順(Counter は挿入順を保ち、sorted は安定)。
+    """
+    if not warnings:
+        return []
+    counts = Counter(warnings)
+    ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+    lines = [f"警告: {len(warnings)}件({len(counts)}種)"]
+    for message, n in ordered[:top]:
+        suffix = f" ×{n}" if n > 1 else ""
+        lines.append(f"  - {message}{suffix}")
+    rest = ordered[top:]
+    if rest:
+        rest_total = sum(n for _, n in rest)
+        lines.append(f"  … 他 {len(rest)}種 {rest_total}件")
+    return lines
+
+
 def _print_report(report: ExportReport) -> None:
     print("=== 完了 ===")
     print(f"出力ファイル: {report.output_path}")
@@ -592,8 +632,8 @@ def _print_report(report: ExportReport) -> None:
     print(f"簡略化: {len(report.simplified)}要素")
     if report.skipped:
         print(f"スキップ: {len(report.skipped)}件")
-    if report.warnings:
-        print(f"警告: {len(report.warnings)}件")
+    for line in summarize_warnings(report.warnings):
+        print(line)
     for stage_name, seconds in report.stage_seconds.items():
         if seconds <= 0:
             # consolidate=False(CUIは常にこれ)のとき、export.pyは

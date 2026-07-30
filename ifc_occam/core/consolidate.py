@@ -33,6 +33,7 @@ from ifc_occam.core.simplify import (
     _remove_styled_item,
     _representation_type_for_schema,
     _styled_items_in_subtree,
+    _transfer_layer_assignments,
     _verts_to_native_units,
     style_signature,
     styles_match,
@@ -234,6 +235,9 @@ def consolidate_duplicates(
         rep_map = _create_representation_map(
             ifc_file, source_verts, rep_shape.faces, context, styles=rep_styles
         )
+        # 共有ソース側の新アイテム(全メンバー共通)。item直付けのレイヤー所属の
+        # 引き継ぎ先として使う(フェーズ最終レビュー I-3)。
+        shared_item = rep_map.MappedRepresentation.Items[0]
 
         centroid_cache: dict[str, object] = {}
         for shape_id, element, body_rep in matched:
@@ -260,6 +264,14 @@ def consolidate_duplicates(
                 for styled_item in _styled_items_in_subtree(item):
                     _remove_styled_item(ifc_file, styled_item)
                 cleanup_targets.append(item)
+
+            # 旧アイテム(cleanup_targets)に付いたレイヤー所属を引き継ぐ:
+            # rep直付け(旧ノードがIfcRepresentation)なら生き残るbody_rep自身へ、
+            # item直付けなら共有ソース側の新アイテムへ(フェーズ最終レビュー I-3。
+            # これをせずcleanup_targetsをそのまま_cleanup_itemsへ渡すと、
+            # レイヤー割当のinverseが残って旧幾何が削除できず、consolidateが
+            # 「縮めるはずが増える」欠陥になる。simplify.py側と同じ理屈)。
+            _transfer_layer_assignments(ifc_file, cleanup_targets, body_rep, shared_item)
 
             body_rep.Items = [mapped_item]
             body_rep.RepresentationType = "MappedRepresentation"

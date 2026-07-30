@@ -531,10 +531,14 @@ def rewrite_without(
     graph: FullGraph,
     source_name: str,
     progress: Callable[[str, int, int], None] | None = None,
+    stamp_header_lines: bool = True,
 ) -> RewriteReport:
     """src_path から plan(drop_ids/patch_rel_ids)を適用した出力を out_path に
     ストリーム書き換えで書き出す(ifcopenshell を一度も開かない。モジュール
     docstring参照)。
+
+    stamp_header_lines=False はGC(textops/gc.py)専用。入力が既に刻印済みの
+    fatファイルであるため、ヘッダを素通しする。
 
     progress は ("rewrite", 処理済みレコード数, graph.record_count) で
     レコードごとに(iter_records の1件の yield ごとに)発火する。間引きは
@@ -581,10 +585,14 @@ def rewrite_without(
     _ensure_sorted_ascending(plan.patch_rel_ids, "patch_rel_ids")
 
     deleted_count = int(plan.stats["seeds"]) + int(plan.stats["cascade"])
-    stamp_lines = build_provenance_lines(source_name, deleted_count, simplified_count=0)
 
     header = _read_header(src_path)
-    stamped_header = _stamp_header(header, stamp_lines)
+    if stamp_header_lines:
+        stamp_lines = build_provenance_lines(source_name, deleted_count, simplified_count=0)
+        stamped_header = _stamp_header(header, stamp_lines)
+    else:
+        # GC経路: fat ファイル側で _stamp_provenance 済み。二重刻印を避ける。
+        stamped_header = header
 
     records_in = 0
     records_dropped = 0

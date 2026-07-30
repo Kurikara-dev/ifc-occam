@@ -1728,10 +1728,11 @@ async function exportTargetExists(path) {
 }
 
 // ifc_occam/cui/repl.py の _STAGE_SECONDS_LABELS と同じ日本語(監督者裁定5)。
-// キーはexport.apply_operationsが実際に設定する6種で固定
-// (open/deletes/simplify/reextract_duplicates/consolidate/write)。UI文言(語彙)
-// の共有であり、estimate.jsの数値係数のような二重管理禁止の対象ではない
-// (opLabelがcore/ops.pyの操作名と同じ語彙を独自に持つのと同じ扱い)。
+// キーはexport.apply_operationsが実際に設定する7種で固定
+// (open/deletes/simplify/reextract_duplicates/consolidate/write/gc。
+// フェーズ最終レビューI3: "gc" ステージ追加時にここへの追記が漏れていた)。
+// UI文言(語彙)の共有であり、estimate.jsの数値係数のような二重管理禁止の
+// 対象ではない(opLabelがcore/ops.pyの操作名と同じ語彙を独自に持つのと同じ扱い)。
 const STAGE_SECONDS_LABELS = {
   open: "開く",
   deletes: "削除",
@@ -1739,6 +1740,7 @@ const STAGE_SECONDS_LABELS = {
   reextract_duplicates: "重複再抽出",
   consolidate: "重複統合",
   write: "書き込み",
+  gc: "ゴミ回収",
 };
 
 /**

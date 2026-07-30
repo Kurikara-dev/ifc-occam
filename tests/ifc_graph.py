@@ -8,7 +8,9 @@ from collections import Counter
 
 import ifcopenshell
 
-# 親から必ず辿られるはずの幾何プリミティブ。表現から到達できないなら死荷重。
+# 親から必ず辿られるはずの幾何。製品から到達できないなら死荷重。
+# IfcShapeRepresentation / IfcRepresentationMap / IfcMappedItem は
+# 「孤児になった器」自体を検出するために追加(2026-07-29)。
 TRACKED_TYPES = (
     "IfcClosedShell",
     "IfcOpenShell",
@@ -16,6 +18,9 @@ TRACKED_TYPES = (
     "IfcPolyLoop",
     "IfcFacetedBrep",
     "IfcTriangulatedFaceSet",
+    "IfcShapeRepresentation",
+    "IfcRepresentationMap",
+    "IfcMappedItem",
 )
 
 
@@ -29,15 +34,30 @@ def _iter_entities(value):
 
 
 def unreachable_geometry(ifc_file) -> dict[str, int]:
-    """IfcShapeRepresentation / IfcRepresentationMap から到達できない幾何を型別に数える。
+    """製品(IfcProduct)から到達できない幾何を型別に数える。
 
-    IfcStyledItem からは先へ辿らない。スタイルだけが旧形状を掴んで残しているケースを
-    「到達不能」として検出したいため(スタイル経由で辿ると健全に見えてしまう)。
-    戻り値は0件の型を含まない辞書。全て健全なら空辞書。
+    到達性のルートは「製品が Representation 経由で参照する IfcRepresentation」と
+    「IfcTypeProduct.RepresentationMaps の IfcRepresentationMap」だけ。
+    以前は全 IfcShapeRepresentation / IfcRepresentationMap をルートにしていた
+    ため、どの製品からも参照されない孤児 rep 自体がルート扱いになり、
+    レイヤー割当が旧repをピン留めして残す不具合の出力でも空辞書を返していた
+    (オラクルの穴、2026-07-29)。共有マップは製品側の IfcMappedItem →
+    MappingSource 経由で到達できるため、ルートに直接加えるのは型定義側だけで
+    足りる。
+
+    IfcStyledItem からは先へ辿らない(従来どおり。forward 属性からは実質
+    到達しないので保険)。戻り値は0件の型を含まない辞書。全て健全なら空辞書。
     """
+    stack = []
+    for product in ifc_file.by_type("IfcProduct"):
+        shape = getattr(product, "Representation", None)
+        if shape is None:
+            continue
+        stack.extend(getattr(shape, "Representations", None) or [])
+    for type_product in ifc_file.by_type("IfcTypeProduct"):
+        stack.extend(getattr(type_product, "RepresentationMaps", None) or [])
+
     reachable: set[int] = set()
-    stack = list(ifc_file.by_type("IfcShapeRepresentation"))
-    stack += list(ifc_file.by_type("IfcRepresentationMap"))
     while stack:
         node = stack.pop()
         node_id = node.id()
