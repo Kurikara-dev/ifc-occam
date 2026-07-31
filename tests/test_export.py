@@ -26,6 +26,7 @@ from tests.fixtures_ifc import (
     build_ifc2x3_single_element_ifc,
     build_many_minimal_products_ifc,
     build_many_walls_with_openings_ifc,
+    build_three_elements_sharing_mapped_shape_ifc,
     build_three_translated_copies_ifc,
     build_two_elements_sharing_mapped_shape_ifc,
     build_wall_with_window_ifc,
@@ -295,6 +296,114 @@ def test_simplify_shared_scope_processes_shared_map_only_once(tmp_path):
     e2 = reopened.by_guid(gid2)
     assert _n_triangles(e1) == 12
     assert _n_triangles(e2) == 12
+
+
+# ---------------------------------------------------------------------------
+# フェーズ最終レビューI-2: フォールバックした要素が共有マップを「処理済み」に
+# マークしてしまい、同一マップの兄弟が黙ってスキップされないこと
+# ---------------------------------------------------------------------------
+
+
+def test_shared_simplify_with_first_sibling_fallback_still_reaches_others(
+    tmp_path, monkeypatch
+):
+    """1マップを3要素が共有し、最初に処理される要素だけMappingTargetを安全に
+    逆変換できずscope="element"にフォールバックする場合でも、残り2要素には
+    共有適用が実際に届くこと(フェーズ最終レビューI-2)。
+
+    修正前は processed_shared_maps へのマークが _apply_simplify の**前**に
+    (成功/フォールバックを問わず)行われるため、フォールバックした要素1つが
+    共有マップを「処理済み」にしてしまい、残りの兄弟は実際には形状が
+    変わらないまま simplified に計上されるだけになる(黙ったスキップ)。
+    """
+    import ifc_occam.core.simplify as simplify_module
+
+    f = build_three_elements_sharing_mapped_shape_ifc()
+    elem1, elem2, elem3 = f.by_type("IfcBuildingElementProxy")
+    gid1, gid2, gid3 = _gid(elem1), _gid(elem2), _gid(elem3)
+
+    # 最初の呼び出し(=最初に処理される要素)だけMappingTargetを安全に逆変換
+    # できないことにし、以降は本物の実装(恒等)に委ねる。
+    original_matrix_fn = simplify_module._transform_operator_matrix
+    call_count = {"n": 0}
+
+    def _matrix_none_on_first_call(op):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return original_matrix_fn(op)
+
+    monkeypatch.setattr(
+        simplify_module, "_transform_operator_matrix", _matrix_none_on_first_call
+    )
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(
+            op="simplify",
+            targets=[gid1, gid2, gid3],
+            scope="shared",
+            params={"method": "bbox"},
+        )
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert set(report.simplified) == {gid1, gid2, gid3}
+    assert any("フォールバック" in w for w in report.warnings)
+
+    reopened = ifcopenshell.open(out_path)
+    # 三角形1枚(1面)→bboxで直方体(12三角形)。兄弟2・3にも共有適用が届いていれば
+    # 12三角形になる(修正前は元の1面のまま=黙ってスキップされている)。
+    assert _n_triangles(reopened.by_guid(gid2)) == 12
+    assert _n_triangles(reopened.by_guid(gid3)) == 12
+
+
+# ---------------------------------------------------------------------------
+# フェーズ最終レビューI-1: 同一共有マップへ異なるsimplify操作が到達したとき、
+# 先勝ちの挙動自体は変えず、無視された側に警告を出すこと
+# ---------------------------------------------------------------------------
+
+
+def test_shared_simplify_conflicting_ops_on_same_map_warns_about_first_come_wins(
+    tmp_path,
+):
+    """1つの共有マップを指す2要素に、異なるsimplify操作(bbox→先着、
+    decimate 0.1→後着)を同時に適用すると、後着側は先着の方法で処理済みの
+    ため適用されず、その旨の警告が出ること(フェーズ最終レビューI-1)。
+    先勝ちという挙動自体は変更しない(可視化のみ)。
+    """
+    f = build_two_elements_sharing_mapped_shape_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(op="simplify", targets=[gid1], scope="shared", params={"method": "bbox"}),
+        Operation(
+            op="simplify",
+            targets=[gid2],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.1},
+        ),
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert set(report.simplified) == {gid1, gid2}
+    expected_warning = (
+        "共有形状は先行の bbox で処理済みのため、"
+        f"この要素(GlobalId={gid2})への decimate は適用されません(共有波及の先勝ち)。"
+    )
+    assert expected_warning in report.warnings
+
+    reopened = ifcopenshell.open(out_path)
+    # 先勝ち: 両要素ともbbox(12三角形)になり、decimateは効いていない
+    # (挙動自体は従来どおり。警告で可視化されるようになった点のみが変化)。
+    assert _n_triangles(reopened.by_guid(gid1)) == 12
+    assert _n_triangles(reopened.by_guid(gid2)) == 12
 
 
 # ---------------------------------------------------------------------------

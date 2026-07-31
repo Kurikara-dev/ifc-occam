@@ -24,6 +24,16 @@ except ImportError as exc:  # pragma: no cover - 依存導入漏れの早期検�
     ) from exc
 
 
+_SHARED_FALLBACK_MARKER = "にフォールバックしました(共有マップは変更されていません)"
+"""scope="shared"の書き戻しが要素個別化にフォールバックしたことを示す警告文の
+識別子(フェーズ最終レビューI-2)。replace_representation がこの部分文字列を含む
+警告を返したときだけ生成されるメッセージ本文の一部をここに切り出し、
+export.py 側はこの定数への in 判定でフォールバックの発生を検知する
+(文言の変更漏れによる検知ズレを防ぐため、メッセージ文字列を二重管理しない)。
+下の replace_representation がメッセージ生成時にこの定数を使う。メッセージ本文
+自体は変更していない。"""
+
+
 # ---------------------------------------------------------------------------
 # 純粋関数
 # ---------------------------------------------------------------------------
@@ -817,7 +827,7 @@ def replace_representation(
         result.append(
             "scope=\"shared\"の書き戻しでMappingTargetを安全に逆変換できないため、"
             f"この要素(GlobalId={getattr(element, 'GlobalId', '?')})はscope=\"element\""
-            "にフォールバックしました(共有マップは変更されていません)。"
+            f"{_SHARED_FALLBACK_MARKER}。"
         )
         return result
 

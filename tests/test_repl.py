@@ -1532,3 +1532,165 @@ def test_print_report_shows_summarized_warning_contents_not_just_the_count(capsy
     out = capsys.readouterr().out
     assert "警告: 4件(2種)" in out
     assert "×3" in out
+
+
+# --- 共有波及の確認2開示(docs/plans/2026-07-31-cui-shared-scope.md) ---
+
+
+def test_shared_spillover_counts_siblings_outside_all_targets(tmp_path):
+    """共有マップの片割れだけを対象にした shared simplify は、もう片方
+    (どの操作の対象でもない)への波及としてクラス別に数えられる。"""
+    import ifcopenshell
+
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _shared_spillover_counts
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    ops = [Operation(op="simplify", targets=[elem1.GlobalId], scope="shared",
+                     params={"method": "bbox"})]
+
+    assert _shared_spillover_counts(f, ops) == {"IfcBuildingElementProxy": 1}
+
+
+def test_shared_spillover_excludes_deleted_and_targeted_siblings(tmp_path):
+    """波及先が (a) 他の simplify の対象、(b) 削除対象、のどちらかなら開示に
+    数えない(aは指定済み、bはどうせ消えるため情報にならない)。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _shared_spillover_counts
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+
+    both = [
+        Operation(op="simplify", targets=[elem1.GlobalId], scope="shared",
+                  params={"method": "bbox"}),
+        Operation(op="simplify", targets=[elem2.GlobalId], scope="shared",
+                  params={"method": "bbox"}),
+    ]
+    assert _shared_spillover_counts(f, both) == {}
+
+    with_delete = [
+        Operation(op="simplify", targets=[elem1.GlobalId], scope="shared",
+                  params={"method": "bbox"}),
+        Operation(op="delete", targets=[elem2.GlobalId]),
+    ]
+    assert _shared_spillover_counts(f, with_delete) == {}
+
+
+def test_element_scope_reports_no_spillover(tmp_path):
+    """個別化(scope=element)は波及しないので開示対象にならない。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _shared_spillover_counts
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, _elem2 = f.by_type("IfcBuildingElementProxy")
+    ops = [Operation(op="simplify", targets=[elem1.GlobalId], scope="element",
+                     params={"method": "bbox"})]
+
+    assert _shared_spillover_counts(f, ops) == {}
+
+
+def test_confirm2_prints_spillover_disclosure(tmp_path, capsys, monkeypatch):
+    """確認2の画面に波及の開示行が出る(結線レベルの番人)。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _preview_and_confirm2
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, _elem2 = f.by_type("IfcBuildingElementProxy")
+    ops = [Operation(op="simplify", targets=[elem1.GlobalId], scope="shared",
+                     params={"method": "bbox"})]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+
+    assert _preview_and_confirm2(f, ops) is True
+    out = capsys.readouterr().out
+    assert "共有波及: 操作で指定していない 1要素 の形状も対象になります" in out
+    assert "IfcBuildingElementProxy: 1" in out
+
+
+def test_shared_spillover_counts_extra_excluded_removes_cascade_deleted_sibling(tmp_path):
+    """extra_excluded に渡した GlobalId は波及開示から除かれる
+    (フェーズ最終レビューM-7、_shared_spillover_counts単体)。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _shared_spillover_counts
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    ops = [Operation(op="simplify", targets=[elem1.GlobalId], scope="shared",
+                     params={"method": "bbox"})]
+
+    # extra_excluded を渡さない(従来どおり)場合はelem2が波及として数えられる。
+    assert _shared_spillover_counts(f, ops) == {"IfcBuildingElementProxy": 1}
+    # elem2 が(例えば削除連鎖で)どうせ消えるなら、extra_excluded に渡して除ける。
+    assert _shared_spillover_counts(f, ops, extra_excluded={elem2.GlobalId}) == {}
+
+
+def test_confirm2_excludes_cascade_deleted_sibling_from_spillover_disclosure(
+    tmp_path, capsys, monkeypatch
+):
+    """兄弟要素が simplify/delete どちらの直接対象でもなくても、delete連鎖
+    (集約の子部材)でどうせ削除される場合は確認2の開示に出ない
+    (フェーズ最終レビューM-7、_preview_and_confirm2への結線)。
+
+    修正前は _shared_spillover_counts に delete closure が渡っていないため、
+    連鎖で消えるだけの兄弟(elem2)も「操作で指定していない要素」として
+    誤って開示されてしまう(過剰開示)。
+    """
+    import ifcopenshell.api
+
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _preview_and_confirm2
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    assembly = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcElementAssembly", name="Assembly1"
+    )
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, products=[elem2], relating_object=assembly
+    )
+
+    ops = [
+        Operation(op="delete", targets=[assembly.GlobalId]),
+        Operation(op="simplify", targets=[elem1.GlobalId], scope="shared",
+                  params={"method": "bbox"}),
+    ]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+
+    assert _preview_and_confirm2(f, ops) is True
+    out = capsys.readouterr().out
+    assert "共有波及" not in out
+
+
+def test_help_text_documents_element_shared_scope_and_shared_default():
+    """helpテキストの [element|shared] とscope既定の注記に番人テストを付ける
+    (フェーズ最終レビューM-2)。既定が破壊的方向(共有波及)に変わった以上、
+    element オプトアウトの存在を知る唯一の手段であるこの文言を固定する。"""
+    assert "[element|shared]" in repl._HELP_TEXT
+    assert "※ 簡略化は既定で共有波及" in repl._HELP_TEXT
+
+
+def test_format_spillover_line_truncates_to_top_five_with_rest_count():
+    """6クラス以上の波及は上位5クラスまで表示し「...他Nクラス」を付ける
+    (フェーズ最終レビューM-3、純粋関数の番人テスト)。"""
+    from ifc_occam.cui.repl import _format_spillover_line
+
+    spillover = {
+        "IfcWall": 10,
+        "IfcSlab": 9,
+        "IfcBeam": 8,
+        "IfcColumn": 7,
+        "IfcDoor": 6,
+        "IfcWindow": 5,
+    }
+    line = _format_spillover_line(spillover)
+    assert line == (
+        "共有波及: 操作で指定していない 45要素 の形状も対象になります"
+        "(IfcWall: 10, IfcSlab: 9, IfcBeam: 8, IfcColumn: 7, IfcDoor: 6, ...他1クラス)。"
+    )

@@ -98,6 +98,8 @@ IFC Occam CUI — 軽量スキャン中...
 
 Commands: `delete`, `bbox`, `hull`, `decimate`, `keep`, `undo`, `list`, `rank`, `apply`, plus `help` and `quit`. Nothing touches disk until `apply`, and `apply` asks you to confirm twice — once on the operation summary, once after the real file has been read and the deletion cascade has been expanded, so you see how many extra elements come along with your choices before anything is written. It also prompts for the output filename.
 
+Simplification commands propagate across shared geometry by default — reducing one class also reduces the shared shapes it uses, exactly like the GUI's 共有波及 option — and the confirmation screen discloses how many elements outside your selection will change; append `element` to a command to simplify per element instead.
+
 `--scan-only` prints the ranking and exits, which is the fast way to size up a model you have never seen.
 
 ### Text mode: for models you cannot open

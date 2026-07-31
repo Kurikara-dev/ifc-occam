@@ -135,6 +135,88 @@ def build_two_elements_sharing_mapped_shape_ifc() -> ifcopenshell.file:
     return f
 
 
+def build_three_elements_sharing_mapped_shape_ifc() -> ifcopenshell.file:
+    """3要素が同じ IfcRepresentationMap(三角形1枚の最小形状)を共有する合成IFC4を
+    返す。build_two_elements_sharing_mapped_shape_ifc の3要素版
+    (フェーズ最終レビューI-2の再現・回帰テスト用)。
+
+    各要素のMappingTargetはすべて恒等変換(見た目の差はない)。テスト側で
+    `ifc_occam.core.simplify._transform_operator_matrix` を先頭の呼び出しだけ
+    None を返すよう monkeypatch すれば、最初に処理される要素だけが
+    scope="element" にフォールバックする状況を再現できる。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 1.0)],
+    )
+    tfs = f.create_entity(
+        "IfcTriangulatedFaceSet",
+        Coordinates=coord_list,
+        CoordIndex=[(1, 2, 3)],
+    )
+    mapped_representation = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=[tfs],
+    )
+    identity = f.create_entity(
+        "IfcAxis2Placement3D",
+        Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+    )
+    rep_map = f.create_entity(
+        "IfcRepresentationMap",
+        MappingOrigin=identity,
+        MappedRepresentation=mapped_representation,
+    )
+
+    for name in ("Elem1", "Elem2", "Elem3"):
+        element = ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name=name
+        )
+        mapped_item = f.create_entity(
+            "IfcMappedItem",
+            MappingSource=rep_map,
+            MappingTarget=f.create_entity(
+                "IfcCartesianTransformationOperator3D",
+                Axis1=None,
+                Axis2=None,
+                LocalOrigin=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+                Scale=None,
+                Axis3=None,
+            ),
+        )
+        body_rep = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body_ctx,
+            RepresentationIdentifier="Body",
+            RepresentationType="MappedRepresentation",
+            Items=[mapped_item],
+        )
+        product_shape = f.create_entity(
+            "IfcProductDefinitionShape",
+            Representations=[body_rep],
+        )
+        element.Representation = product_shape
+        ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
 def build_two_elements_sharing_mapped_shape_with_transform_ifc() -> ifcopenshell.file:
     """build_two_elements_sharing_mapped_shape_ifc の変形版: Elem1 の MappingTarget に
     非恒等変換(平行移動 (2,0,0))を持たせる。Elem2 は恒等(既存フィクスチャと同じ)。

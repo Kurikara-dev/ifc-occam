@@ -64,9 +64,11 @@ from pathlib import Path
 import ifcopenshell
 
 from ifc_occam.core.cascade import compute_delete_closure
-from ifc_occam.core.export import ExportReport, apply_operations
+# 共有マップの識別はexport.pyのsimplifyループと同じ関数で行う(定義の二重化でズレるより私的importの方がまし)。
+from ifc_occam.core.export import ExportReport, _shared_map_key, apply_operations
 from ifc_occam.core.extract import extract_elements_light
 from ifc_occam.core.paths import refers_to_same_file
+from ifc_occam.core.simplify import get_shared_element_gids
 from ifc_occam.cui.session import CuiSession, Intent
 from ifc_occam.scan.aggregate import FULLOPEN_BYTES_MULTIPLIER, ScanResult, scan_file
 from ifc_occam.scan.fullgraph import scan_full_graph
@@ -126,15 +128,16 @@ _INTRO_HINT = "操作を入力してください (h でヘルプ):"
 _HELP_TEXT = """\
 === コマンド一覧 ===
   delete <クラス名>             クラス全要素を削除対象に追加する
-  bbox <クラス名>               クラス全要素をbbox軽量化対象に追加する
-  hull <クラス名>               クラス全要素を凸包化対象に追加する
-  decimate <クラス名> <ratio>   クラス全要素を間引き対象に追加する(ratio: 0.05-0.95)
+  bbox <クラス名> [element|shared]     クラス全要素をbbox軽量化対象に追加する(既定: 共有波及)
+  hull <クラス名> [element|shared]     クラス全要素を凸包化対象に追加する(既定: 共有波及)
+  decimate <クラス名> <ratio> [element|shared]   クラス全要素を間引き対象に追加する(ratio: 0.05-0.95、既定: 共有波及)
   keep <クラス名>               操作指定を解除し、保持対象として明示する
   undo [番号]                  操作リストから1件取り消す(番号省略時は list の最終行を取り消し)
   list                         現在の操作リストを表示する
   rank                         診断ランキングを再表示する
   apply                        操作リストをIFCファイルに適用して出力する(確認2回)
   quit                         対話を中断して終了する(ファイルは変更されない)
+  ※ 簡略化は既定で共有波及(同じ共有形状を使う要素にまとめて効く)。末尾に element で従来の個別化。
   h / help                     このヘルプを表示する"""
 
 
@@ -554,6 +557,60 @@ def _run_text_apply(
     return True, True
 
 
+def _shared_spillover_counts(
+    ifc_file, operations, extra_excluded: set[str] | None = None
+) -> dict[str, int]:
+    """共有波及(scope="shared")の simplify が、どの操作の対象にも入っていない
+    要素へ波及する件数をクラス別に数える(確認2の開示用)。
+
+    共有マップは同一形状を複数要素で使い回すため、対象クラスだけを指定しても
+    同じマップを使う別クラスの要素の形状が一緒に変わる。GUIは共有波及プレビュー
+    で開示しており、CUIも黙って波及させない(docs/plans/2026-07-31-cui-shared-scope.md
+    設計判断2)。simplify対象と削除対象は開示から除く(前者は指定済み、後者は
+    どうせ消える)。走査はマップ単位で1回(同じマップを使う対象が何千要素でも
+    inverse走査は1回で済む)。
+
+    extra_excluded: 呼び出し側(_preview_and_confirm2)が別途計算済みの削除連鎖
+    (direct+cascaded)の GlobalId 集合を渡せる(フェーズ最終レビューM-7)。
+    delete op.targets(直接指定)は上の走査で既に除外しているが、集約の子部材や
+    開口の充填要素のように連鎖でしか消える要素は op.targets には現れないため、
+    このパラメータで合流させないと「どうせ消える要素」が波及開示に紛れ込む
+    (安全側だが過剰開示)。省略時(None)は従来どおり直接指定のみを除外する。
+    """
+    excluded: set[str] = set()
+    for op in operations:
+        if op.op in ("simplify", "delete"):
+            excluded.update(op.targets)
+    if extra_excluded:
+        excluded.update(extra_excluded)
+
+    spillover: dict[str, int] = {}
+    seen_maps: set[int] = set()
+    counted: set[str] = set()
+    for op in operations:
+        if op.op != "simplify" or op.scope != "shared":
+            continue
+        for gid in op.targets:
+            try:
+                element = ifc_file.by_guid(gid)
+            except RuntimeError:
+                continue
+            map_key = _shared_map_key(element)
+            if map_key is None or map_key in seen_maps:
+                continue
+            seen_maps.add(map_key)
+            for sibling_gid in get_shared_element_gids(ifc_file, gid):
+                if sibling_gid in excluded or sibling_gid in counted:
+                    continue
+                counted.add(sibling_gid)
+                try:
+                    sibling = ifc_file.by_guid(sibling_gid)
+                except RuntimeError:
+                    continue
+                spillover[sibling.is_a()] = spillover.get(sibling.is_a(), 0) + 1
+    return spillover
+
+
 def _preview_and_confirm2(ifc_file, operations) -> bool:
     """フルオープン後の実ファイル突合・削除連鎖プレビュー・確認2(手順2)。
     確認2の答えが y/yes なら True。"""
@@ -589,16 +646,52 @@ def _preview_and_confirm2(ifc_file, operations) -> bool:
         print(f"スキャン時と異なる要素を{missing}件検出しました(対象から除外します)。")
 
     summary: list[str] = []
+    delete_closure_gids: set[str] = set()
     if delete_targets:
         closure = compute_delete_closure(ifc_file, sorted(delete_targets))
         summary.append(f"削除 直接{len(closure.direct)}件+連鎖{len(closure.cascaded)}件")
+        delete_closure_gids = closure.all_gids
     for label, count in simplify_counts.items():
         summary.append(f"{label} {count}件")
 
     print("=== 適用内容(実ファイルで確認済み) ===")
     print(" / ".join(summary) if summary else "(適用対象なし)")
 
+    # extra_excluded=delete_closure_gids: 削除連鎖(集約の子部材・開口の充填要素等)
+    # でどうせ消える兄弟は、simplify/delete の直接対象でなくても開示から除く
+    # (フェーズ最終レビューM-7、設計判断2の意図と揃える)。
+    spillover = _shared_spillover_counts(
+        ifc_file, operations, extra_excluded=delete_closure_gids
+    )
+    if spillover:
+        print(_format_spillover_line(spillover))
+
     return _confirm("実行しますか? (y/N): ")
+
+
+def _format_spillover_line(spillover: dict[str, int]) -> str:
+    """共有波及の開示行を整形する(確認2用の純粋関数、フェーズ最終レビューM-3)。
+
+    上位5クラスまでの内訳を件数降順で表示し、6クラス以上あれば
+    「...他Nクラス」を付ける。spillover が空の場合は呼び出し側
+    (_preview_and_confirm2)が呼ばない前提(このケースは想定していない)。
+
+    文言はフェーズ最終レビューM-1+I-3の裁定により「一緒に変わります」の断定を
+    避け「対象になります」に緩めている(MappingTargetが逆変換不能な場合は
+    scope="element"へフォールバックし実際には変わらないことがあるため。また
+    IfcMappedItemを介さない直接共有はこの開示自体に乗らないため、「変わる」と
+    断定できない)。
+    """
+    total = sum(spillover.values())
+    ordered = sorted(spillover.items(), key=lambda kv: -kv[1])
+    detail = ", ".join(f"{cls}: {n}" for cls, n in ordered[:5])
+    rest = len(ordered) - 5
+    if rest > 0:
+        detail += f", ...他{rest}クラス"
+    return (
+        f"共有波及: 操作で指定していない {total}要素 の形状も対象になります"
+        f"({detail})。"
+    )
 
 
 def summarize_warnings(warnings: list[str], top: int = 5) -> list[str]:

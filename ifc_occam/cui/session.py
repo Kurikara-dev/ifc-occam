@@ -6,11 +6,16 @@
 core/export.py の責務)。
 
 対話コマンド一覧(ifc_occam_cui_requirements.md §5、cui-design.md §6):
-    delete <クラス名>              クラス全要素を削除対象に
-    bbox <クラス名>                クラス全要素をbbox化対象に
-    hull <クラス名>                クラス全要素を凸包化対象に
-    decimate <クラス名> <ratio>    クラス全要素を間引き対象に(ratio: 0.05-0.95)
-    keep <クラス名>                既存の操作指定を解除する(明示的な保持マーカー)
+    delete <クラス名>                            クラス全要素を削除対象に
+    bbox <クラス名> [element|shared]             クラス全要素をbbox化対象に
+    hull <クラス名> [element|shared]             クラス全要素を凸包化対象に
+    decimate <クラス名> <ratio> [element|shared] クラス全要素を間引き対象に
+                                                  (ratio: 0.05-0.95)。bbox/hull/
+                                                  decimateの末尾scopeキーワードは
+                                                  省略時 既定"shared"(共有波及。
+                                                  docs/plans/2026-07-31-cui-shared-scope.md)
+    keep <クラス名>                              既存の操作指定を解除する
+                                                  (明示的な保持マーカー)
     undo [番号]                   操作リストから1件除去(番号省略時は直前に
                                    新規追加した1件。cui-design.md には
                                    専用メソッドが無いため command() 内で解釈する)
@@ -48,19 +53,32 @@ _RATIO_MAX = 0.95
 _CANDIDATE_LIMIT = 10
 
 #: Intent.op(simplify系) → core.ops.Operation の params["method"] 変換表
-#: (cui-design.md §6: "bbox/hull/decimate → simplify(method=..., scope='element')")。
+#: (cui-design.md §6: "bbox/hull/decimate → simplify(method=..., scope=intent.scope)"、
+#: 既定 "shared"。docs/plans/2026-07-31-cui-shared-scope.md)。
 _SIMPLIFY_METHOD_BY_OP = {"bbox": "bbox", "hull": "convex_hull", "decimate": "decimate"}
 
 _SET_OP_LABELS = {"delete": "削除", "bbox": "bbox軽量化", "hull": "凸包化"}
 
+#: simplify系コマンドの scope 表示ラベル(GUIの操作リストと同じ語彙)。
+_SCOPE_LABELS = {"shared": "共有波及", "element": "個別"}
+
 
 @dataclass
 class Intent:
-    """1クラスに対する操作意図(cui-design.md §6)。"""
+    """1クラスに対する操作意図(cui-design.md §6)。
+
+    scope は bbox/hull/decimate(simplify系)でのみ意味を持つ。既定 "shared"
+    (共有波及): 同じ共有形状(IfcRepresentationMap)を使う要素すべてに1回の
+    書き換えで波及する(GUIの共有波及と同じ。2026-07-31 実測: large.ifc で
+    element 比 サイズ-5.5MB/簡略化1.8倍速/警告708→0件)。"element"(個別)は
+    要素ごとに形状を個別化する(コマンド末尾の element キーワード)。
+    delete/keep では無視される。
+    """
 
     op: str  # "delete" | "bbox" | "hull" | "decimate" | "keep"
     ifc_class: str  # スキャン時の大文字クラス名
     ratio: float | None = None
+    scope: str = "shared"
 
 
 class CuiSession:
@@ -113,8 +131,9 @@ class CuiSession:
         """Intent → core.ops.Operation 変換(cui-design.md §6)。
 
         targets は scan.elements(GlobalId列)から取る。op の対応:
-        bbox/hull/decimate → simplify(method=..., scope="element")、
-        delete → delete、keep → keep。scope は常に "element"。
+        bbox/hull/decimate → simplify(method=..., scope=intent.scope)、
+        delete → delete、keep → keep。simplify は intent.scope(既定 shared)、
+        delete/keep は従来どおり "element"(意味を持たない)。
         """
         operations: list[Operation] = []
         for intent in self.intents():
@@ -124,7 +143,7 @@ class CuiSession:
                 if intent.op == "decimate":
                     params["ratio"] = intent.ratio
                 operations.append(
-                    Operation(op="simplify", targets=targets, scope="element", params=params)
+                    Operation(op="simplify", targets=targets, scope=intent.scope, params=params)
                 )
             else:  # "delete" | "keep"
                 operations.append(Operation(op=intent.op, targets=targets, scope="element"))
@@ -217,18 +236,19 @@ class CuiSession:
 
     @staticmethod
     def _op_label(intent: Intent) -> str:
-        """list 表示用の操作ラベル(日本語、docs/plans/2026-07-24-cui-phase1.md Task 6 監督者確定要件2)。
-
-        要件定義§5の list モック例(「削除」「間引き 0.3」等)に合わせる。
-        delete/bbox/hull は _SET_OP_LABELS の既存語彙(削除/bbox軽量化/凸包化)を
-        そのまま使う。decimate/keep はそこに無いため、同じ語彙系(間引き/保持、
-        本モジュール内の他メッセージで既に使っている語)をここで直接返す。
+        """list 表示用の操作ラベル(日本語)。simplify系は scope を併記する
+        (GUIの操作リスト「decimate ratio=0.1 / 共有波及」と同じ情報量)。
+        要件定義§5モックの「間引き 0.3」形からの逸脱は
+        docs/plans/2026-07-31-cui-shared-scope.md で正式に上書き済み。
         """
         if intent.op == "decimate":
-            return f"間引き {intent.ratio}"
+            return f"間引き {intent.ratio}({_SCOPE_LABELS[intent.scope]})"
         if intent.op == "keep":
             return "保持"
-        return _SET_OP_LABELS.get(intent.op, intent.op)
+        label = _SET_OP_LABELS.get(intent.op, intent.op)
+        if intent.op in _SIMPLIFY_METHOD_BY_OP:
+            return f"{label}({_SCOPE_LABELS[intent.scope]})"
+        return label
 
     # ------------------------------------------------------------------
     # 内部ヘルパー: クラス名解決
@@ -239,6 +259,20 @@ class CuiSession:
         クラス名の突合は常に upper() で行う)。見つからなければ None。"""
         cls = raw.upper()
         return cls if cls in self._element_counts else None
+
+    @staticmethod
+    def _parse_scope(token: str | None) -> str | None:
+        """簡略化コマンド末尾の任意キーワードを scope に解決する。
+
+        None(省略)= 既定の "shared"。"element"/"shared"(大文字小文字不問)は
+        それぞれの scope。それ以外は None を返し、呼び出し側がエラーにする。
+        """
+        if token is None:
+            return "shared"
+        lowered = token.lower()
+        if lowered in ("element", "shared"):
+            return lowered
+        return None
 
     def _unknown_class_error(self, raw: str) -> str:
         """不明クラスのエラーメッセージ。前方一致候補を最大 `_CANDIDATE_LIMIT`
@@ -260,19 +294,34 @@ class CuiSession:
     # ------------------------------------------------------------------
 
     def _command_set(self, args: list[str], *, op: str) -> str:
-        """delete/bbox/hull 共通(いずれも <クラス名> 1個だけを取る)。"""
-        if len(args) != 1:
-            return f"使い方: {op} <クラス名>"
+        """delete/bbox/hull 共通。bbox/hull は末尾に任意の scope キーワード
+        (element=個別化 / shared=既定の共有波及の明示)を取れる。delete は
+        取らない(削除に波及の概念はなく、連鎖はapply側の閉包計算が担う)。"""
+        takes_scope = op in _SIMPLIFY_METHOD_BY_OP
+        usage = f"使い方: {op} <クラス名>" + (" [element|shared]" if takes_scope else "")
+        max_args = 2 if takes_scope else 1
+        if not (1 <= len(args) <= max_args):
+            return usage
         cls = self._resolve_class(args[0])
         if cls is None:
             return self._unknown_class_error(args[0])
-        self._intents[cls] = Intent(op=op, ifc_class=cls)
         count = self._element_counts[cls]
+        if takes_scope:
+            scope = self._parse_scope(args[1] if len(args) == 2 else None)
+            if scope is None:
+                return f"不明な指定です: {args[1]}({usage})"
+            self._intents[cls] = Intent(op=op, ifc_class=cls, scope=scope)
+            return (
+                f"{cls} {count}要素を{_SET_OP_LABELS[op]}対象に追加しました"
+                f"({_SCOPE_LABELS[scope]})。"
+            )
+        self._intents[cls] = Intent(op=op, ifc_class=cls)
         return f"{cls} {count}要素を{_SET_OP_LABELS[op]}対象に追加しました。"
 
     def _command_decimate(self, args: list[str]) -> str:
-        if len(args) != 2:
-            return "使い方: decimate <クラス名> <ratio>"
+        usage = "使い方: decimate <クラス名> <ratio> [element|shared]"
+        if not (2 <= len(args) <= 3):
+            return usage
         cls = self._resolve_class(args[0])
         if cls is None:
             return self._unknown_class_error(args[0])
@@ -285,10 +334,16 @@ class CuiSession:
                 f"decimate の ratio は {_RATIO_MIN}~{_RATIO_MAX} の範囲で"
                 f"指定してください: {ratio}"
             )
-        self._intents[cls] = Intent(op="decimate", ifc_class=cls, ratio=ratio)
+        scope = self._parse_scope(args[2] if len(args) == 3 else None)
+        if scope is None:
+            return f"不明な指定です: {args[2]}({usage})"
+        self._intents[cls] = Intent(op="decimate", ifc_class=cls, ratio=ratio, scope=scope)
         count = self._element_counts[cls]
         percent = ratio * 100
-        return f"{cls} {count}要素を間引き(残{percent:.0f}%)対象に追加しました。"
+        return (
+            f"{cls} {count}要素を間引き(残{percent:.0f}%)対象に追加しました"
+            f"({_SCOPE_LABELS[scope]})。"
+        )
 
     def _command_keep(self, args: list[str]) -> str:
         if len(args) != 1:

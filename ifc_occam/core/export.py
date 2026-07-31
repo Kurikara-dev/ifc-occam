@@ -41,6 +41,7 @@ from ifc_occam.core.ops import Operation, resolve_effective, validate_operations
 from ifc_occam.core.paths import refers_to_same_file
 from ifc_occam.core.provenance import build_provenance_lines
 from ifc_occam.core.simplify import (
+    _SHARED_FALLBACK_MARKER,
     bbox_mesh,
     convex_hull_mesh,
     decimate_mesh,
@@ -518,7 +519,13 @@ def apply_operations(
     t0 = time.monotonic()
     simplified: list[str] = []
     skipped: list[SkippedItem] = list(delete_skipped)
-    processed_shared_maps: set[int] = set()
+    # map_key(int) -> 実際にその共有マップへ書き込んだ (method, ratio)。
+    # フェーズ最終レビューI-1/I-2: 値は「in-place書き換えが実際に成功した」
+    # ときだけ記録する(フォールバック時やsimplify失敗時は記録しない。I-2)。
+    # 既に記録済みの共有マップへ異なる(method, ratio)で到達した要素には
+    # 「先勝ちで無視された」ことを警告として可視化する(I-1。挙動そのもの=
+    # 先勝ちは変更しない)。
+    processed_shared_maps: dict[int, tuple[str | None, float | None]] = {}
 
     simplify_total = sum(1 for op in effective.values() if op.op == "simplify")
     simplify_done = 0
@@ -550,28 +557,38 @@ def apply_operations(
                 )
                 continue
 
+            cur_method = op.params.get("method")
+            cur_ratio = op.params.get("ratio")
+
+            shared_key = None
             if op.scope == "shared":
                 shared_key = _shared_map_key(element)
-                if shared_key is not None:
-                    if shared_key in processed_shared_maps:
-                        # 既にこのexport実行内で同じ共有マップを処理済み。
-                        # in-place編集の複合(二重適用)を避けるため再処理しないが、
-                        # この要素の幾何は共有マップ経由で変化済みなので simplified には含める。
-                        #
-                        # Final Review Fix4 (doc-only): この guard は「1要素が同じ共有マップを
-                        # 複数回踏む」場合の重複適用を防ぐが、対象を横断した"勝者"のルールも
-                        # ここで決まる。effective(gid→Operation) を反復する順序(Pythonの
-                        # dict挿入順=最初にそのgidへ有効操作が確定した順)で、異なる2つの
-                        # simplify操作(例: 別々のUIバッチ)がそれぞれ別gid経由で同じ共有マップを
-                        # 指す場合、最初にそのマップへ到達した操作のパラメータ(method/ratio等)が
-                        # 実際に書き込まれ、後続の操作は(このgidに対しては)何もせず simplified に
-                        # 積まれるだけになる。つまり「同じ共有マップに対する複数のsimplify操作」は
-                        # 後続が上書きされるのではなく、先行が勝ってそれ以降は無視される
-                        # (list全体のlast-wins原則である resolve_effective とは別次元の勝者決定)。
-                        # 現状は警告を出していないため、ユーザからは区別できない(既知の制約)。
-                        simplified.append(gid)
-                        continue
-                    processed_shared_maps.add(shared_key)
+                if shared_key is not None and shared_key in processed_shared_maps:
+                    # 既にこのexport実行内で同じ共有マップへ「実際の書き換え」が
+                    # 成功済み(フォールバックではない)。in-place編集の複合(二重
+                    # 適用)を避けるため再処理しないが、この要素の幾何は共有マップ
+                    # 経由で変化済みなので simplified には含める(従来どおり)。
+                    #
+                    # 対象を横断した"勝者"のルールは、effective(gid→Operation) を
+                    # 反復する順序(Pythonのdict挿入順=最初にそのgidへ有効操作が
+                    # 確定した順)で、最初にそのマップへ到達した操作のパラメータ
+                    # (method/ratio)が実際に書き込まれ、後続の操作は(このgidに
+                    # 対しては)何もせず simplified に積まれるだけになる。つまり
+                    # 「同じ共有マップに対する複数のsimplify操作」は後続が上書き
+                    # されるのではなく、先行が勝ってそれ以降は無視される(list全体
+                    # のlast-wins原則である resolve_effective とは別次元の勝者
+                    # 決定)。挙動そのもの(先勝ち)は変更しないが、異なる
+                    # (method, ratio) で到達した場合は無視されたことを警告で
+                    # 可視化する(フェーズ最終レビューI-1)。
+                    prev_method, prev_ratio = processed_shared_maps[shared_key]
+                    if (cur_method, cur_ratio) != (prev_method, prev_ratio):
+                        warnings.append(
+                            f"共有形状は先行の {prev_method} で処理済みのため、"
+                            f"この要素(GlobalId={gid})への {cur_method} は適用されません"
+                            "(共有波及の先勝ち)。"
+                        )
+                    simplified.append(gid)
+                    continue
 
             success, skip_reason, op_warnings = _apply_simplify(ifc_file, element, op, doomed_root_ids)
             warnings.extend(op_warnings)
@@ -580,6 +597,14 @@ def apply_operations(
                 warnings.append(f"簡略化をスキップしました(GlobalId={gid}): {skip_reason}")
             else:
                 simplified.append(gid)
+                if shared_key is not None and not any(
+                    _SHARED_FALLBACK_MARKER in w for w in op_warnings
+                ):
+                    # 共有マップの in-place 書き換えが実際に成功したときだけ
+                    # 「処理済み」にマークする(フェーズ最終レビューI-2)。
+                    # フォールバック(要素個別化)時は共有マップ自体は無変化のため
+                    # マークせず、同じマップを持つ他の兄弟に適用の機会を残す。
+                    processed_shared_maps[shared_key] = (cur_method, cur_ratio)
     finally:
         if use_batch:
             # unbatch は新しい file オブジェクトを返す(以降のステージは

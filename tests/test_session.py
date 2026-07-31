@@ -12,11 +12,15 @@ ifcopenshell へのアクセスは一切行わない(それらは repl.py / core
   - 同一クラスへの再指定は上書き(後勝ち)。keep は既存の操作指定の解除
     (=明示的な保持マーカーとして記録)として機能する。
   - to_operations(): Intent → core.ops.Operation。targets は scan.elements
-    (GlobalId列)由来、scope は常に "element"。
+    (GlobalId列)由来、bbox/hull/decimate の scope は intent.scope(既定
+    "shared")、delete/keep は従来どおり "element"
+    (docs/plans/2026-07-31-cui-shared-scope.md)。
   - render_intents()/render_ranking(): 主要な数値(要素数・推定Face数等)を含む。
 """
 
 from __future__ import annotations
+
+import pytest
 
 from ifc_occam.core.ops import Operation
 from ifc_occam.cui.session import CuiSession, Intent
@@ -535,6 +539,8 @@ def test_to_operations_delete_maps_to_delete_op_with_scan_elements_as_targets():
 
 
 def test_to_operations_bbox_maps_to_simplify_method_bbox():
+    """bbox は末尾にscopeキーワードを指定しなければ既定"shared"になる
+    (docs/plans/2026-07-31-cui-shared-scope.md)。"""
     scan = _basic_scan()
     session = CuiSession(scan)
     session.command("bbox IFCPLATE")
@@ -543,13 +549,14 @@ def test_to_operations_bbox_maps_to_simplify_method_bbox():
         Operation(
             op="simplify",
             targets=scan.elements["IFCPLATE"],
-            scope="element",
+            scope="shared",
             params={"method": "bbox"},
         )
     ]
 
 
 def test_to_operations_hull_maps_to_simplify_method_convex_hull():
+    """hull も既定"shared"(docs/plans/2026-07-31-cui-shared-scope.md)。"""
     scan = _basic_scan()
     session = CuiSession(scan)
     session.command("hull IFCMEMBER")
@@ -558,13 +565,14 @@ def test_to_operations_hull_maps_to_simplify_method_convex_hull():
         Operation(
             op="simplify",
             targets=scan.elements["IFCMEMBER"],
-            scope="element",
+            scope="shared",
             params={"method": "convex_hull"},
         )
     ]
 
 
 def test_to_operations_decimate_maps_to_simplify_method_decimate_with_ratio_param():
+    """decimate も既定"shared"(docs/plans/2026-07-31-cui-shared-scope.md)。"""
     scan = _basic_scan()
     session = CuiSession(scan)
     session.command("decimate IFCMEMBER 0.3")
@@ -573,7 +581,7 @@ def test_to_operations_decimate_maps_to_simplify_method_decimate_with_ratio_para
         Operation(
             op="simplify",
             targets=scan.elements["IFCMEMBER"],
-            scope="element",
+            scope="shared",
             params={"method": "decimate", "ratio": 0.3},
         )
     ]
@@ -587,14 +595,18 @@ def test_to_operations_keep_maps_to_keep_op():
     assert ops == [Operation(op="keep", targets=scan.elements["IFCWALL"], scope="element")]
 
 
-def test_to_operations_scope_is_always_element():
+def test_to_operations_scope_defaults_to_shared_for_simplify_and_element_for_delete_keep():
+    """delete/keep の Operation.scope は従来どおり"element"(意味を持たない)。
+    bbox/decimate(scopeキーワード省略)は既定"shared"になる
+    (docs/plans/2026-07-31-cui-shared-scope.md、旧
+    test_to_operations_scope_is_always_element を新仕様に更新)。"""
     session = CuiSession(_basic_scan())
     session.command("delete IFCWALL")
     session.command("bbox IFCPLATE")
     session.command("decimate IFCMEMBER 0.3")
     session.command("keep IFCWALLSTANDARDCASE")
     ops = session.to_operations()
-    assert all(op.scope == "element" for op in ops)
+    assert [op.scope for op in ops] == ["element", "shared", "shared", "element"]
 
 
 def test_to_operations_order_follows_intents_order():
@@ -659,3 +671,81 @@ def test_wrong_arg_count_for_decimate_extra_argument_returns_usage_error():
     msg = session.command("decimate IFCWALL 0.3 extra")
     assert isinstance(msg, str) and msg != ""
     assert session.intents() == []
+
+
+# --- 共有波及(scope)対応(docs/plans/2026-07-31-cui-shared-scope.md) ---
+
+
+@pytest.fixture
+def session() -> CuiSession:
+    """scope対応テスト用の標準スキャン。IFCWALLは2要素、IFCDOORも別途持つ
+    (test_intent_list_shows_scopeでbbox対象に使う)。"""
+    return CuiSession(
+        _scan(
+            stats=[
+                _stats("IFCWALL", element_count=2, expanded=20, unique=20, parametric=0),
+                _stats("IFCDOOR", element_count=4, expanded=40, unique=40, parametric=0),
+            ],
+            elements={
+                "IFCWALL": ["W0", "W1"],
+                "IFCDOOR": ["D0", "D1", "D2", "D3"],
+            },
+        )
+    )
+
+
+def test_simplify_commands_default_to_shared_scope(session):
+    """bbox/hull/decimate は既定で共有波及になり、メッセージにも明示される。"""
+    msg = session.command("bbox IfcWall")
+    assert msg == "IFCWALL 2要素をbbox軽量化対象に追加しました(共有波及)。"
+    ops = session.to_operations()
+    assert ops[0].scope == "shared"
+
+
+def test_element_keyword_opts_out_to_per_element(session):
+    """末尾の element キーワードで従来の個別化に切り替わる。"""
+    msg = session.command("decimate IfcWall 0.3 element")
+    assert msg == "IFCWALL 2要素を間引き(残30%)対象に追加しました(個別)。"
+    ops = session.to_operations()
+    assert ops[0].scope == "element"
+
+
+def test_element_keyword_is_case_insensitive(session):
+    """docstringが明記する大文字小文字不問を固定する(フェーズ最終レビューM-4、
+    レビュー時は手動確認のみだった)。`decimate <クラス> 0.1 ELEMENT` の
+    ような全大文字のscope指定も受理されること。"""
+    msg = session.command("decimate IfcWall 0.1 ELEMENT")
+    assert msg == "IFCWALL 2要素を間引き(残10%)対象に追加しました(個別)。"
+    ops = session.to_operations()
+    assert ops[0].scope == "element"
+
+
+def test_shared_keyword_is_accepted_as_explicit_default(session):
+    msg = session.command("hull IfcWall shared")
+    assert msg == "IFCWALL 2要素を凸包化対象に追加しました(共有波及)。"
+    assert session.to_operations()[0].scope == "shared"
+
+
+def test_unknown_scope_keyword_is_rejected(session):
+    msg = session.command("bbox IfcWall banana")
+    assert msg == "不明な指定です: banana(使い方: bbox <クラス名> [element|shared])"
+    assert session.intents() == []
+
+
+def test_delete_still_takes_exactly_one_argument(session):
+    """delete に scope の概念はない(連鎖は閉包計算の領域)。"""
+    assert session.command("delete IfcWall element") == "使い方: delete <クラス名>"
+
+
+def test_intent_list_shows_scope(session):
+    session.command("decimate IfcWall 0.1")
+    session.command("bbox IfcDoor element")
+    rendered = session.render_intents()
+    assert "間引き 0.1(共有波及)" in rendered
+    assert "bbox軽量化(個別)" in rendered
+
+
+def test_delete_and_keep_operations_keep_element_scope(session):
+    """delete/keep の Operation.scope は従来どおり "element" のまま(実質未使用)。"""
+    session.command("delete IfcWall")
+    assert session.to_operations()[0].scope == "element"
