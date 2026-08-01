@@ -836,8 +836,9 @@ def replace_representation(
 
 
 def _shared_element_group(ifc_file, gid: str) -> list:
-    """gid の要素が参照する形状(共有 RepresentationMap 含む)を使う要素の
-    entity リストを返す(gid自身を含む)。Body representationが無ければ空リスト。
+    """gid の要素が参照する形状(共有 RepresentationMap または直接共有の
+    IfcShapeRepresentation)を使う要素の entity リストを返す(gid自身を含む)。
+    Body representationが無ければ空リスト。
     count_shared_elements/get_shared_element_gids の共通の内部実装。"""
     element = ifc_file.by_guid(gid)
     body_rep = _find_body_shape_representation(element)
@@ -852,6 +853,16 @@ def _shared_element_group(ifc_file, gid: str) -> list:
                 ifc_file, mapped_representation
             )
         )
+
+    # 直接共有(IfcMappedItem 非経由): Body の IfcShapeRepresentation 自体が
+    # 複数の製品から参照されている場合も、書き戻し(replace_representation の
+    # 非 mapped 経路)は rep をその場で書き換えるため波及グループになる
+    # (フェーズ最終レビューI-3の carry-forward、2026-08-01)。
+    direct_users = list(
+        ifcopenshell.util.element.get_elements_by_representation(ifc_file, body_rep)
+    )
+    if len(direct_users) > 1:
+        return direct_users
 
     return [element]
 

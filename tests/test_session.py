@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 
 from ifc_occam.core.ops import Operation
-from ifc_occam.cui.session import CuiSession, Intent
+from ifc_occam.cui.session import CuiSession, Intent, _display_width
 from ifc_occam.scan.aggregate import ClassScanStats, ScanResult
 
 # --- テスト用ヘルパー ---
@@ -405,6 +405,32 @@ def test_render_intents_label_for_keep_is_japanese():
     rendered = session.render_intents()
     assert "保持" in rendered
     assert "keep" not in rendered
+
+
+def test_render_intents_operation_column_pads_by_display_width():
+    """操作列のパディングは表示セル幅(全角=2セル)基準で行うこと
+    (フェーズ最終レビューM-6)。「保持」(4セル)と「間引き 0.3(共有波及)」
+    (全角混じり・可変長)が並んでも、クラス列の開始セル位置が
+    ヘッダ含め全行で一致する。"""
+    session = CuiSession(_basic_scan())
+    session.command("keep IFCPLATE")
+    session.command("decimate IFCMEMBER 0.3")
+    session.command("decimate IFCWALL 0.15")
+    rendered = session.render_intents()
+    lines = rendered.splitlines()
+    # lines[0]="=== 操作リスト ===", lines[1]=ヘッダ, lines[2:]=データ行
+    header = lines[1]
+    rows = lines[2:]
+    assert len(rows) == 3
+
+    # クラス列の開始位置(表示セル数)= '#'列4 + 区切り2 + 操作列22 + 区切り2 = 30
+    # decimate IFCWALL 0.15 は「間引き 0.15(共有波及)」(21セル)で、20セル予算
+    # だと境界値(0.05/0.95)を含む2桁小数ratioで列がズレる不具合の再現行。
+    prefix_widths = {
+        _display_width(line[: line.index("IFC")]) for line in rows
+    }
+    assert prefix_widths == {30}
+    assert _display_width(header[: header.index("クラス")]) == 30
 
 
 # --- 8. rank / render_ranking ---

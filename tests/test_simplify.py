@@ -22,6 +22,7 @@ from tests.fixtures_ifc import (
     build_single_element_with_styled_item_ifc,
     build_two_elements_sharing_mapped_shape_ifc,
     build_two_elements_sharing_mapped_shape_with_transform_ifc,
+    build_two_elements_sharing_representation_directly_ifc,
 )
 
 
@@ -424,6 +425,17 @@ def test_get_shared_element_gids_returns_sibling_excluding_self():
 
     assert get_shared_element_gids(f, elem1.GlobalId) == [elem2.GlobalId]
     assert get_shared_element_gids(f, elem2.GlobalId) == [elem1.GlobalId]
+
+
+def test_get_shared_element_gids_covers_direct_sharing():
+    """IfcMappedItem を介さない直接共有(同一 IfcShapeRepresentation を
+    複数製品が直接参照)でも兄弟が返ること(フェーズ最終レビューI-3の
+    carry-forward)。書き戻しは rep をその場で書き換えるため、この構成も
+    実際に波及グループである。"""
+    f = build_two_elements_sharing_representation_directly_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    assert get_shared_element_gids(f, elem1.GlobalId) == [elem2.GlobalId]
+    assert count_shared_elements(f, elem1.GlobalId) == 2
 
 
 def test_get_shared_element_gids_empty_when_not_shared():

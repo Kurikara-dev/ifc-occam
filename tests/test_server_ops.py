@@ -309,7 +309,7 @@ def test_sharing_batch_before_ready_returns_409(client):
 def test_export_202_then_ready_with_result(client, monkeypatch):
     _load_and_wait(client)
 
-    def fake_apply(src_path, operations, output_path, consolidate=False):
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         return ExportReport(
             deleted=["G1"],
             simplified=["G3"],
@@ -342,7 +342,7 @@ def test_export_result_includes_stage_seconds(client, monkeypatch):
     """export_result に stage_seconds (既知のステージキー) が含まれること(phase4 Task5)。"""
     _load_and_wait(client)
 
-    def fake_apply(src_path, operations, output_path, consolidate=False):
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         return ExportReport(
             deleted=["G1"],
             simplified=["G3"],
@@ -382,7 +382,7 @@ def test_export_consolidate_defaults_false_and_is_forwarded(client, monkeypatch)
 
     received = {}
 
-    def fake_apply(src_path, operations, output_path, consolidate=False):
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         received["consolidate"] = consolidate
         return ExportReport(output_path=str(output_path))
 
@@ -399,7 +399,7 @@ def test_export_consolidate_false_is_forwarded(client, monkeypatch):
 
     received = {}
 
-    def fake_apply(src_path, operations, output_path, consolidate=False):
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         received["consolidate"] = consolidate
         return ExportReport(output_path=str(output_path))
 
@@ -409,6 +409,64 @@ def test_export_consolidate_false_is_forwarded(client, monkeypatch):
     assert resp.status_code == 202
     _wait_for_status(client, {"ready", "error"})
     assert received["consolidate"] is False
+
+
+def test_export_geometry_cleanup_defaults_gc_and_is_forwarded(client, monkeypatch):
+    """POST /api/export の geometry_cleanup は既定 "gc" で、apply_operations に
+    渡されること(GUI省メモリ書き出し、carry-forward Phase D)。"""
+    _load_and_wait(client)
+
+    received = {}
+
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
+        received["geometry_cleanup"] = geometry_cleanup
+        return ExportReport(output_path=str(output_path))
+
+    monkeypatch.setattr(app_module, "apply_operations", fake_apply)
+
+    resp = client.post("/api/export", json={"output_path": "out.ifc"})
+    assert resp.status_code == 202
+    _wait_for_status(client, {"ready", "error"})
+    assert received["geometry_cleanup"] == "gc"
+
+
+def test_export_geometry_cleanup_inline_is_forwarded(client, monkeypatch):
+    _load_and_wait(client)
+
+    received = {}
+
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
+        received["geometry_cleanup"] = geometry_cleanup
+        return ExportReport(output_path=str(output_path))
+
+    monkeypatch.setattr(app_module, "apply_operations", fake_apply)
+
+    resp = client.post(
+        "/api/export", json={"output_path": "out.ifc", "geometry_cleanup": "inline"}
+    )
+    assert resp.status_code == 202
+    _wait_for_status(client, {"ready", "error"})
+    assert received["geometry_cleanup"] == "inline"
+
+
+def test_export_geometry_cleanup_rejects_unknown_value(client, monkeypatch):
+    """"gc"/"inline" 以外は pydantic バリデーションで 422 になり、
+    apply_operations は一度も呼ばれない(export は開始されない)こと。"""
+    _load_and_wait(client)
+
+    called = {"count": 0}
+
+    def counting_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
+        called["count"] += 1
+        return ExportReport(output_path=str(output_path))
+
+    monkeypatch.setattr(app_module, "apply_operations", counting_apply)
+
+    resp = client.post(
+        "/api/export", json={"output_path": "out.ifc", "geometry_cleanup": "banana"}
+    )
+    assert resp.status_code == 422
+    assert called["count"] == 0
 
 
 def test_export_before_ready_returns_409(client):
@@ -421,7 +479,7 @@ def test_export_while_exporting_returns_409(client, monkeypatch):
 
     gate = threading.Event()
 
-    def slow_apply(src_path, operations, output_path, consolidate=False):
+    def slow_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         gate.wait(timeout=5.0)
         return ExportReport(output_path=str(output_path))
 
@@ -442,7 +500,7 @@ def test_export_failure_returns_to_ready_and_surfaces_error(client, monkeypatch)
     エラーを記録すること(Final Review Fix1)。復帰後は診断も再exportも可能なこと。"""
     _load_and_wait(client)
 
-    def boom_apply(src_path, operations, output_path, consolidate=False):
+    def boom_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         raise ValueError("boom: apply_operations failed")
 
     monkeypatch.setattr(app_module, "apply_operations", boom_apply)
@@ -460,7 +518,7 @@ def test_export_failure_returns_to_ready_and_surfaces_error(client, monkeypatch)
     assert diag_resp.status_code == 200
 
     # apply_operations を正常版に戻せば再exportは成功する
-    def fake_apply(src_path, operations, output_path, consolidate=False):
+    def fake_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         return ExportReport(output_path=str(output_path))
 
     monkeypatch.setattr(app_module, "apply_operations", fake_apply)
@@ -478,7 +536,7 @@ def test_load_while_exporting_returns_409(client, monkeypatch):
 
     gate = threading.Event()
 
-    def slow_apply(src_path, operations, output_path, consolidate=False):
+    def slow_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         gate.wait(timeout=5.0)
         return ExportReport(output_path=str(output_path))
 
@@ -499,7 +557,7 @@ def test_ops_while_exporting_returns_409(client, monkeypatch):
 
     gate = threading.Event()
 
-    def slow_apply(src_path, operations, output_path, consolidate=False):
+    def slow_apply(src_path, operations, output_path, consolidate=False, geometry_cleanup="gc"):
         gate.wait(timeout=5.0)
         return ExportReport(output_path=str(output_path))
 

@@ -34,6 +34,7 @@ Global Constraint: クラス名の突合は常に upper() で行う(スキャン
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 
 from ifc_occam.core.ops import Operation
@@ -61,6 +62,28 @@ _SET_OP_LABELS = {"delete": "削除", "bbox": "bbox軽量化", "hull": "凸包�
 
 #: simplify系コマンドの scope 表示ラベル(GUIの操作リストと同じ語彙)。
 _SCOPE_LABELS = {"shared": "共有波及", "element": "個別"}
+
+
+def _display_width(text: str) -> int:
+    """端末表示セル数。East Asian Width が F(Fullwidth)/W(Wide) の文字を
+    2セル、それ以外を1セルと数える。Python の format 幅指定はコードポイント数
+    でパディングするため、全角混じりの操作ラベル(「間引き 0.1(共有波及)」等)
+    と短いラベル(「保持」)が並ぶと列がズレる(フェーズ最終レビューM-6)。"""
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1 for ch in text
+    )
+
+
+def _pad_display(text: str, width: int) -> str:
+    """_display_width 基準で width セルまで右側に空白を詰める(左寄せ)。
+    超過時は切り詰めずそのまま返す(列境界は明示2スペース区切りが保証する —
+    render_intents/render_ranking 共通の既存方針)。"""
+    return text + " " * max(0, width - _display_width(text))
+
+
+def _rjust_display(text: str, width: int) -> str:
+    """_display_width 基準の右寄せ(ヘッダの数値列見出し用)。"""
+    return " " * max(0, width - _display_width(text)) + text
 
 
 @dataclass
@@ -224,13 +247,22 @@ class CuiSession:
             return "操作はまだありません。"
 
         # render_rankingと同じ理由(decimateラベルがratio埋め込みで可変長)で
-        # 列の間に明示的な2スペース区切りを入れる。
+        # 列の間に明示的な2スペース区切りを入れる。パディングは表示セル幅
+        # (_display_width、全角=2)基準 — format の :<20 はコードポイント数で
+        # 詰めるため全角混じりのラベルで列がズレる(フェーズ最終レビューM-6)。
+        # 操作列は22セル: 最長の通常ラベル「間引き 0.NN(共有波及)」が21セル、
+        # 3桁小数(例: 0.150)でも22セルに収まる(それ以上の桁は超過時
+        # 非切り詰めの既存方針に委ねる)。
         lines: list[str] = ["=== 操作リスト ==="]
-        lines.append(f"{'#':<4}  {'操作':<20}  {'クラス':<32}  {'要素数':>10}")
+        lines.append(
+            f"{'#':<4}  {_pad_display('操作', 22)}  {_pad_display('クラス', 32)}"
+            f"  {_rjust_display('要素数', 10)}"
+        )
         for i, intent in enumerate(self.intents(), start=1):
             count = self._element_counts.get(intent.ifc_class, 0)
             lines.append(
-                f"{i:<4}  {self._op_label(intent):<20}  {intent.ifc_class:<32}  {count:>10}"
+                f"{i:<4}  {_pad_display(self._op_label(intent), 22)}"
+                f"  {_pad_display(intent.ifc_class, 32)}  {count:>10}"
             )
         return "\n".join(lines)
 

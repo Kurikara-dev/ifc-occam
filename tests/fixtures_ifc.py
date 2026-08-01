@@ -135,6 +135,55 @@ def build_two_elements_sharing_mapped_shape_ifc() -> ifcopenshell.file:
     return f
 
 
+def build_two_elements_sharing_representation_directly_ifc() -> ifcopenshell.file:
+    """2要素が同じ IfcShapeRepresentation(三角形1枚)を IfcMappedItem を
+    介さず直接共有する合成IFC4を返す(実データでは稀な構成)。
+
+    replace_representation の非 mapped 経路は rep をその場で書き換えるため、
+    この構成では書き戻しが全共有要素へ波及する。dedup が無いと同じ rep へ
+    簡略化が要素数ぶん重ねがけされる(2026-08-01 実測——CUI共有波及フェーズ
+    最終レビュー I-3 の carry-forward)。座標・単位の設計意図は
+    build_two_elements_sharing_mapped_shape_ifc と同じ。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+    coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 1.0)],
+    )
+    tfs = f.create_entity(
+        "IfcTriangulatedFaceSet",
+        Coordinates=coord_list,
+        CoordIndex=[(1, 2, 3)],
+    )
+    shared_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=[tfs],
+    )
+    for name in ("Elem1", "Elem2"):
+        element = ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name=name
+        )
+        element.Representation = f.create_entity(
+            "IfcProductDefinitionShape", Representations=[shared_rep]
+        )
+        ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+    return f
+
+
 def build_three_elements_sharing_mapped_shape_ifc() -> ifcopenshell.file:
     """3要素が同じ IfcRepresentationMap(三角形1枚の最小形状)を共有する合成IFC4を
     返す。build_two_elements_sharing_mapped_shape_ifc の3要素版

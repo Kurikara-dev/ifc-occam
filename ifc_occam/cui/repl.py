@@ -501,7 +501,7 @@ def _run_text_apply(
     print(
         f"  内訳: 直接指定{plan.stats['seeds']}件 + 連鎖{plan.stats['cascade']}件"
         f" + 専有回収{plan.stats['swept']}件"
-        f"(うち関係レコードの連鎖削除{plan.stats['rels_dropped']}件を含む)"
+        f"(うち巻き添えで消える関係レコード{plan.stats['rels_dropped']}件を含む)"
     )
     print(
         "参照リスト修正候補(rel patch候補、実行時に「参照リスト修正」または"
@@ -595,7 +595,7 @@ def _shared_spillover_counts(
                 element = ifc_file.by_guid(gid)
             except RuntimeError:
                 continue
-            map_key = _shared_map_key(element)
+            map_key = _shared_map_key(ifc_file, element)
             if map_key is None or map_key in seen_maps:
                 continue
             seen_maps.add(map_key)
@@ -678,9 +678,9 @@ def _format_spillover_line(spillover: dict[str, int]) -> str:
 
     文言はフェーズ最終レビューM-1+I-3の裁定により「一緒に変わります」の断定を
     避け「対象になります」に緩めている(MappingTargetが逆変換不能な場合は
-    scope="element"へフォールバックし実際には変わらないことがあるため。また
-    IfcMappedItemを介さない直接共有はこの開示自体に乗らないため、「変わる」と
-    断定できない)。
+    scope="element"へフォールバックし実際には変わらないことがあるため。
+    直接共有(IfcMappedItem非経由)も2026-08-01から集計対象になったが、
+    フォールバックの可能性があるため文言は据え置き)。
     """
     total = sum(spillover.values())
     ordered = sorted(spillover.items(), key=lambda kv: -kv[1])

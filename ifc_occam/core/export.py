@@ -96,6 +96,16 @@ class ExportReport:
     stage_seconds: dict[str, float] = field(default_factory=dict)
 
 
+def _method_desc(method: str | None, ratio: float | None) -> str:
+    """先勝ち警告に使う操作表記。ratio を持つ操作(decimate)は ratio まで
+    示さないと、同一 method 同士の衝突時に「先行の decimate で処理済みのため
+    decimate は適用されません」となり何が無視されたのか読めない
+    (CUI共有波及フェーズ最終レビューの carry-forward)。"""
+    if ratio is not None:
+        return f"{method}(ratio={ratio})"
+    return str(method)
+
+
 def _safe_global_id(entity) -> str | None:
     """entity の GlobalId を取得する。既に破棄されたハンドル等は None を返す。"""
     try:
@@ -331,11 +341,23 @@ def _current_mesh(element) -> tuple[np.ndarray, np.ndarray]:
     return verts, faces
 
 
-def _shared_map_key(element) -> int | None:
-    """要素の Body が IfcMappedItem 経由で共有 IfcRepresentationMap を参照している場合、
-    そのマップの識別子(entity id)を返す。共有していない/Bodyが無ければ None。
+def _shared_map_key(ifc_file, element) -> int | None:
+    """要素の Body 形状が他要素と共有されている場合、その共有実体の識別子
+    (entity id)を返す。共有していない/Bodyが無ければ None。
 
-    scope="shared" の simplify で同じマップへの重複処理を防ぐための識別に使う。
+    scope="shared" の simplify で同じ共有実体への重複処理を防ぐための識別に使う。
+
+    - IfcMappedItem 経由: MappingSource(IfcRepresentationMap)の id。
+    - 直接共有(Body の IfcShapeRepresentation 自体が複数の製品から参照
+      されている場合): その rep の id。replace_representation の非 mapped
+      経路は rep をその場で書き換えるため mapped と同様に全共有要素へ波及
+      する——dedup しないと同じ rep に簡略化が要素数ぶん重ねがけされる
+      (直接共有2要素への shared simplify で二重適用を実測、2026-08-01。
+      フェーズ最終レビューI-3の carry-forward)。
+    - entity id 空間はファイル内で共通なので、マップ id と rep id が
+      衝突することはない。
+    - 専有(参照する製品が1つ)なら従来どおり None(processed_shared_maps
+      を太らせない)。
     """
     rep = getattr(element, "Representation", None)
     if rep is None:
@@ -345,6 +367,11 @@ def _shared_map_key(element) -> int | None:
             items = list(r.Items)
             if len(items) == 1 and items[0].is_a("IfcMappedItem"):
                 return items[0].MappingSource.id()
+            users = ifcopenshell.util.element.get_elements_by_representation(
+                ifc_file, r
+            )
+            if len(users) > 1:
+                return r.id()
             return None
     return None
 
@@ -562,7 +589,7 @@ def apply_operations(
 
             shared_key = None
             if op.scope == "shared":
-                shared_key = _shared_map_key(element)
+                shared_key = _shared_map_key(ifc_file, element)
                 if shared_key is not None and shared_key in processed_shared_maps:
                     # 既にこのexport実行内で同じ共有マップへ「実際の書き換え」が
                     # 成功済み(フォールバックではない)。in-place編集の複合(二重
@@ -583,8 +610,10 @@ def apply_operations(
                     prev_method, prev_ratio = processed_shared_maps[shared_key]
                     if (cur_method, cur_ratio) != (prev_method, prev_ratio):
                         warnings.append(
-                            f"共有形状は先行の {prev_method} で処理済みのため、"
-                            f"この要素(GlobalId={gid})への {cur_method} は適用されません"
+                            f"共有形状は先行の {_method_desc(prev_method, prev_ratio)} "
+                            "で処理済みのため、"
+                            f"この要素(GlobalId={gid})への "
+                            f"{_method_desc(cur_method, cur_ratio)} は適用されません"
                             "(共有波及の先勝ち)。"
                         )
                     simplified.append(gid)

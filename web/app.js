@@ -88,6 +88,7 @@ const exportManualPathRow = document.getElementById("export-manual-path-row");
 const exportPathInput = document.getElementById("export-path-input");
 const exportPathError = document.getElementById("export-path-error");
 const exportConsolidateCheckbox = document.getElementById("export-consolidate-checkbox");
+const exportInlineCleanupCheckbox = document.getElementById("export-inline-cleanup-checkbox");
 const exportButton = document.getElementById("export-button");
 const exportStatusLine = document.getElementById("export-status-line");
 const exportResult = document.getElementById("export-result");
@@ -1686,6 +1687,7 @@ function setExportInFlight(inFlight) {
   exportManualPathToggle.disabled = inFlight;
   exportPathInput.disabled = inFlight;
   exportConsolidateCheckbox.disabled = inFlight;
+  exportInlineCleanupCheckbox.disabled = inFlight;
   updateExportButtonDisabled();
 }
 
@@ -1813,7 +1815,7 @@ async function handleExportClick() {
   exportStatusLine.textContent = "出力中... (0.0秒)";
 
   try {
-    await startExport(outputPath, exportConsolidateCheckbox.checked);
+    await startExport(outputPath, exportConsolidateCheckbox.checked, exportInlineCleanupCheckbox.checked);
   } catch (err) {
     showError(String(err.message || err));
     setExportInFlight(false);

@@ -113,6 +113,7 @@ _OWNER_HISTORY_CLASS = "IFCOWNERHISTORY"
 _REL_PREFIX = "IFCREL"
 _PLA_CLASS = "IFCPRESENTATIONLAYERASSIGNMENT"
 _STYLED_ITEM_CLASS = "IFCSTYLEDITEM"
+_REL_DEFINES_BY_PROPERTIES_CLASS = "IFCRELDEFINESBYPROPERTIES"
 # I3(Important、フェーズ最終レビュー): `_generic_rel_candidates` は
 # クラス名が `_REL_PREFIX` で始まるレコードだけを patch 候補にする——kept
 # (dead でない)かつ非 `IfcRel*` のレコードが dead を参照していても、この
@@ -467,6 +468,128 @@ def _reap_dead_annotations(
         _sweep(graph, dead, anchor_edges)
 
 
+def _collect_rel_defines_edges(
+    graph: FullGraph, owner_history_code: int | None, rows: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """IFCRELDEFINESBYPROPERTIES 用: related はリスト、relating(pset)は
+    スカラーだが平坦参照列の**末尾**に来る(VOIDS/FILLS/AGGREGATES と逆順。
+    属性順は GlobalId, OwnerHistory, Name, Description, RelatedObjects,
+    RelatingPropertyDefinition で IFC2X3/IFC4 共通)ため
+    `_relating_and_related` は流用できない。(rel行, related_indptr,
+    related行の平坦配列) の CSR を返す。relating 自体は返さない——rel を
+    dead にした後の pset 回収は sweep の被参照カウントに任せるため、
+    ここで位置を知る必要がない。
+
+    末尾1参照(relating)を related に含めないことが肝: 含めると pset が
+    生きている限り「全滅」が成立せず、常に保守側に倒れてこのフェーズの
+    目的が果たせない。逆に IFC4 の IfcPropertySetDefinitionSet(relating が
+    複数 pset に展開される稀な形)では relating の一部を related と誤認
+    するが、pset は削除対象になり得ないクラスなので「全滅が成立しない=
+    刈らない」側にしか倒れない(保守側で安全)。
+
+    未解決(-1)参照を含む行と、OwnerHistory スキップ後に参照が2本未満の
+    壊れた行は防御的に読み飛ばす(=刈り取り対象にしない。ピン留め継続)。
+    rows は IFCRELDEFINESBYPROPERTIES の行数(製品数オーダー)に比例する
+    Python ループだが、`_collect_pair_edges`/`_collect_list_edges` と同じ
+    許容範囲(IFCRELAGGREGATES も製品数オーダー)。
+    """
+    rel_list: list[int] = []
+    related_flat: list[int] = []
+    related_lengths: list[int] = []
+    for row in rows.tolist():
+        start, end = int(graph.ref_indptr[row]), int(graph.ref_indptr[row + 1])
+        pos = start
+        if pos < end:
+            head = int(graph.ref_targets[pos])
+            if (
+                head != -1
+                and owner_history_code is not None
+                and int(graph.class_codes[head]) == owner_history_code
+            ):
+                pos += 1
+        # 残り = [RelatedObjects..., RelatingPropertyDefinition(末尾)]。
+        # related 1件以上 + relating 1件 = 最低2参照。
+        if end - pos < 2:
+            continue
+        related = graph.ref_targets[pos : end - 1]
+        if np.any(related == -1):
+            continue
+        rel_list.append(int(row))
+        related_lengths.append(int(related.size))
+        related_flat.extend(int(x) for x in related.tolist())
+    related_indptr = np.zeros(len(rel_list) + 1, dtype=np.int64)
+    if related_lengths:
+        related_indptr[1:] = np.cumsum(related_lengths)
+    return (
+        np.array(rel_list, dtype=np.int64),
+        related_indptr,
+        np.array(related_flat, dtype=np.int64),
+    )
+
+
+def _reap_empty_rel_defines(
+    graph: FullGraph,
+    dead: np.ndarray,
+    anchor_edges: np.ndarray,
+    owner_history_code: int | None,
+) -> None:
+    """RelatedObjects が全滅した IFCRELDEFINESBYPROPERTIES 自身を dead にし、
+    解放された RelatingPropertyDefinition(pset)の専有サブグラフ
+    (IfcPropertySet → IfcPropertySingleValue 等)を追加の sweep で回収する。
+
+    背景: 削除対象を参照する RelDefines は汎用 IFCREL* パッチで
+    RelatedObjects から死んだ id が抜かれるが、空になっても rel 自身は
+    kept のまま出力され、pset を掴み続けていた(donuts 全削除の実測で
+    912 pset + 922 value ≒ 残存 214KB の大半。full-open 削除は
+    root.remove_product が pset まで消すため、テキストモードだけが太る
+    差分だった)。
+
+    対象を IFCRELDEFINESBYPROPERTIES 完全一致に限定する理由: 「related
+    リストの後に relating スカラーが末尾」という属性配置に依存するため、
+    汎用の IFCREL* 前方一致には広げない(IfcRelAssignsToGroup 等は参照で
+    ない enum を挟む等、平坦参照列の解釈がクラスごとに異なる。誤解釈は
+    「生きている関係の破壊」側に倒れ得る)。IFCRELDEFINESBYTYPE は同
+    レイアウトだが full-open 側の挙動と突き合わせていないため対象外
+    (carry-forward)。
+
+    rel の in_degree によるピン留めは**しない**(当初設計から変更、
+    2026-08-01 の RED で判明): patch 段の規則3(除去で空リストになった
+    record は drop)が、related 全滅の rel を plan から見えないところで
+    どのみち落とすため、plan 段でピン留めしても出力に rel は残らず、
+    参照元だけが dangling になる(実測 0→1)。逆に plan 段で dead に
+    しておけば、参照元(正常な IFC には存在しないが、IfcRel* であれば)は
+    `_generic_rel_candidates` のパッチ候補に入り、連鎖全体が矛盾なく
+    消える。非 IfcRel* の参照元が dangling になり得る点は、モジュール
+    冒頭の不変条件コメント(b)と同じ理由(正常な IFC に RelDefines への
+    前方参照は無い)で許容し、網は既存の equivalence テストの未解決参照
+    チェックが担う。
+
+    dead を破壊的に更新する。不動点まで反復する(pset サブグラフの回収が
+    別の RelDefines の related を殺すことは正常データでは起きないが、
+    `_reap_dead_annotations` と同じ流儀の保険。コストは反復1回あたり
+    reduceat + sweep 1回)。
+    """
+    rows = _rows_of_class(graph, _REL_DEFINES_BY_PROPERTIES_CLASS)
+    if rows.size == 0:
+        return
+    rel_rows, related_indptr, related_flat = _collect_rel_defines_edges(
+        graph, owner_history_code, rows
+    )
+    if rel_rows.size == 0:
+        return
+    while True:
+        related_dead = dead[related_flat]
+        # 各 rel の related が全滅か。related_lengths >= 1 が
+        # _collect_rel_defines_edges で保証されているため reduceat の
+        # 空区間問題は起きない。
+        all_dead = np.logical_and.reduceat(related_dead, related_indptr[:-1])
+        newly = all_dead & ~dead[rel_rows]
+        if not newly.any():
+            break
+        dead[rel_rows[newly]] = True
+        _sweep(graph, dead, anchor_edges)
+
+
 def _generic_rel_candidates(graph: FullGraph, dead: np.ndarray) -> np.ndarray:
     """3特殊クラス以外の汎用 IFCREL* 規則: kept(dead でない)かつ class_table
     名が IFCREL で始まるレコードのうち、dead な record を1件以上参照する
@@ -538,6 +661,8 @@ def compute_text_delete_plan(
     anchor_edges = _annotation_anchor_edges(graph)
     _sweep(graph, dead, anchor_edges)
     _reap_dead_annotations(graph, dead, anchor_edges)
+    # RelatedObjects が全滅した RelDefines と専有 pset の回収(2026-08-01)
+    _reap_empty_rel_defines(graph, dead, anchor_edges, owner_history_code)
     swept_count = int(dead.sum()) - seeds_count - cascade_count
 
     # --- 汎用 IFCREL* パッチ候補(sweep 完了後の最終 dead 集合に対して) ---

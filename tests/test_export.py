@@ -29,6 +29,7 @@ from tests.fixtures_ifc import (
     build_three_elements_sharing_mapped_shape_ifc,
     build_three_translated_copies_ifc,
     build_two_elements_sharing_mapped_shape_ifc,
+    build_two_elements_sharing_representation_directly_ifc,
     build_wall_with_window_ifc,
 )
 
@@ -395,7 +396,8 @@ def test_shared_simplify_conflicting_ops_on_same_map_warns_about_first_come_wins
     assert set(report.simplified) == {gid1, gid2}
     expected_warning = (
         "共有形状は先行の bbox で処理済みのため、"
-        f"この要素(GlobalId={gid2})への decimate は適用されません(共有波及の先勝ち)。"
+        f"この要素(GlobalId={gid2})への decimate(ratio=0.1) は適用されません"
+        "(共有波及の先勝ち)。"
     )
     assert expected_warning in report.warnings
 
@@ -404,6 +406,142 @@ def test_shared_simplify_conflicting_ops_on_same_map_warns_about_first_come_wins
     # (挙動自体は従来どおり。警告で可視化されるようになった点のみが変化)。
     assert _n_triangles(reopened.by_guid(gid1)) == 12
     assert _n_triangles(reopened.by_guid(gid2)) == 12
+
+
+def test_shared_simplify_same_method_different_ratio_warning_shows_both_ratios(
+    tmp_path,
+):
+    """同一 method(decimate)で ratio だけ違う衝突では、警告に双方の ratio が
+    出ること(フェーズ最終レビュー carry-forward)。ratio なしでは
+    「先行の decimate で処理済みのため decimate は適用されません」となり
+    何が無視されたのか読めない。"""
+    f = build_two_elements_sharing_mapped_shape_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(
+            op="simplify",
+            targets=[gid1],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.1},
+        ),
+        Operation(
+            op="simplify",
+            targets=[gid2],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.5},
+        ),
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    expected_warning = (
+        "共有形状は先行の decimate(ratio=0.1) で処理済みのため、"
+        f"この要素(GlobalId={gid2})への decimate(ratio=0.5) は適用されません"
+        "(共有波及の先勝ち)。"
+    )
+    assert expected_warning in report.warnings
+
+
+def test_shared_simplify_same_method_same_ratio_stays_silent(tmp_path):
+    """同一 (method, ratio) での再到達は従来どおり無言(先勝ち警告を出さない)。
+    フェーズ最終レビュー時はレビュアの手動プローブのみだった挙動の番人化。"""
+    f = build_two_elements_sharing_mapped_shape_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(
+            op="simplify",
+            targets=[gid1],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.1},
+        ),
+        Operation(
+            op="simplify",
+            targets=[gid2],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.1},
+        ),
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert set(report.simplified) == {gid1, gid2}
+    assert [w for w in report.warnings if "先勝ち" in w] == []
+
+
+def test_directly_shared_rep_conflicting_ops_first_come_wins(tmp_path):
+    """IfcMappedItem を介さない直接共有でも、同一 rep への2操作は先勝ちで
+    dedup され、警告で可視化されること(フェーズ最終レビューI-3の
+    carry-forward)。dedup が無いと同じ rep に bbox→decimate が重ねがけ
+    され、無警告で幾何が二重に劣化する(2026-08-01 実測)。"""
+    f = build_two_elements_sharing_representation_directly_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(op="simplify", targets=[gid1], scope="shared", params={"method": "bbox"}),
+        Operation(
+            op="simplify",
+            targets=[gid2],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.1},
+        ),
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert set(report.simplified) == {gid1, gid2}
+    expected_warning = (
+        "共有形状は先行の bbox で処理済みのため、"
+        f"この要素(GlobalId={gid2})への decimate(ratio=0.1) は適用されません"
+        "(共有波及の先勝ち)。"
+    )
+    assert expected_warning in report.warnings
+
+    reopened = ifcopenshell.open(out_path)
+    # 先勝ち: 両要素とも bbox(12三角形)。decimate は重ねがけされていない。
+    assert _n_triangles(reopened.by_guid(gid1)) == 12
+    assert _n_triangles(reopened.by_guid(gid2)) == 12
+
+
+def test_exclusively_owned_rep_still_returns_no_shared_key(tmp_path):
+    """専有 rep(参照1本)の要素は従来どおり鍵 None(dedup 辞書を太らせず、
+    先勝ち警告も出ない)。直接共有フィクスチャの片側を専有化して確認する。"""
+    f = build_two_elements_sharing_representation_directly_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    # elem2 を専有の別 rep に付け替える(elem1 の rep は参照1本になる)
+    shared_rep = elem1.Representation.Representations[0]
+    coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (0.0, 2.0, 2.0)],
+    )
+    tfs = f.create_entity(
+        "IfcTriangulatedFaceSet", Coordinates=coord_list, CoordIndex=[(1, 2, 3)]
+    )
+    own_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=shared_rep.ContextOfItems,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=[tfs],
+    )
+    elem2.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[own_rep]
+    )
+
+    from ifc_occam.core.export import _shared_map_key
+
+    assert _shared_map_key(f, elem1) is None
+    assert _shared_map_key(f, elem2) is None
 
 
 # ---------------------------------------------------------------------------

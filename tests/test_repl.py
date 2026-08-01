@@ -1630,6 +1630,28 @@ def test_shared_spillover_counts_extra_excluded_removes_cascade_deleted_sibling(
     assert _shared_spillover_counts(f, ops, extra_excluded={elem2.GlobalId}) == {}
 
 
+def test_spillover_counts_include_directly_shared_sibling():
+    """直接共有の兄弟が確認2の波及開示に乗ること(フェーズ最終レビューI-3)。
+    従来は IfcMappedItem 経由の共有しか集計されず、「開示行が出ない=波及
+    が一切ない」とは限らなかった(testing-guide の旧注意点2)。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _shared_spillover_counts
+    from tests.fixtures_ifc import build_two_elements_sharing_representation_directly_ifc
+
+    f = build_two_elements_sharing_representation_directly_ifc()
+    elem1, _elem2 = f.by_type("IfcBuildingElementProxy")
+    ops = [
+        Operation(
+            op="simplify",
+            targets=[elem1.GlobalId],
+            scope="shared",
+            params={"method": "bbox"},
+        )
+    ]
+    spillover = _shared_spillover_counts(f, ops)
+    assert spillover == {"IfcBuildingElementProxy": 1}
+
+
 def test_confirm2_excludes_cascade_deleted_sibling_from_spillover_disclosure(
     tmp_path, capsys, monkeypatch
 ):

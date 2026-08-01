@@ -118,6 +118,10 @@
           <input id="export-consolidate-checkbox" type="checkbox" />
           重複形状を共有化して出力(フラット化されたモデル向け)
         </label>
+        <label id="export-inline-cleanup-label" style="display:block; font-size:12px; margin-bottom:6px;" title="一時ファイルと追加メモリを使わない代わりに、大きなモデルでは遅くなることがあります。メモリが足りずに出力が失敗するときに試してください。出力内容はどちらの方式でも同じです。">
+          <input id="export-inline-cleanup-checkbox" type="checkbox" />
+          省メモリ方式で書き出す(逐次ゴミ回収)
+        </label>
         <button id="export-button">出力</button>
         <div id="export-status-line"></div>
         <div id="export-result"></div>

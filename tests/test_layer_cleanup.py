@@ -364,6 +364,86 @@ def test_consolidate_transfers_item_level_layer_assignments_to_the_shared_item()
         assert assigned_ids == {shared_item.id()}
 
 
+# ---------------------------------------------------------------------------
+# carry-forward Phase D Task2: GUI出力チェックボックス(consolidate)経路の
+# レイヤー保存をプローブして固定(事前プローブの実測: 両構成とも dangling
+# ゼロ。consolidate.py の _transfer_layer_assignments 呼び出しが両ケースを
+# カバー済みと確認)。
+# ---------------------------------------------------------------------------
+
+
+def test_consolidate_preserves_rep_attached_layer_assignment(tmp_path):
+    """consolidate=True(重複形状の共有化)で、rep 直付けのレイヤー割当が
+    dangling にならず生き残ること(carry-forward「GUIのconsolidateレイヤー
+    未検証」の固定)。"""
+    from ifc_occam.core.export import apply_operations
+
+    f = build_three_translated_copies_ifc()
+    reps = [
+        e.Representation.Representations[0]
+        for e in f.by_type("IfcBuildingElementProxy")
+    ]
+    attach_layer_assignment(f, reps, name="レイヤーA")
+
+    src_path = tmp_path / "src.ifc"
+    f.write(str(src_path))
+    out_path = str(tmp_path / "out.ifc")
+    report = apply_operations(
+        str(src_path), [], out_path, consolidate=True, consolidate_min_benefit_ratio=0
+    )
+    assert report.consolidated_elements == 3
+
+    reopened = ifcopenshell.open(out_path)
+    plas = reopened.by_type("IfcPresentationLayerAssignment")
+    assert len(plas) == 1
+    assert plas[0].Name == "レイヤーA"
+    # rep直付けは body_rep 自体(Itemsだけが共有マップへの参照に差し替わる)を
+    # 指し続けるため、3件とも生き残る(実測)。
+    assert len(plas[0].AssignedItems) == 3
+    for item in plas[0].AssignedItems:
+        # 参照先が出力に実在する(dangling でない)ことを id 再解決で確認
+        assert reopened.by_id(item.id()) is not None
+        assert item.is_a() == "IfcShapeRepresentation"
+    assert unreachable_geometry(reopened) == {}
+
+
+def test_consolidate_transfers_item_attached_layer_assignment_through_apply_operations(tmp_path):
+    """item 直付けのレイヤー割当(consolidateで置き換えられる旧アイテムに
+    直接付いた形)。consolidate は置き換えで消える旧アイテムから、共有ソース側の
+    新アイテムへ所属を引き継ぐ(_transfer_layer_assignments、フェーズ最終レビュー
+    I-3 の実装が apply_operations 経由でも効いていることを実測で固定)。
+    引き継ぎ先は3要素とも同じ共有アイテム1件のため、SETの重複排除で
+    AssignedItems は1件に収束する(実測)。"""
+    from ifc_occam.core.export import apply_operations
+
+    f = build_three_translated_copies_ifc()
+    items = [
+        e.Representation.Representations[0].Items[0]
+        for e in f.by_type("IfcBuildingElementProxy")
+    ]
+    attach_layer_assignment(f, items, name="レイヤーB")
+
+    src_path = tmp_path / "src.ifc"
+    f.write(str(src_path))
+    out_path = str(tmp_path / "out.ifc")
+    report = apply_operations(
+        str(src_path), [], out_path, consolidate=True, consolidate_min_benefit_ratio=0
+    )
+    assert report.consolidated_elements == 3
+
+    reopened = ifcopenshell.open(out_path)
+    plas = reopened.by_type("IfcPresentationLayerAssignment")
+    assert len(plas) == 1
+    assert plas[0].Name == "レイヤーB"
+    assigned = list(plas[0].AssignedItems)
+    assert len(assigned) == 1
+    assert assigned[0].is_a() == "IfcTriangulatedFaceSet"
+    assert reopened.by_id(assigned[0].id()) is not None
+    shared_item = reopened.by_type("IfcRepresentationMap")[0].MappedRepresentation.Items[0]
+    assert assigned[0].id() == shared_item.id()
+    assert unreachable_geometry(reopened) == {}
+
+
 # --- 書き出し時GC経路(apply_operations 既定)の統合テスト ---
 
 

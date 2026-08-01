@@ -109,6 +109,10 @@ class SharingBatchRequest(BaseModel):
 class ExportRequest(BaseModel):
     output_path: str
     consolidate: bool = False
+    # 書き出し時のゴミ回収方式(export.apply_operations にそのまま渡す)。
+    # "gc"(既定)=一括GC(fat一時ファイル+約4.8倍メモリ)、"inline"=逐次
+    # (省メモリ。バッチ化済みだが大規模ではGCより遅いことがある)。
+    geometry_cleanup: Literal["gc", "inline"] = "gc"
 
 
 class PresetRuleModel(BaseModel):
@@ -168,9 +172,16 @@ def _run_export(
     operations: list[Operation],
     output_path: str,
     consolidate: bool = False,
+    geometry_cleanup: str = "gc",
 ) -> None:
     try:
-        report = apply_operations(src_path, operations, output_path, consolidate=consolidate)
+        report = apply_operations(
+            src_path,
+            operations,
+            output_path,
+            consolidate=consolidate,
+            geometry_cleanup=geometry_cleanup,
+        )
         state.set_export_result(
             {
                 "deleted": len(report.deleted),
@@ -473,7 +484,7 @@ def create_app(presets_path: str | Path | None = None, root: Path | None = None)
         src_path, operations = state.get_export_context()
         thread = threading.Thread(
             target=_run_export,
-            args=(state, src_path, operations, body.output_path, body.consolidate),
+            args=(state, src_path, operations, body.output_path, body.consolidate, body.geometry_cleanup),
             daemon=True,
         )
         thread.start()

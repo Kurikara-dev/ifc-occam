@@ -205,13 +205,19 @@ export async function fetchSharingBatch(gids) {
  * 操作リストを適用した新規IFCの出力を開始する(非同期、/api/statusでポーリング)。
  * @param {string} outputPath
  * @param {boolean} [consolidate=false] 重複形状を共有化して出力するか(既定false)。
+ * @param {boolean} [inlineCleanup=false] 省メモリ方式(逐次ゴミ回収)で書き出すか。
+ *   true で geometry_cleanup="inline"(既定はサーバ側と同じ "gc")。
  * @returns {Promise<{status: string}>}
  */
-export async function startExport(outputPath, consolidate = false) {
+export async function startExport(outputPath, consolidate = false, inlineCleanup = false) {
   const res = await fetch("/api/export", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ output_path: outputPath, consolidate }),
+    body: JSON.stringify({
+      output_path: outputPath,
+      consolidate,
+      geometry_cleanup: inlineCleanup ? "inline" : "gc",
+    }),
   });
   if (!res.ok) {
     const detail = await _safeDetail(res);
