@@ -28,6 +28,7 @@ from tests.fixtures_ifc import (
     build_ifc2x3_single_element_ifc,
     build_many_minimal_products_ifc,
     build_many_walls_with_openings_ifc,
+    build_n_translated_copies_ifc,
     build_three_elements_sharing_mapped_shape_ifc,
     build_three_translated_copies_ifc,
     build_two_elements_sharing_mapped_shape_ifc,
@@ -365,6 +366,34 @@ def test_shared_simplify_with_first_sibling_fallback_still_reaches_others(
 
 
 # ---------------------------------------------------------------------------
+# carry-forward Phase M(操作表記の統一、CF-A最終レビューM-1): 先勝ち警告に
+# 使う _method_desc を日本語主表記+英語併記にする。CUIの操作リスト
+# (session.py _op_label/_SET_OP_LABELS: bbox軽量化/凸包化/間引き)と同じ
+# 語彙に揃える(この警告文はGUI/CUI双方のexport経路から出るため)。
+# ---------------------------------------------------------------------------
+
+
+def test_method_desc_decimate_with_ratio_shows_japanese_label_and_ratio():
+    assert export_module._method_desc("decimate", 0.1) == "間引き(decimate, ratio=0.1)"
+
+
+def test_method_desc_bbox_without_ratio_shows_japanese_label():
+    assert export_module._method_desc("bbox", None) == "bbox軽量化(bbox)"
+
+
+def test_method_desc_convex_hull_without_ratio_shows_japanese_label():
+    assert export_module._method_desc("convex_hull", None) == "凸包化(convex_hull)"
+
+
+def test_method_desc_unknown_method_passes_through_unchanged():
+    """_METHOD_LABELS に日本語ラベルの無い未知のmethodは、従来どおり
+    英語表記のまま素通しする(防御。将来simplifyにmethodが増えても
+    ここでの分岐漏れがexportを止めない)。"""
+    assert export_module._method_desc("mystery", None) == "mystery"
+    assert export_module._method_desc("mystery", 0.3) == "mystery(ratio=0.3)"
+
+
+# ---------------------------------------------------------------------------
 # フェーズ最終レビューI-1: 同一共有マップへ異なるsimplify操作が到達したとき、
 # 先勝ちの挙動自体は変えず、無視された側に警告を出すこと
 # ---------------------------------------------------------------------------
@@ -398,8 +427,8 @@ def test_shared_simplify_conflicting_ops_on_same_map_warns_about_first_come_wins
 
     assert set(report.simplified) == {gid1, gid2}
     expected_warning = (
-        "共有形状は先行の bbox で処理済みのため、"
-        f"この要素(GlobalId={gid2})への decimate(ratio=0.1) は適用されません"
+        "共有形状は先行の bbox軽量化(bbox) で処理済みのため、"
+        f"この要素(GlobalId={gid2})への 間引き(decimate, ratio=0.1) は適用されません"
         "(共有波及の先勝ち)。"
     )
     assert expected_warning in report.warnings
@@ -442,8 +471,8 @@ def test_shared_simplify_same_method_different_ratio_warning_shows_both_ratios(
     report = apply_operations(src_path, ops, out_path)
 
     expected_warning = (
-        "共有形状は先行の decimate(ratio=0.1) で処理済みのため、"
-        f"この要素(GlobalId={gid2})への decimate(ratio=0.5) は適用されません"
+        "共有形状は先行の 間引き(decimate, ratio=0.1) で処理済みのため、"
+        f"この要素(GlobalId={gid2})への 間引き(decimate, ratio=0.5) は適用されません"
         "(共有波及の先勝ち)。"
     )
     assert expected_warning in report.warnings
@@ -504,8 +533,8 @@ def test_directly_shared_rep_conflicting_ops_first_come_wins(tmp_path):
 
     assert set(report.simplified) == {gid1, gid2}
     expected_warning = (
-        "共有形状は先行の bbox で処理済みのため、"
-        f"この要素(GlobalId={gid2})への decimate(ratio=0.1) は適用されません"
+        "共有形状は先行の bbox軽量化(bbox) で処理済みのため、"
+        f"この要素(GlobalId={gid2})への 間引き(decimate, ratio=0.1) は適用されません"
         "(共有波及の先勝ち)。"
     )
     assert expected_warning in report.warnings
@@ -618,8 +647,8 @@ def test_apply_operations_dedups_across_two_maps_sharing_one_mapped_representati
 
     assert set(report.simplified) == {gid1, gid2}
     expected_warning = (
-        "共有形状は先行の bbox で処理済みのため、"
-        f"この要素(GlobalId={gid2})への decimate(ratio=0.5) は適用されません"
+        "共有形状は先行の bbox軽量化(bbox) で処理済みのため、"
+        f"この要素(GlobalId={gid2})への 間引き(decimate, ratio=0.5) は適用されません"
         "(共有波及の先勝ち)。"
     )
     assert expected_warning in report.warnings
@@ -656,8 +685,8 @@ def test_apply_operations_dedups_hybrid_direct_and_mapped_share(tmp_path):
 
     assert set(report.simplified) == {gid1, gid2}
     expected_warning = (
-        "共有形状は先行の bbox で処理済みのため、"
-        f"この要素(GlobalId={gid2})への decimate(ratio=0.5) は適用されません"
+        "共有形状は先行の bbox軽量化(bbox) で処理済みのため、"
+        f"この要素(GlobalId={gid2})への 間引き(decimate, ratio=0.5) は適用されません"
         "(共有波及の先勝ち)。"
     )
     assert expected_warning in report.warnings
@@ -1623,3 +1652,63 @@ def test_inline_shared_simplify_over_batch_threshold_matches_gc_byte_for_byte(tm
     gc_hash = hashlib.sha256(Path(out_gc).read_bytes()).hexdigest()
     inline_hash = hashlib.sha256(Path(out_inline).read_bytes()).hexdigest()
     assert gc_hash == inline_hash
+
+
+# ---------------------------------------------------------------------------
+# carry-forward Phase L: consolidate=ON 出力の実行ごと非決定性(決定性の番人)。
+# フェーズ最終レビュー I-1(.superpowers/sdd/cfi-phase-final-review.md)の実測:
+# extract_model のマルチスレッドgeometry iteratorがshapes dictへの挿入順を
+# 実行ごとに変え、find_duplicatesのバケツ内代表選択がその順序に依存するため、
+# consolidateが「どの形状を共有先に選ぶか」が実行ごとに揺れてsha256が一致しない
+# (86件のIFCSHAPEREPRESENTATIONが別のIfcMappedItemを共有先に選ぶ、等価だが
+# 再現性がない)。
+# ---------------------------------------------------------------------------
+
+
+def test_consolidate_output_is_deterministic_across_reopened_runs_synthetic(tmp_path):
+    """同一入力・同一操作(consolidate=ON、simplifyなし)でapply_operationsを
+    毎回ファイルから開き直して2回実行すると、出力のsha256が一致すること。
+
+    build_n_translated_copies_ifcは各メンバーが自分専用のBody representation
+    (別entity)を持つ平行移動コピーで、抽出後は全員が1つの重複群に入る
+    (tests/test_consolidate.pyの選別ルールテストで使っているのと同じフィクスチャ)。
+    どのメンバーが共有先(代表)に選ばれるかはfind_duplicatesのバケツ内到着順に
+    依存するため、この構成自体がフェーズ最終レビューI-1の再現条件そのもの。
+    min_benefit_ratio=0でサイズ選別を無効化し、機構だけを見る。"""
+    import hashlib
+
+    f = build_n_translated_copies_ifc(n_members=30, n_verts=4)
+    src_path = _write_fixture(f, tmp_path)
+
+    hashes = []
+    for i in range(2):
+        out_path = str(tmp_path / f"out_{i}.ifc")
+        apply_operations(
+            src_path, [], out_path, consolidate=True, consolidate_min_benefit_ratio=0
+        )
+        hashes.append(hashlib.sha256(Path(out_path).read_bytes()).hexdigest())
+
+    assert hashes[0] == hashes[1]
+
+
+def test_consolidate_output_is_deterministic_across_reopened_runs_real_data(
+    small_ifc_path, tmp_path
+):
+    """small.ifc(実データ)でも同じ決定性を確認する(合成フィクスチャでは非決定性が
+    顕在化しない環境があり得るため、フェーズ最終レビューI-1が実際に反証した条件
+    ―real dataでのconsolidate=ON二重実行―を直接踏む)。small.ifcが無ければ
+    (conftestのskip設計に従い)スキップする。原本は読み取り専用: tmp_pathへ
+    コピーしたものに対して実行する。"""
+    import hashlib
+    import shutil
+
+    src_path = tmp_path / "small.ifc"
+    shutil.copy(small_ifc_path, src_path)
+
+    hashes = []
+    for i in range(2):
+        out_path = str(tmp_path / f"out_{i}.ifc")
+        apply_operations(str(src_path), [], out_path, consolidate=True)
+        hashes.append(hashlib.sha256(Path(out_path).read_bytes()).hexdigest())
+
+    assert hashes[0] == hashes[1]

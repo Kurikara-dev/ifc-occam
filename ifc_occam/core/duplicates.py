@@ -66,10 +66,19 @@ def _canonical_faces(faces: np.ndarray, order: np.ndarray) -> np.ndarray:
 def find_duplicates(
     shapes: dict[str, ShapeInfo], tol: float = 1e-6
 ) -> list[DuplicateGroup]:
-    """平行移動不変な重複形状検出。単独形状(バケツ内1件)は結果に含めない。"""
+    """平行移動不変な重複形状検出。単独形状(バケツ内1件)は結果に含めない。
+
+    carry-forward Phase L: shapes.items() をそのまま辞書順(=到着順)で走査すると、
+    extract_model のマルチスレッドgeometry iteratorがshapes dictへ書き込む順序が
+    実行ごとに変わるため、バケツ内メンバー順・group.shape_ids・代表(先頭)選択が
+    実行ごとに揺れ、consolidate側の共有先選択が非決定になる
+    (.superpowers/sdd/cfi-phase-final-review.md I-1で実測)。shape_id自体は
+    geometry.idに基づき実行間で安定しているため、sorted()でキーの昇順に固定する
+    だけで走査順序を決定的にできる(抽出の並列度=iteratorのスレッド数は変えない。
+    ここで直列化しているのはfind_duplicatesのバケツ構築であって抽出そのものではない)。"""
     buckets: dict[tuple, list[tuple[str, np.ndarray, np.ndarray]]] = {}
 
-    for shape_id, shape in shapes.items():
+    for shape_id, shape in sorted(shapes.items()):
         q, v_sorted, order = _canonical(shape, tol)
         key = (q.tobytes(), len(shape.vertices), len(shape.faces))
         faces_c = _canonical_faces(shape.faces, order)

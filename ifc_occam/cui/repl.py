@@ -125,12 +125,20 @@ _SIMPLIFY_PREVIEW_LABELS = {"bbox": "bbox軽量化", "convex_hull": "凸包化",
 
 _INTRO_HINT = "操作を入力してください (h でヘルプ):"
 
+# bbox/hull/decimate の各行は「日本語ラベル(内部method名)」の形で併記する
+# (carry-forward Phase M「操作表記の統一」、CF-A最終レビューM-1)。
+# _method_desc(export.py)が先勝ち警告に出す表記(例:「凸包化(convex_hull)」)
+# と同じ形にすることで、コマンド名(bbox/hull/decimate)↔警告文中の英語表記
+# (bbox/convex_hull/decimate)↔日本語ラベル(bbox軽量化/凸包化/間引き)の
+# 対応をhelpだけで読み取れるようにする(旧文面はコマンド名とhull以外の
+# method名が一致するため気付きにくいが、hullだけmethod名がconvex_hullに
+# 変わり対応が読み取れなかった)。
 _HELP_TEXT = """\
 === コマンド一覧 ===
   delete <クラス名>             クラス全要素を削除対象に追加する
-  bbox <クラス名> [element|shared]     クラス全要素をbbox軽量化対象に追加する(既定: 共有波及)
-  hull <クラス名> [element|shared]     クラス全要素を凸包化対象に追加する(既定: 共有波及)
-  decimate <クラス名> <ratio> [element|shared]   クラス全要素を間引き対象に追加する(ratio: 0.05-0.95、既定: 共有波及)
+  bbox <クラス名> [element|shared]     クラス全要素をbbox軽量化(bbox)対象に追加する(既定: 共有波及)
+  hull <クラス名> [element|shared]     クラス全要素を凸包化(convex_hull)対象に追加する(既定: 共有波及)
+  decimate <クラス名> <ratio> [element|shared]   クラス全要素を間引き(decimate)対象に追加する(ratio: 0.05-0.95、既定: 共有波及)
   keep <クラス名>               操作指定を解除し、保持対象として明示する
   undo [番号]                  操作リストから1件取り消す(番号省略時は list の最終行を取り消し)
   list                         現在の操作リストを表示する

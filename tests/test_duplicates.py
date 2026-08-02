@@ -72,3 +72,23 @@ def test_different_triangulation_not_grouped():
     }
     groups = find_duplicates(shapes)
     assert groups == []
+
+
+def test_find_duplicates_is_insertion_order_independent():
+    """shapes dict の挿入順(マルチスレッド geom iterator の到着順)を逆転させても
+    グループ構成・グループ内のメンバー順・グループの並びが完全一致することを
+    固定する(CF-L: consolidate の共有先選択の決定化の単体番人。統合番人
+    (test_export.py の sha256 一致、実データで110秒級)の軽量な一次防衛線)。"""
+    shapes = {
+        "a": _shape("a"),
+        "b": _shape("b", offset=(100, 0, 0)),
+        "x": _shape("x", scale=3.0),
+        "y": _shape("y", scale=3.0, offset=(0, 0, 70)),
+        "solo": _shape("solo", scale=5.0),
+    }
+    items = list(shapes.items())
+    forward = find_duplicates(dict(items))
+    backward = find_duplicates(dict(reversed(items)))
+    assert [(g.shape_ids, g.triangle_count, g.savable_triangles) for g in forward] == [
+        (g.shape_ids, g.triangle_count, g.savable_triangles) for g in backward
+    ]

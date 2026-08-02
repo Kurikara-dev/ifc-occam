@@ -87,14 +87,37 @@ class ExportReport:
     stage_seconds: dict[str, float] = field(default_factory=dict)
 
 
+#: method(core.ops Operation.params["method"]の値) → 日本語主表記。
+#: CUIの語彙(session.py _SET_OP_LABELS/_op_label、repl.py
+#: _SIMPLIFY_PREVIEW_LABELS)と同じ訳語(bbox軽量化/凸包化/間引き)に揃える
+#: (carry-forward Phase M「操作表記の統一」、CF-A最終レビューM-1: 同一操作の
+#: 表記がCUI操作リスト/この先勝ち警告/GUI操作リストの3系統で並存していた)。
+#: 独自の訳語を増やさないため、ここに無いmethodは日本語化せず素通しする。
+_METHOD_LABELS = {"bbox": "bbox軽量化", "convex_hull": "凸包化", "decimate": "間引き"}
+
+
 def _method_desc(method: str | None, ratio: float | None) -> str:
-    """先勝ち警告に使う操作表記。ratio を持つ操作(decimate)は ratio まで
-    示さないと、同一 method 同士の衝突時に「先行の decimate で処理済みのため
-    decimate は適用されません」となり何が無視されたのか読めない
-    (CUI共有波及フェーズ最終レビューの carry-forward)。"""
+    """先勝ち警告に使う操作表記。日本語主表記+英語併記(例: `間引き(decimate,
+    ratio=0.1)`)にする(carry-forward Phase M。この警告文はGUI/CUI双方の
+    export経路から出るため、ここ1箇所の変更で両UIの警告語彙が揃う)。
+
+    ratio を持つ操作(decimate)は ratio まで示さないと、同一 method 同士の
+    衝突時に「先行の間引き(decimate)で処理済みのため間引き(decimate)は
+    適用されません」となり何が無視されたのか読めない
+    (CUI共有波及フェーズ最終レビューの carry-forward)。
+
+    _METHOD_LABELS に無い未知の method は日本語ラベルを持たないため、
+    従来どおり英語表記のまま素通しする(防御。将来 simplify に新しい
+    method が増えても、ここでの分岐漏れがexportを止めない)。
+    """
+    label = _METHOD_LABELS.get(method)
+    if label is None:
+        if ratio is not None:
+            return f"{method}(ratio={ratio})"
+        return str(method)
     if ratio is not None:
-        return f"{method}(ratio={ratio})"
-    return str(method)
+        return f"{label}({method}, ratio={ratio})"
+    return f"{label}({method})"
 
 
 def _safe_global_id(entity) -> str | None:
