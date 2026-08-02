@@ -7,6 +7,13 @@ dependencies = ["ifcopenshell", "numpy", "fastapi", "uvicorn", "scipy", "fast-si
 [project.optional-dependencies]
 dev = ["pytest", "httpx", "pyinstaller"]
 
+# flat-layoutの自動探索は web/ と packaging/ をトップレベルパッケージと誤認して
+# ビルドを拒否する(クリーン環境の pip install -e . で発覚、CI初回失敗の原因)。
+# 配布パッケージは ifc_occam のみ。web/ は WEB_DIR 経由でソースから配信、
+# packaging/ は PyInstaller 専用。
+[tool.setuptools.packages.find]
+include = ["ifc_occam*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m \"not slow\""
