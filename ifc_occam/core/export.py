@@ -347,7 +347,14 @@ def _shared_map_key(ifc_file, element) -> int | None:
 
     scope="shared" の simplify で同じ共有実体への重複処理を防ぐための識別に使う。
 
-    - IfcMappedItem 経由: MappingSource(IfcRepresentationMap)の id。
+    - IfcMappedItem 経由: MappingSource.MappedRepresentation(実際に書き換わる
+      共有rep)の id。マップのidではなくrepのidを鍵にするのは、(a) 複数の
+      RepresentationMapが同一MappedRepresentationを共有する構成、(b) 同じrepを
+      直接参照する要素とmapped経由の要素が混在するハイブリッド構成、のどちらでも
+      鍵が分裂して二重適用が残るため(CF-C最終レビューI-1、既存欠陥と実証済み。
+      shared書き戻しの実体はMappedRepresentationのin-place差し替えであり、
+      書き換わる実体こそが正しいdedupの単位)。in-place書き換えでrepのidは
+      変わらないため、処理後も鍵は安定する。
     - 直接共有(Body の IfcShapeRepresentation 自体が複数の製品から参照
       されている場合): その rep の id。replace_representation の非 mapped
       経路は rep をその場で書き換えるため mapped と同様に全共有要素へ波及
@@ -357,7 +364,9 @@ def _shared_map_key(ifc_file, element) -> int | None:
     - entity id 空間はファイル内で共通なので、マップ id と rep id が
       衝突することはない。
     - 専有(参照する製品が1つ)なら従来どおり None(processed_shared_maps
-      を太らせない)。
+      を太らせない)。ただしこれは直接共有分岐の話で、mapped 分岐は参照製品数を
+      数えず常に鍵を返す(マップ経由は書き戻しが常に共有実体へ向かうため。
+      Phase G 最終レビューM-2)。
     """
     rep = getattr(element, "Representation", None)
     if rep is None:
@@ -366,7 +375,7 @@ def _shared_map_key(ifc_file, element) -> int | None:
         if r.RepresentationIdentifier == "Body":
             items = list(r.Items)
             if len(items) == 1 and items[0].is_a("IfcMappedItem"):
-                return items[0].MappingSource.id()
+                return items[0].MappingSource.MappedRepresentation.id()
             users = ifcopenshell.util.element.get_elements_by_representation(
                 ifc_file, r
             )

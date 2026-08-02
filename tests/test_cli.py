@@ -69,7 +69,7 @@ def test_find_free_port_skips_occupied_port():
 def test_cui_subcommand_calls_run_cui_with_parsed_args(monkeypatch):
     captured = {}
 
-    def _fake_run_cui(path, *, output=None, scan_only=False, text=False):
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False, inline_cleanup=False):
         captured["path"] = path
         captured["output"] = output
         captured["scan_only"] = scan_only
@@ -84,7 +84,7 @@ def test_cui_subcommand_calls_run_cui_with_parsed_args(monkeypatch):
 def test_cui_subcommand_defaults_output_none_and_scan_only_false(monkeypatch):
     captured = {}
 
-    def _fake_run_cui(path, *, output=None, scan_only=False, text=False):
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False, inline_cleanup=False):
         captured["path"] = path
         captured["output"] = output
         captured["scan_only"] = scan_only
@@ -102,7 +102,7 @@ def test_cui_subcommand_forwards_text_flag_to_run_cui(monkeypatch):
     は無変更のまま同時に渡ることも確認する。"""
     captured = {}
 
-    def _fake_run_cui(path, *, output=None, scan_only=False, text=False):
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False, inline_cleanup=False):
         captured["path"] = path
         captured["output"] = output
         captured["scan_only"] = scan_only
@@ -113,6 +113,37 @@ def test_cui_subcommand_forwards_text_flag_to_run_cui(monkeypatch):
     main(["cui", "model.ifc", "--text"])
 
     assert captured == {"path": "model.ifc", "output": None, "scan_only": False, "text": True}
+
+
+def test_cui_subcommand_forwards_inline_cleanup_flag_to_run_cui(monkeypatch):
+    """--inline-cleanup フラグが run_cui(= repl.run)の inline_cleanup= に
+    渡ること(carry-forward Phase E)。他フラグの既定値も同時に確認する。"""
+    captured = {}
+
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False, inline_cleanup=False):
+        captured["path"] = path
+        captured["text"] = text
+        captured["inline_cleanup"] = inline_cleanup
+
+    monkeypatch.setattr(cli, "run_cui", _fake_run_cui)
+
+    main(["cui", "model.ifc", "--inline-cleanup"])
+
+    assert captured == {"path": "model.ifc", "text": False, "inline_cleanup": True}
+
+
+def test_cui_subcommand_defaults_inline_cleanup_false(monkeypatch):
+    """--inline-cleanup 未指定なら inline_cleanup=False が渡ること。"""
+    captured = {}
+
+    def _fake_run_cui(path, *, output=None, scan_only=False, text=False, inline_cleanup=False):
+        captured["inline_cleanup"] = inline_cleanup
+
+    monkeypatch.setattr(cli, "run_cui", _fake_run_cui)
+
+    main(["cui", "model.ifc"])
+
+    assert captured == {"inline_cleanup": False}
 
 
 def test_cui_scan_only_on_real_small_ifc_prints_ranking_via_cli_main(small_ifc_path, capsys):
@@ -177,3 +208,15 @@ def test_entry_subcommands_stay_in_sync_with_the_parser(capsys):
     match = re.search(r"\{([a-z,]+)\}", help_text)
     assert match is not None, f"ヘルプにサブコマンド一覧が見つからない: {help_text!r}"
     assert set(match.group(1).split(",")) == set(cli._ENTRY_SUBCOMMANDS)
+
+
+def test_cui_help_discloses_inline_cleanup_has_no_effect_in_text_mode(capsys):
+    """--inline-cleanup のhelp文言が「テキストモードでは効果なし」を開示している
+    こと(監督者裁定3: 実行時警告を出さない代わりにhelpで開示する)。"""
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(["cui", "--help"])
+    out = capsys.readouterr().out
+    assert "--inline-cleanup" in out
+    assert "テキストモードでは効果なし" in out

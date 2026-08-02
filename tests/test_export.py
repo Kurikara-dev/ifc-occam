@@ -23,6 +23,7 @@ from ifc_occam.core.export import (
 )
 from ifc_occam.core.ops import Operation
 from tests.fixtures_ifc import (
+    build_hybrid_direct_and_mapped_share_ifc,
     build_ifc2x3_single_element_ifc,
     build_many_minimal_products_ifc,
     build_many_walls_with_openings_ifc,
@@ -30,6 +31,7 @@ from tests.fixtures_ifc import (
     build_three_translated_copies_ifc,
     build_two_elements_sharing_mapped_shape_ifc,
     build_two_elements_sharing_representation_directly_ifc,
+    build_two_maps_sharing_mapped_representation_ifc,
     build_wall_with_window_ifc,
 )
 
@@ -542,6 +544,126 @@ def test_exclusively_owned_rep_still_returns_no_shared_key(tmp_path):
 
     assert _shared_map_key(f, elem1) is None
     assert _shared_map_key(f, elem2) is None
+
+
+# ---------------------------------------------------------------------------
+# CF-G Task1: _shared_map_key の鍵をMappedRepresentationのidに統一する
+# (CF-C最終レビューI-1: マップidを鍵にすると複数マップ共有・ハイブリッド
+# 構成で鍵が分裂し、二重適用が残る)
+# ---------------------------------------------------------------------------
+
+
+def test_shared_map_key_unifies_two_maps_sharing_one_mapped_representation():
+    """別々のIfcRepresentationMap経由で同一MappedRepresentationを共有する2要素の
+    鍵が一致すること(CF-C最終レビューI-1: マップidを鍵にすると分裂し、
+    同じrepがマップの数だけ書き換えられる=二重適用)。鍵は「実際に書き換わる
+    rep」= MappingSource.MappedRepresentation の id。"""
+    from ifc_occam.core.export import _shared_map_key
+
+    f = build_two_maps_sharing_mapped_representation_ifc()
+    e1 = f.by_type("IfcWall")[0]
+    e2 = f.by_type("IfcColumn")[0]
+    k1 = _shared_map_key(f, e1)
+    k2 = _shared_map_key(f, e2)
+    assert k1 is not None
+    assert k1 == k2
+    mapped_rep = (
+        e1.Representation.Representations[0].Items[0].MappingSource.MappedRepresentation
+    )
+    assert k1 == mapped_rep.id()
+
+
+def test_shared_map_key_unifies_hybrid_direct_and_mapped_reference():
+    """同一のIfcShapeRepresentationを直接参照する要素とIfcMappedItem経由で
+    参照する要素の鍵が一致すること(ハイブリッド構成。直接側はrep自体のid、
+    mapped側もMappedRepresentation=同じrepのidになる)。"""
+    from ifc_occam.core.export import _shared_map_key
+
+    f = build_hybrid_direct_and_mapped_share_ifc()
+    direct_elem = f.by_type("IfcWall")[0]
+    mapped_elem = f.by_type("IfcColumn")[0]
+    k_direct = _shared_map_key(f, direct_elem)
+    k_mapped = _shared_map_key(f, mapped_elem)
+    assert k_direct is not None
+    assert k_direct == k_mapped
+
+
+def test_apply_operations_dedups_across_two_maps_sharing_one_mapped_representation(
+    tmp_path,
+):
+    """2つのマップ経由で同一repを共有する2クラスへ異パラメータのsimplifyを
+    適用したとき、鍵統一により後続が先勝ちdedupに掛かり、(i) 先勝ち警告が
+    1件出る、(ii) 両要素とも simplified に積まれる、(iii) repのItemsは先行
+    パラメータの結果1回分だけになっている、ことを固定する(修正前は両方が
+    別鍵で実際に書き換わり警告0件のまま二重適用だった)。"""
+    f = build_two_maps_sharing_mapped_representation_ifc()
+    elem1 = f.by_type("IfcWall")[0]
+    elem2 = f.by_type("IfcColumn")[0]
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(op="simplify", targets=[gid1], scope="shared", params={"method": "bbox"}),
+        Operation(
+            op="simplify",
+            targets=[gid2],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.5},
+        ),
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert set(report.simplified) == {gid1, gid2}
+    expected_warning = (
+        "共有形状は先行の bbox で処理済みのため、"
+        f"この要素(GlobalId={gid2})への decimate(ratio=0.5) は適用されません"
+        "(共有波及の先勝ち)。"
+    )
+    assert expected_warning in report.warnings
+
+    reopened = ifcopenshell.open(out_path)
+    # 先勝ち: 両要素ともbbox(12三角形)。decimateは重ねがけされていない
+    # (二重適用の不在こそが本丸——鍵統一前は別鍵で警告0件のまま両方が
+    # 実際に書き換わっていた)。
+    assert _n_triangles(reopened.by_guid(gid1)) == 12
+    assert _n_triangles(reopened.by_guid(gid2)) == 12
+
+
+def test_apply_operations_dedups_hybrid_direct_and_mapped_share(tmp_path):
+    """直接参照+mapped参照のハイブリッド構成でも同様に先勝ちdedupが効く
+    ことを固定する(修正前は直接側=repのid、mapped側=マップidで鍵が分裂)。"""
+    f = build_hybrid_direct_and_mapped_share_ifc()
+    elem1 = f.by_type("IfcWall")[0]
+    elem2 = f.by_type("IfcColumn")[0]
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+
+    ops = [
+        Operation(op="simplify", targets=[gid1], scope="shared", params={"method": "bbox"}),
+        Operation(
+            op="simplify",
+            targets=[gid2],
+            scope="shared",
+            params={"method": "decimate", "ratio": 0.5},
+        ),
+    ]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert set(report.simplified) == {gid1, gid2}
+    expected_warning = (
+        "共有形状は先行の bbox で処理済みのため、"
+        f"この要素(GlobalId={gid2})への decimate(ratio=0.5) は適用されません"
+        "(共有波及の先勝ち)。"
+    )
+    assert expected_warning in report.warnings
+
+    reopened = ifcopenshell.open(out_path)
+    assert _n_triangles(reopened.by_guid(gid1)) == 12
+    assert _n_triangles(reopened.by_guid(gid2)) == 12
 
 
 # ---------------------------------------------------------------------------

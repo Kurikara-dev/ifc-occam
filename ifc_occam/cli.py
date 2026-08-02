@@ -116,6 +116,11 @@ def main(argv: list[str] | None = None) -> None:
         "--text", action="store_true",
         help="delete のみの操作ならテキストモード(フルオープン不要)を提案する",
     )
+    cui_parser.add_argument(
+        "--inline-cleanup", action="store_true",
+        help="省メモリ方式で書き出す(逐次ゴミ回収)。既定の書き出し時一括ゴミ回収(GC)が"
+             "使う大きな一時メモリを避ける。 テキストモードでは効果なし",
+    )
 
     args = parser.parse_args(argv)
 
@@ -127,10 +132,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "serve":
         _serve(port=args.port, open_browser=not args.no_browser)
     elif args.command == "cui":
-        # --text は docs/plans/2026-07-25-cui-phase3.md Task5 で追加した新フラグ。
-        # output/scan_only と同じく値に関わらず常に渡す(3フラグを対称に扱う)。
+        # --text は docs/plans/2026-07-25-cui-phase3.md、--inline-cleanup は
+        # carry-forward Phase E で追加したフラグ。output/scan_only と同じく
+        # 値に関わらず常に渡す(4フラグを対称に扱う)。
         run_cui(
-            args.path, output=args.output, scan_only=args.scan_only, text=args.text
+            args.path, output=args.output, scan_only=args.scan_only, text=args.text,
+            inline_cleanup=args.inline_cleanup,
         )
 
 

@@ -142,7 +142,8 @@ _HELP_TEXT = """\
 
 
 def run(
-    path: str, *, output: str | None = None, scan_only: bool = False, text: bool = False
+    path: str, *, output: str | None = None, scan_only: bool = False, text: bool = False,
+    inline_cleanup: bool = False,
 ) -> None:
     """CUI対話ループのエントリポイント(cui-design.md §6)。
 
@@ -152,6 +153,12 @@ def run(
     `text`(CUI Phase3 Task5、CLI `--text`)は apply 確認フローに割り込む
     テキストモード提案の発動条件の一部として `_run_apply` にそのまま渡す
     (モジュールdocstring参照)。
+
+    `inline_cleanup`(carry-forward Phase E、CLI `--inline-cleanup`)はフル
+    オープン経路の書き出し方式(`apply_operations` の `geometry_cleanup`)を
+    "inline"(逐次ゴミ回収、省メモリ)に切り替えるフラグで、`_run_apply` に
+    そのまま渡す。テキストモード経路は `apply_operations` を通らないため
+    効果を持たない。
     """
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -188,7 +195,8 @@ def run(
                 continue
             if verb == "apply":
                 if _run_apply(
-                    scan, session, path, output, text=text, already_written=file_written
+                    scan, session, path, output, text=text,
+                    inline_cleanup=inline_cleanup, already_written=file_written,
                 ):
                     file_written = True
                 continue
@@ -291,6 +299,7 @@ def _run_apply(
     output: str | None,
     *,
     text: bool = False,
+    inline_cleanup: bool = False,
     already_written: bool = False,
 ) -> bool:
     """`apply` コマンドの一連処理(cui-design.md §6 手順1-3、1b、
@@ -410,6 +419,10 @@ def _run_apply(
         output_path,
         progress=_make_progress_printer(),
         source_name=Path(path).name,
+        # carry-forward Phase E: GUIの_run_exportと同じく常に明示的に渡す
+        # (既定値の暗黙依存を作らない)。"inline"は簡略化のたびに旧形状を
+        # 逐次回収する省メモリ方式(GUIチェックボックスと同じもの)。
+        geometry_cleanup="inline" if inline_cleanup else "gc",
     )
     del ifc_file_to_apply
     _print_report(report)

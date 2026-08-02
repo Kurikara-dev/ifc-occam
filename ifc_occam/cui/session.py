@@ -203,15 +203,22 @@ class CuiSession:
             # decimateラベル(ratio埋め込みで可変長)が想定の列幅を超えても、
             # 幅指定のpadding(overflow時は無視される)だけに頼らず次の列との
             # 境界が必ず視認できるようにする。
+            # ヘッダは表示セル幅(_display_width、全角=2)基準でパディングする
+            # (render_intentsと同じ理由 — formatの幅指定はコードポイント数で
+            # 詰めるため全角見出しがASCIIのデータ列と最大31セルズレていた。
+            # CF-A最終レビューM-2)。見出しがデータ列幅を超える2列は列ごと
+            # 拡幅した(推定Face数(共有統合)=22セル、パラメトリック件数=18セル)。
             lines.append(
-                f"{'#':<4}  {'クラス名':<32}  {'要素数':>10}  {'推定Face数(展開)':>18}"
-                f"  {'推定Face数(共有統合)':>20}  {'パラメトリック件数':>12}  {'寄与率':>8}"
+                f"{'#':<4}  {_pad_display('クラス名', 32)}  {_rjust_display('要素数', 10)}"
+                f"  {_rjust_display('推定Face数(展開)', 18)}"
+                f"  {_rjust_display('推定Face数(共有統合)', 22)}"
+                f"  {_rjust_display('パラメトリック件数', 18)}  {_rjust_display('寄与率', 8)}"
             )
             for i, s in enumerate(scan.stats, start=1):
                 share = (s.est_faces_expanded / total_expanded * 100) if total_expanded else 0.0
                 lines.append(
                     f"{i:<4}  {s.ifc_class:<32}  {s.element_count:>10}  {s.est_faces_expanded:>18}"
-                    f"  {s.est_faces_unique:>20}  {s.parametric_count:>12}  {share:>7.1f}%"
+                    f"  {s.est_faces_unique:>22}  {s.parametric_count:>18}  {share:>7.1f}%"
                 )
 
         lines.extend(self._render_proxy_name_breakdown(scan.proxy_names))

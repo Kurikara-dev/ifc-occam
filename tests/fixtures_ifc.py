@@ -371,6 +371,183 @@ def build_two_elements_sharing_mapped_shape_with_transform_ifc() -> ifcopenshell
     return f
 
 
+def build_two_maps_sharing_mapped_representation_ifc() -> ifcopenshell.file:
+    """クラスの異なる2要素(IfcWall/IfcColumn)が、別々の IfcRepresentationMap
+    (M1/M2)経由で同一の IfcShapeRepresentation(MappedRepresentation R)を共有する
+    合成IFC4を返す。両要素の MappingTarget はいずれも恒等変換(simplify.py:815の
+    恒等分岐に確実に乗せ、shared簡略化がRをin-placeで書き換える経路を通す)。
+
+    CF-C最終レビューI-1で実証されたハイブリッド鍵分裂の再現用: マップidを鍵に
+    すると M1/M2 は別idのため鍵が分裂し、同じRが要素数ぶん重ねがけされる。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 1.0)],
+    )
+    tfs = f.create_entity(
+        "IfcTriangulatedFaceSet",
+        Coordinates=coord_list,
+        CoordIndex=[(1, 2, 3)],
+    )
+    mapped_representation = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=[tfs],
+    )
+    identity = f.create_entity(
+        "IfcAxis2Placement3D",
+        Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+    )
+    # M1 と M2 は別々の IfcRepresentationMap だが、いずれも同じ
+    # mapped_representation(R)を指す。
+    rep_map_1 = f.create_entity(
+        "IfcRepresentationMap",
+        MappingOrigin=identity,
+        MappedRepresentation=mapped_representation,
+    )
+    rep_map_2 = f.create_entity(
+        "IfcRepresentationMap",
+        MappingOrigin=identity,
+        MappedRepresentation=mapped_representation,
+    )
+
+    for ifc_class, name, rep_map in (
+        ("IfcWall", "Wall1", rep_map_1),
+        ("IfcColumn", "Column1", rep_map_2),
+    ):
+        element = ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class=ifc_class, name=name
+        )
+        mapped_item = f.create_entity(
+            "IfcMappedItem",
+            MappingSource=rep_map,
+            MappingTarget=f.create_entity(
+                "IfcCartesianTransformationOperator3D",
+                Axis1=None,
+                Axis2=None,
+                LocalOrigin=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+                Scale=None,
+                Axis3=None,
+            ),
+        )
+        body_rep = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body_ctx,
+            RepresentationIdentifier="Body",
+            RepresentationType="MappedRepresentation",
+            Items=[mapped_item],
+        )
+        element.Representation = f.create_entity(
+            "IfcProductDefinitionShape", Representations=[body_rep]
+        )
+        ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
+def build_hybrid_direct_and_mapped_share_ifc() -> ifcopenshell.file:
+    """クラスの異なる2要素のうち、一方(IfcWall)は Body で共有rep Rを直接参照し、
+    もう一方(IfcColumn)は IfcMappedItem+IfcRepresentationMap M 経由で同じ Rを
+    参照する合成IFC4を返す(ハイブリッド構成)。mapped側の MappingTarget は恒等
+    変換(shared簡略化がRをin-placeで書き換える経路を通す)。
+
+    CF-C最終レビューI-1で実証されたハイブリッド鍵分裂の再現用: 直接側は鍵=Rの
+    id、mapped側は(修正前は)鍵=Mのidとなり分裂し、同じRが二重に書き換わる。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 1.0)],
+    )
+    tfs = f.create_entity(
+        "IfcTriangulatedFaceSet",
+        Coordinates=coord_list,
+        CoordIndex=[(1, 2, 3)],
+    )
+    shared_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=[tfs],
+    )
+
+    # 直接側: IfcWall が shared_rep をそのまま Body として参照する。
+    direct_elem = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcWall", name="Wall1"
+    )
+    direct_elem.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[shared_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=direct_elem)
+
+    # mapped側: IfcColumn が IfcRepresentationMap M 経由で同じ shared_rep を参照する。
+    identity = f.create_entity(
+        "IfcAxis2Placement3D",
+        Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+    )
+    rep_map = f.create_entity(
+        "IfcRepresentationMap",
+        MappingOrigin=identity,
+        MappedRepresentation=shared_rep,
+    )
+    mapped_item = f.create_entity(
+        "IfcMappedItem",
+        MappingSource=rep_map,
+        MappingTarget=f.create_entity(
+            "IfcCartesianTransformationOperator3D",
+            Axis1=None,
+            Axis2=None,
+            LocalOrigin=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+            Scale=None,
+            Axis3=None,
+        ),
+    )
+    mapped_elem = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcColumn", name="Column1"
+    )
+    mapped_body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="MappedRepresentation",
+        Items=[mapped_item],
+    )
+    mapped_elem.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[mapped_body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=mapped_elem)
+
+    return f
+
+
 def build_millimeter_single_element_ifc() -> ifcopenshell.file:
     """ミリメートル単位(IFC4)の最小合成ファイルを返す(要素1つ、Body representation は空)。
 
@@ -1284,6 +1461,80 @@ def build_single_element_with_wrapped_child_styled_brep_ifc(
     ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
 
     return f
+
+
+def build_two_elements_with_shared_type_ifc():
+    """要素2件(IfcPipeSegment)が同じ型(IfcPipeSegmentType、RepresentationMaps
+    を1つ持つ)を共有し、単一の IFCRELDEFINESBYTYPE で束ねられる合成IFC4を返す。
+
+    carry-forward Phase F の事前調査(.superpowers/sdd/cff-probe-report.md
+    Fact2)で確認した「1型に RepresentationMap がある」構成(実データで支配的、
+    Fact4: small.ifc の IFC*TYPE系1,360件は1型1relの1:1が典型)を再現する。
+    full-open(`type.unassign_type`)は related 全滅時に空になった
+    IFCRELDEFINESBYTYPE 自身は消すが、RelatingType(型本体)と
+    RepresentationMaps は積極的には消さない(psetの`remove_pset`とは非対称)。
+
+    戻り値: (f, type_obj, elements)。elements は [IfcPipeSegment, IfcPipeSegment]。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 1.0)],
+    )
+    tfs = f.create_entity(
+        "IfcTriangulatedFaceSet",
+        Coordinates=coord_list,
+        CoordIndex=[(1, 2, 3)],
+    )
+    mapped_representation = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Tessellation",
+        Items=[tfs],
+    )
+    identity = f.create_entity(
+        "IfcAxis2Placement3D",
+        Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+    )
+    rep_map = f.create_entity(
+        "IfcRepresentationMap",
+        MappingOrigin=identity,
+        MappedRepresentation=mapped_representation,
+    )
+
+    type_obj = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcPipeSegmentType", name="PST1"
+    )
+    type_obj.RepresentationMaps = [rep_map]
+
+    elements = [
+        ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class="IfcPipeSegment", name=f"Pipe{i}"
+        )
+        for i in range(2)
+    ]
+    ifcopenshell.api.run(
+        "type.assign_type",
+        f,
+        related_objects=elements,
+        relating_type=type_obj,
+        should_map_representations=True,
+    )
+
+    return f, type_obj, elements
 
 
 def attach_layer_assignment(f, targets, name: str = "レイヤーA"):

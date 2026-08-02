@@ -102,6 +102,8 @@ Simplification commands propagate across shared geometry by default — reducing
 
 `--scan-only` prints the ranking and exits, which is the fast way to size up a model you have never seen.
 
+`--inline-cleanup` writes the output in a low-memory mode: instead of the default one-shot garbage collection at write time, which temporarily needs several times the model's size in RAM, old geometry is reclaimed piece by piece as each shape is simplified. It is the same switch as the GUI's 省メモリ checkbox. It keeps the same elements, geometry and GlobalIds, though it does not reclaim quite as thoroughly as the one-shot GC — with many simplifications the output can end up a few percent larger — and it has no effect in text mode, which never opens the model in the first place.
+
 ### Text mode: for models you cannot open
 
 Some models are not merely large but hostile to element-by-element editing. On one real family of models, `ifcopenshell`'s per-element deletion measured **~22 seconds per element** — 456 elements would have taken 2.8 hours — while a comparable model deleted at 110–140 ms per element. Text mode exists for those cases, and for models too big to open at all.
@@ -125,11 +127,11 @@ The mode is offered only for delete-only operation sets — bounding boxes, hull
 Numbers below are measured, not estimated.
 
 - **Full open costs ~14× the file size in RAM.** Beyond about 2 GB the CUI warns you; past that you want text mode.
-- **Text mode's reference-graph scan costs ~4.8× the file size in RAM.** So a 6.5 GB model would need roughly 31 GB of peak memory, and **text mode has not yet been validated at that size** — diagnosis (`--scan-only`) has: a 6.5 GB model scanned in 455 seconds. Reducing this is the next piece of planned work.
+- **Text mode's reference-graph scan costs ~1.6× the file size in RAM** after the intermediate-array reduction (1.63× measured at 1.2 GB; 1.40× on a 21.5 MB model with fewer references per record — the factor grows with reference density; the old implementation cost 4.79× on that same 21.5 MB model). **Text mode is now validated at 6.5 GB end to end**: deleting every element of a 6.5 GB model finished in 27.4 minutes on a 32 GB machine — reference-graph scan 608 s at 11.4 MB/s, 135.6 million records removed, output reopens cleanly with zero unresolved references, source file untouched (SHA-256 verified). One honest caveat: that model is relationship-light (a single element class, almost no relationship records), so the relationship-patching stage has not been exercised at that scale — models dense with relationship records will spend more time in the planning stage.
 - **Text mode is delete-only.**
 - **Text mode can leave a small residue.** Two structural approximations remain — cycles among dead records are not reclaimed, and relationship records queued for patching are counted as alive — so the record count is not guaranteed to match the full-open path. In practice, after the annotation-pinning and residue-reclamation fixes, a re-measurement on a 380,000-record model produced the same record count on both paths: a 0-record difference (it was +0.24% before the fixes). An `IfcPresentationLayerWithStyle` assignment is the remaining known case that still pins deleted geometry. Surviving elements and geometry match the full-open path exactly.
 - **Text mode's cascade equivalence is verified on synthetic models, not real ones.** The real model available for testing contains no openings or fillings at all, so the voids-and-fillings and aggregation cascades are pinned by purpose-built fixtures instead. Both agree exactly with the full-open path; neither has met a real building model.
-- **Simplify cleanup runs as a write-time sweep.** Exports that simplified geometry write a temporary `.gc-tmp` "fat" file next to the output — roughly the same size as the *input* model, not the (often much smaller) output — and briefly need roughly **4.8× the fat file's size in RAM** for the reference-graph scan that removes the replaced geometry. Measured on a 305 MB model (456 elements): the sweep itself took about 2 minutes (119.9 s); a 20-element probe on the same model measured 79.8 s, so the cost depends only weakly on element count. If a run is killed mid-sweep, the `.gc-tmp` file can be left behind next to the output; it is safe to delete.
+- **Simplify cleanup runs as a write-time sweep.** Exports that simplified geometry write a temporary `.gc-tmp` "fat" file next to the output — roughly the same size as the *input* model, not the (often much smaller) output — and briefly need roughly **1.6× the fat file's size in RAM** for the reference-graph scan that removes the replaced geometry (the same scan as text mode's; it used to cost ~4.8×). Measured on a 305 MB model (456 elements): the sweep itself took about 2 minutes (119.9 s); a 20-element probe on the same model measured 79.8 s, so the cost depends only weakly on element count. If a run is killed mid-sweep, the `.gc-tmp` file can be left behind next to the output; it is safe to delete.
 - **No release binaries yet**, and no CI.
 
 ## Disclaimer
@@ -142,7 +144,7 @@ This software is provided under the MIT License's "AS IS" terms, with no warrant
 
 ## Status
 
-The GUI covers its intended feature set. The CUI covers scanning, class-level operations, provenance stamping, and text-level deletion. The largest models in the intended range are not yet validated end to end — see [Limits](#limits-and-known-gaps).
+The GUI covers its intended feature set. The CUI covers scanning, class-level operations, provenance stamping, and text-level deletion, and text mode is validated end to end up to a 6.5 GB model — see [Limits](#limits-and-known-gaps) for what remains open.
 
 ## More documentation
 

@@ -51,6 +51,18 @@ Pythonオブジェクトを1件ずつ持たない)を使う。`class_table`/`cla
 (aggregate.pyのraw_id_to_full_index dict撤去、docs/plans/2026-07-25-cui-phase3.md
 Task 1 の明示指定と同じ理由づけ)。
 
+**Phase H(carry-forward)省メモリ化**: `ids_buf`(id列)/`flat_refs_buf`
+(refs列)は値域の関係でint64(`"q"`)のままだが、`class_code_buf`(クラス
+コード。種類数のみに比例し有界)と`ref_len_buf`(1レコードのrefs件数。
+2^31を超えない)は`"i"`(int32)に縮小し、ステージング段のメモリを削減する。
+`array.array`からnumpy配列への変換も4本まとめてではなく1本ずつ行い、変換
+直後に元の`array.array`を`del`する(小さい3本を先に処理し、最大の
+`flat_refs_buf`を最後に処理することで、変換中に新旧2本のm長配列が同時に
+生き続ける期間を作らない)。tracemalloc実測では、この節の最適化と後述の
+並べ替え・解決段の最適化を合わせてピークメモリが旧実装の約29%まで縮小した
+(21.5MBモデル: 約103MB→約30MB=1.40×。1.2GBモデルでは1.63×——係数は
+参照密度とともに上がる)。
+
 ## ids整列への並べ替え(ファイル記述順 → id昇順)とCSRの再構成
 
 reader.iter_recordsはファイル中の記述順でレコードを返すが、`ids`(および
@@ -62,6 +74,20 @@ reader.iter_recordsはファイル中の記述順でレコードを返すが、`
 ベクトル化して求め、`flat_refs_raw[src_positions]` の1回のfancy indexingで
 CSR全体を並べ替える(要素ごとのPythonループを避ける)。
 
+**Phase H**: 旧実装は`row_of_pos`(新フラット位置→新行番号、m長)と
+`within_row`(行内相対位置、m長)を明示的に実体化してから
+`old_row_starts[row_of_pos] + within_row`で`src_positions`を組んでいたが、
+これはm長のint64中間配列を2本余分に抱える。新実装は「各新行の(元の開始位置
+− 新しい開始位置)」という行数(n長)のオフセット配列を`np.repeat`で
+m長に展開し、そこに`np.arange(total_refs)`を足すだけで同じ`src_positions`
+を得る——被repeat配列とその引き算はn長で軽く、m長で同時に生きるのは
+`src_positions`と`arange`加算時のみになる(数学的同値性: 旧コードの
+`src_positions[k] = old_row_starts[row_of_pos[k]] + (k - ref_indptr[row_of_pos[k]])`
+に対し、`repeat(old_row_starts - ref_indptr[:-1])[k]`は
+`old_row_starts[row_of_pos[k]] - ref_indptr[row_of_pos[k]]`と等しく、これに
+`+k`を加えた新コードの式は旧式と同一)。読みやすさのためにこのm長中間変数
+を復活させてはならない。
+
 参照解決(生のid→`ids`上のindex)は aggregate.py `_build_graph`
 (L266-269付近。タスクブリーフは「L250-253付近」と引用しているが、これは
 `_build_graph`内でrefsを重複除去する箇所であり、実際にsearchsorted+clamp+
@@ -70,6 +96,17 @@ CSR全体を並べ替える(要素ごとのPythonループを避ける)。
 searchsorted + clamp + 等値チェックのミスガードパターンを使う:
 `searchsorted` で挿入位置を求め、`ids`の範囲外にclampしてから実際にその
 位置の値が一致するかを確認する(一致しなければ解決不能=-1)。
+
+**Phase H**: 旧実装は`resolved`(searchsortedの生の返り値)と
+`resolved_clamped`(範囲外をclamp済み)の2本のm長int64配列を同時に持って
+いたが、先に`in_range = resolved < n`(m長だがbool=1byte/要素)を取ってから
+`np.minimum(resolved, n - 1, out=resolved)`でin-place clampする——これで
+実質1.125本分(int64 1本+bool 1本)まで圧縮する。なお`in_range`をclamp後に
+取ると判定は常に真になり無意味化するが、範囲外参照(searchsortedがnを返すのは
+最大idより大きい値のときのみ)は後段の等値チェックが独立に弾くため、最終出力は
+どちらの順序でも同一(Phase Hレビューで数学的に確認)。現在の順序は防御の
+二重化として選んだもので、正しさの必須条件ではない。また
+`flat_targets_raw`/`valid`/`resolved`は使用後即座に`del`し、逐次解放する。
 """
 
 from __future__ import annotations
@@ -114,8 +151,12 @@ def scan_full_graph(path: str | Path) -> FullGraph:
     含まない)。
     """
     ids_buf: array = array("q")  # 各レコードのid(ファイル記述順)
-    class_code_buf: array = array("q")  # 各レコードのクラスコード(ファイル記述順)
-    ref_len_buf: array = array("q")  # 各レコードのrefs件数(ファイル記述順)
+    # class_code_buf/ref_len_buf は "i"(int32)に縮小(Phase H 省メモリ化)。
+    # クラスコードはクラス種類数(有界・実データで数百程度)の範囲、1レコード
+    # あたりのrefs件数も2^31を超えることはなく、いずれもint32で十分。
+    # ステージング段でint64の半分のメモリで足りる分を毎回節約する。
+    class_code_buf: array = array("i")  # 各レコードのクラスコード(ファイル記述順)
+    ref_len_buf: array = array("i")  # 各レコードのrefs件数(ファイル記述順)
     flat_refs_buf: array = array("q")  # 全レコードのrefsを連結した生id列(ファイル記述順)
 
     class_table: list[str] = []
@@ -144,14 +185,25 @@ def scan_full_graph(path: str | Path) -> FullGraph:
 
     n = len(ids_buf)
 
+    # numpy変換は1本ずつ行い、変換元の array.array を直後にdelして二重持ちの
+    # 期間を最小化する(Phase H 省メモリ化)。flat_refs_buf はm長(全参照数)で
+    # 最大のバッファなので、小さい3本(いずれもn長)を先に変換・delしてから
+    # 最後に変換・delする——変換中に「新旧2本のm長配列」が同時に生きる期間を
+    # 作らないための順序。
     ids_unsorted = np.array(ids_buf, dtype=np.int64)
+    del ids_buf
     class_codes_unsorted = np.array(class_code_buf, dtype=np.int32)
+    del class_code_buf
     ref_lengths_unsorted = np.array(ref_len_buf, dtype=np.int64)
+    del ref_len_buf
     flat_refs_raw = np.array(flat_refs_buf, dtype=np.int64)
+    del flat_refs_buf
 
     order = np.argsort(ids_unsorted, kind="stable")
     ids = ids_unsorted[order]
+    del ids_unsorted
     class_codes = class_codes_unsorted[order]
+    del class_codes_unsorted
     ref_lengths = ref_lengths_unsorted[order]
 
     # ファイル記述順でのCSR開始位置(元の各行がflat_refs_raw中のどこから
@@ -159,27 +211,49 @@ def scan_full_graph(path: str | Path) -> FullGraph:
     # 「新しい行番号 → 元の開始位置」が求まる。
     orig_indptr = np.zeros(n + 1, dtype=np.int64)
     orig_indptr[1:] = np.cumsum(ref_lengths_unsorted)
+    del ref_lengths_unsorted
 
     ref_indptr = np.zeros(n + 1, dtype=np.int64)
     ref_indptr[1:] = np.cumsum(ref_lengths)
     total_refs = int(ref_indptr[-1])
 
-    # 可変長の行をPythonループ無しで並べ替える(モジュールdocstring参照):
-    # 新フラット配列の各位置がどの新行に属すかを row_of_pos で求め、行内での
-    # 相対位置(within_row)と元の開始位置(old_row_starts)を足すことで、
-    # 元のflat_refs_raw上の絶対位置(src_positions)を1回のベクトル演算で得る。
-    row_of_pos = np.repeat(np.arange(n, dtype=np.int64), ref_lengths)
-    within_row = np.arange(total_refs, dtype=np.int64) - ref_indptr[row_of_pos]
+    # 可変長の行をPythonループ無しで並べ替える(モジュールdocstring参照。
+    # Phase H: row_of_pos/within_row のm長中間2本を実体化しない版)。
+    # 各新行の「元の開始位置 − 新しい開始位置」のオフセットを行ごとに繰り返し、
+    # 位置番号(arange)に足すことで、元flat配列上の絶対位置を直接得る。
+    # 数学的同値性: 旧コードの
+    #   src_positions[k] = old_row_starts[row_of_pos[k]] + (k - ref_indptr[row_of_pos[k]])
+    # に対し、新コードは
+    #   repeat(old_row_starts - ref_indptr[:-1])[k]
+    #     = old_row_starts[row_of_pos[k]] - ref_indptr[row_of_pos[k]]
+    # であり、そこに +k を加えれば同一の式になる。
+    # 被repeat配列(old_row_starts - ref_indptr[:-1])はn長(行数)であり、この
+    # 引き算の一時配列もn長で軽い。m長で同時に生きるのは src_positions と
+    # arange加算時のみ——これが本設計が守る不変条件であり、読みやすさのために
+    # row_of_pos/within_row のようなm長中間変数を追加で持たせてはならない。
     old_row_starts = orig_indptr[order]
-    src_positions = old_row_starts[row_of_pos] + within_row
+    del orig_indptr, order
+    src_positions = np.repeat(old_row_starts - ref_indptr[:-1], ref_lengths)
+    del old_row_starts, ref_lengths
+    src_positions += np.arange(total_refs, dtype=np.int64)
     flat_targets_raw = flat_refs_raw[src_positions]
+    del src_positions, flat_refs_raw
 
     # 参照解決: searchsorted + clamp + 等値チェックのミスガードパターン
-    # (aggregate.py _build_graph と同型)。
+    # (aggregate.py _build_graph と同型)。np.searchsortedの返り値は0..nの
+    # 範囲を取り、n(範囲外=対応する要素なし)かどうかのbool判定
+    # (in_range、m長だがboolなので1byte/要素と軽い)を先に取ってから、
+    # resolvedをin-place(out=)でclampする(Phase H: resolved/resolved_clamped
+    # の2本持ちを1本+bool化)。clamp後に取るとin_rangeは常にTrueで無意味化
+    # するが、範囲外参照は下の等値チェックが独立に弾くため出力は同一
+    # (モジュールdocstring参照)。この順序は防御の二重化。
     resolved = np.searchsorted(ids, flat_targets_raw)
-    resolved_clamped = np.minimum(resolved, n - 1)
-    valid = (resolved < n) & (ids[resolved_clamped] == flat_targets_raw)
-    ref_targets = np.where(valid, resolved_clamped, -1).astype(np.int64)
+    in_range = resolved < n
+    np.minimum(resolved, n - 1, out=resolved)  # 以後 resolved はclamp済みの値
+    valid = in_range & (ids[resolved] == flat_targets_raw)
+    del flat_targets_raw, in_range
+    ref_targets = np.where(valid, resolved, -1).astype(np.int64)
+    del valid, resolved
 
     in_degree = np.bincount(ref_targets[ref_targets >= 0], minlength=n).astype(np.int64)
 

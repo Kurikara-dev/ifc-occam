@@ -277,6 +277,53 @@ def test_apply_two_step_confirmation_opens_once_and_calls_export(monkeypatch, ca
     assert str(fake_report.output_path) in out  # 結果表示
 
 
+def _run_apply_with_flag_and_capture_kwargs(monkeypatch, tmp_path, **run_kwargs):
+    """delete 1件を確認2まで進め、apply_operations(モック)が受け取った
+    kwargs を返す(geometry_cleanup 貫通テスト用の共通脚本)。"""
+    f = build_wall_with_window_ifc()
+    wall_gid = f.by_type("IfcWall")[0].GlobalId
+    src_path = _write_ifc(f, tmp_path)
+    scan = _fake_scan(
+        stats=[_stats("IFCWALL", 1)],
+        path=str(src_path),
+        elements={"IFCWALL": [wall_gid]},
+    )
+    monkeypatch.setattr(repl, "scan_file", lambda path, **kw: scan)
+
+    captured_kwargs = {}
+    fake_report = ExportReport(
+        deleted=[wall_gid], simplified=[], skipped=[], warnings=[],
+        output_path=str(tmp_path / "src_light.ifc"),
+        stage_seconds={"open": 0.01, "deletes": 0.02, "write": 0.01},
+    )
+
+    def _fake_apply_operations(src, operations, output_path, **kwargs):
+        captured_kwargs.update(kwargs)
+        return fake_report
+
+    monkeypatch.setattr(repl, "apply_operations", _fake_apply_operations)
+    _feed_input(monkeypatch, ["delete IFCWALL", "apply", "y", "", "y", "quit"])
+
+    repl.run(str(src_path), **run_kwargs)
+    return captured_kwargs
+
+
+def test_apply_passes_geometry_cleanup_gc_by_default(monkeypatch, tmp_path):
+    """inline_cleanup 未指定(既定False)なら apply_operations に
+    geometry_cleanup="gc" が明示的に渡ること(carry-forward Phase E)。"""
+    kwargs = _run_apply_with_flag_and_capture_kwargs(monkeypatch, tmp_path)
+    assert kwargs.get("geometry_cleanup") == "gc"
+
+
+def test_apply_passes_geometry_cleanup_inline_when_flag_set(monkeypatch, tmp_path):
+    """inline_cleanup=True なら apply_operations に geometry_cleanup="inline"
+    が渡ること(CLI --inline-cleanup → repl.run → _run_apply の貫通)。"""
+    kwargs = _run_apply_with_flag_and_capture_kwargs(
+        monkeypatch, tmp_path, inline_cleanup=True
+    )
+    assert kwargs.get("geometry_cleanup") == "inline"
+
+
 def test_apply_second_confirmation_declined_does_not_call_export(monkeypatch, capsys, tmp_path):
     f = build_wall_with_window_ifc()
     wall_gid = f.by_type("IfcWall")[0].GlobalId
@@ -534,6 +581,49 @@ def test_apply_text_mode_yes_calls_rewrite_without_and_skips_fullopen(
     # (実端末ならエコーされるが、_feed_inputのスタブはエコーしない)、
     # calls(_feed_inputが記録したinput()の各prompt引数)側で照合する。
     assert any("テキストモードで適用しますか" in c for c in calls)
+    out = capsys.readouterr().out
+    assert "出力ファイル: " in out
+
+
+def test_text_mode_completes_with_inline_cleanup_flag_and_never_calls_apply_operations(
+    monkeypatch, capsys, tmp_path
+):
+    """`--inline-cleanup` を付けてもテキストモード経路(_run_text_apply)には
+    一切干渉しない(裁定2: テキストモードには効果を持たず、apply_operations
+    にも到達しない)ことを固定する。フェーズ最終レビューM-2。"""
+    f = build_wall_with_window_ifc()
+    wall_gid = f.by_type("IfcWall")[0].GlobalId
+    src_path = _write_ifc(f, tmp_path)
+
+    scan = _fake_scan(
+        stats=[_stats("IFCWALL", 1)], path=str(src_path), elements={"IFCWALL": [wall_gid]}
+    )
+    monkeypatch.setattr(repl, "scan_file", lambda path, **kw: scan)
+
+    def _boom_open(*a, **kw):
+        raise AssertionError("テキスト経路でifcopenshell.openが呼ばれた(監督者裁定8違反)")
+
+    monkeypatch.setattr(ifcopenshell, "open", _boom_open)
+
+    def _fake_rewrite_without(src, out, plan, graph, source_name, progress=None):
+        if progress is not None:
+            progress("rewrite", 1, 1)
+        return RewriteReport(
+            records_in=10, records_dropped=3, rels_patched=1, rels_dropped=0, bytes_out=1234
+        )
+
+    monkeypatch.setattr(repl, "rewrite_without", _fake_rewrite_without)
+
+    def _boom_apply_operations(*a, **kw):
+        raise AssertionError(
+            "--inline-cleanup 付きでもテキスト経路でapply_operationsが呼ばれてはならない"
+        )
+
+    monkeypatch.setattr(repl, "apply_operations", _boom_apply_operations)
+
+    _feed_input(monkeypatch, ["delete IFCWALL", "apply", "y", "y", "", "quit"])
+    repl.run(str(src_path), text=True, inline_cleanup=True)
+
     out = capsys.readouterr().out
     assert "出力ファイル: " in out
 

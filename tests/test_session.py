@@ -543,14 +543,61 @@ def test_render_ranking_full_output_matches_fixed_expected_string_for_basic_scan
             "推定フルオープンメモリ: 7000 bytes",
             "",
             "=== クラス別ランキング (推定Face数[展開]降順) ===",
-            "#     クラス名                                     要素数         推定Face数(展開)         推定Face数(共有統合)     パラメトリック件数       寄与率",
-            "1     IFCWALL                                   12                 120                   100             1     42.9%",
-            "2     IFCWALLSTANDARDCASE                        3                  30                    30             0     10.7%",
-            "3     IFCPLATE                                   8                  80                    80             0     28.6%",
-            "4     IFCMEMBER                                  5                  50                    40             2     17.9%",
+            "#     " + "クラス名" + " " * 24 + "  " + " " * 4 + "要素数"
+            + "  " + " " * 2 + "推定Face数(展開)" + "  " + " " * 2 + "推定Face数(共有統合)"
+            + "  " + "パラメトリック件数" + "  " + " " * 2 + "寄与率",
+            "1     " + "IFCWALL" + " " * 25 + "  " + " " * 8 + "12"
+            + "  " + " " * 15 + "120" + "  " + " " * 19 + "100"
+            + "  " + " " * 17 + "1" + "  " + "   42.9" + "%",
+            "2     " + "IFCWALLSTANDARDCASE" + " " * 13 + "  " + " " * 9 + "3"
+            + "  " + " " * 16 + "30" + "  " + " " * 20 + "30"
+            + "  " + " " * 17 + "0" + "  " + "   10.7" + "%",
+            "3     " + "IFCPLATE" + " " * 24 + "  " + " " * 9 + "8"
+            + "  " + " " * 16 + "80" + "  " + " " * 20 + "80"
+            + "  " + " " * 17 + "0" + "  " + "   28.6" + "%",
+            "4     " + "IFCMEMBER" + " " * 23 + "  " + " " * 9 + "5"
+            + "  " + " " * 16 + "50" + "  " + " " * 20 + "40"
+            + "  " + " " * 17 + "2" + "  " + "   17.9" + "%",
         ]
     )
     assert rendered == expected
+
+
+def test_render_ranking_header_aligns_with_data_rows_by_display_width():
+    """ヘッダ行の各見出しセルの右端(表示セル位置)がデータ行の各列の右端と
+    一致することを固定する(CF-A最終レビューM-2: formatのコードポイント幅
+    詰めでは全角見出しが実データ列と最大31セルズレていた)。データ行は
+    ASCII(クラス名・数値)のみなので len == 表示セル幅がそのまま成り立つ。
+    列右端(累積セル、明示2スペース区切り込み): #=4 / クラス名=38 /
+    要素数=50 / 推定Face数(展開)=70 / 推定Face数(共有統合)=94 /
+    パラメトリック件数=114 / 寄与率(%込み)=124。"""
+    session = CuiSession(_basic_scan())
+    lines = session.render_ranking().split("\n")
+    header = next(l for l in lines if "クラス名" in l)
+    first_row = lines[lines.index(header) + 1]
+
+    # データ行はASCIIのみ: 右寄せ最終列(寄与率)の右端が全幅=124セル。
+    assert first_row.isascii()
+    assert len(first_row) == 124
+
+    def end_cell(label: str) -> int:
+        return _display_width(header[: header.index(label) + len(label)])
+
+    # 左寄せのクラス名は開始位置がデータ行のクラス名開始(セル6)と一致する。
+    assert _display_width(header[: header.index("クラス名")]) == 6
+    # 右寄せの数値見出しは右端がデータ列の右端と一致する。
+    assert end_cell("要素数") == 50
+    assert end_cell("推定Face数(展開)") == 70
+    assert end_cell("推定Face数(共有統合)") == 94
+    assert end_cell("パラメトリック件数") == 114
+    assert end_cell("寄与率") == 124
+
+    # 補償型の列幅変異(片方を縮め他方を伸ばすと総幅124が保たれる)を殺すため、
+    # データ行の数値列の右端も個別に固定する: 右端の文字は数字、直後は
+    # 明示2スペース区切り。
+    for end in (50, 70, 94, 114):
+        assert first_row[end - 1].isdigit()
+        assert first_row[end:end + 2] == "  "
 
 
 # --- 9. to_operations ---
