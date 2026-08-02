@@ -18,7 +18,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install
-        run: pip install -e ".[dev]"
+        # editable(-e)は新しいpipだとPEP 660のimport hookになりPyInstallerの
+        # 解析から不可視になる(v0.1.0初回ビルドのsmoke失敗で実測:
+        # ModuleNotFoundError: ifc_occam)。リリースビルドは通常installにする。
+        run: pip install ".[dev]"
       - name: Test
         run: pytest -q
       - name: Build exe
