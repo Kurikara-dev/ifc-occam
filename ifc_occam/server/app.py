@@ -110,8 +110,9 @@ class ExportRequest(BaseModel):
     output_path: str
     consolidate: bool = False
     # 書き出し時のゴミ回収方式(export.apply_operations にそのまま渡す)。
-    # "gc"(既定)=一括GC(fat一時ファイル+約4.8倍メモリ)、"inline"=逐次
-    # (省メモリ。バッチ化済みだが大規模ではGCより遅いことがある)。
+    # "gc"(既定)=一括GC(fat一時ファイル+約1.6倍メモリ)、"inline"=逐次
+    # (省メモリ。要素ごとに即時回収するためGCより遅いことがある。
+    # かつてのバッチ化は残置を生むためPhase Iで撤去済み)。
     geometry_cleanup: Literal["gc", "inline"] = "gc"
 
 

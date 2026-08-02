@@ -601,7 +601,7 @@ def rewrite_without(
 
     with open(out_path, "wb") as out:
         out.write(stamped_header)
-        out.write(b"\n")
+        out.write(b"\r\n")
 
         for record in iter_records(src_path):
             records_in += 1
@@ -611,7 +611,7 @@ def rewrite_without(
                 # 壊れたレコード: idが取れないのでdrop判定できない。
                 # verbatimで出力し、records_inにも数える(裁定6)。
                 out.write(record)
-                out.write(b"\n")
+                out.write(b"\r\n")
             else:
                 rec_id = int(matched[0].group(1))
                 if _is_member(rec_id, plan.drop_ids):
@@ -624,10 +624,10 @@ def rewrite_without(
                         if patched != record:
                             rels_patched += 1
                         out.write(patched)
-                        out.write(b"\n")
+                        out.write(b"\r\n")
                 else:
                     out.write(record)
-                    out.write(b"\n")
+                    out.write(b"\r\n")
 
             if progress is not None:
                 progress("rewrite", records_in, graph.record_count)
@@ -646,8 +646,8 @@ def rewrite_without(
                 "anything in this input (source/plan mismatch?)"
             )
 
-        out.write(b"ENDSEC;\n")
-        out.write(b"END-ISO-10303-21;\n")
+        out.write(b"ENDSEC;\r\n")
+        out.write(b"END-ISO-10303-21;\r\n")
 
     bytes_out = Path(out_path).stat().st_size
 

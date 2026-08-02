@@ -561,32 +561,6 @@ def test_apply_operations_inline_path_still_works(tmp_path):
     assert f2.by_type("IfcFacetedBrep") == []
 
 
-def test_inline_batch_path_cleans_and_does_not_warn(tmp_path, monkeypatch):
-    """inline+バッチ経路(閾値超)でも旧形状が消え、バッチ遅延を残置と誤検知した
-    警告が出ない。閾値は monkeypatch で 0 にして少数要素で発動させる。"""
-    import ifc_occam.core.export as export_mod
-    from ifc_occam.core.export import apply_operations
-    from ifc_occam.core.ops import Operation
-
-    monkeypatch.setattr(export_mod, "_SIMPLIFY_BATCH_THRESHOLD", 0)
-
-    f = build_single_consumer_mapped_child_styled_brep_ifc()
-    element = f.by_type("IfcBuildingElementProxy")[0]
-    body_rep = element.Representation.Representations[0]
-    attach_layer_assignment(f, [body_rep])
-    src = tmp_path / "src.ifc"
-    f.write(str(src))
-    out = tmp_path / "out.ifc"
-    ops = [Operation(op="simplify", targets=[element.GlobalId], scope="element",
-                     params={"method": "bbox"})]
-    report = apply_operations(str(src), ops, str(out), geometry_cleanup="inline")
-
-    assert [w for w in report.warnings if "削除できません" in w] == []
-    f2 = ifcopenshell.open(str(out))
-    assert unreachable_geometry(f2) == {}
-    assert f2.by_type("IfcFacetedBrep") == []
-
-
 def test_gc_path_releases_the_model_before_the_graph_scan(tmp_path, monkeypatch):
     """GC(fatの約4.8倍のメモリ)が始まる前に、フルオープン中のモデル
     (ファイルサイズの約14倍)が解放されていることを weakref で固定する。

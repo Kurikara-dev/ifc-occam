@@ -65,15 +65,6 @@ Stage Aベンチ(docs/plans/2026-07-24-cui-phase1.md Task 7, docs/cui-measuremen
 に対し17〜26%短縮・正当性(verify_no_dangling/GlobalId保存)は全項目パスした
 採用方式。"""
 
-_SIMPLIFY_BATCH_THRESHOLD = 100
-"""inline掃除(geometry_cleanup="inline")で batch_remove_deep2 を使う simplify
-対象数の閾値(これを**超えたら**バッチ)。2026-07-30 プローブ実測: donuts族で
-バッチは 47→13.9秒/要素だが、unbatch がファイル全体のシリアライズ+再パース
-(305MBで約28秒)を伴うため、対象が少ないときは固定費が逆転する。100 は
-暫定値(unbatch固定費 ≈ 数十要素分の節約、に安全率を掛けた判断)。既定経路は
-GC(geometry_cleanup="gc")なのでこの値がユーザー体験を左右することはない。"""
-
-
 @dataclass
 class SkippedItem:
     """スキップされた操作1件(gid + 理由)。"""
@@ -367,6 +358,15 @@ def _shared_map_key(ifc_file, element) -> int | None:
       を太らせない)。ただしこれは直接共有分岐の話で、mapped 分岐は参照製品数を
       数えず常に鍵を返す(マップ経由は書き戻しが常に共有実体へ向かうため。
       Phase G 最終レビューM-2)。
+    - スキーマ違反域(MappedRepresentation=$)への耐性: 本来IFCスキーマ上は
+      IfcRepresentationMap.MappedRepresentation は必須属性だが、破損ファイル
+      ではNoneになり得る。ここは呼び出し元(apply_operations)の要素単位
+      try/except(_apply_simplify)の**外**にあるため、ここでAttributeError
+      を出すとexport全体が中断する(旧実装は要素skipで完走していた=退行。
+      Phase G 最終レビューM-1)。共有実体を特定できない以上、dedupの鍵を
+      作れないという意味で専有相当としてNoneを返す(呼び出し元は
+      shared_key=Noneのとき直接_apply_simplifyに進み、そちら側で
+      改めて例外保護される)。
     """
     rep = getattr(element, "Representation", None)
     if rep is None:
@@ -375,7 +375,10 @@ def _shared_map_key(ifc_file, element) -> int | None:
         if r.RepresentationIdentifier == "Body":
             items = list(r.Items)
             if len(items) == 1 and items[0].is_a("IfcMappedItem"):
-                return items[0].MappingSource.MappedRepresentation.id()
+                mapped_rep = getattr(items[0].MappingSource, "MappedRepresentation", None)
+                if mapped_rep is None:
+                    return None
+                return mapped_rep.id()
             users = ifcopenshell.util.element.get_elements_by_representation(
                 ifc_file, r
             )
@@ -491,9 +494,15 @@ def apply_operations(
 
     geometry_cleanup: "gc"(既定)は旧形状の掃除を書き出し時GCで一括実行する
     (fat一時ファイルを出力の隣に作り、グラフスキャンにfatサイズの約4.8倍の
-    メモリを一時使用する)。"inline"は従来どおり要素ごとに掃除する(GCの
-    一時ファイル/メモリを避けたい場合の退避経路。Task 3 でバッチ化される)。
-    不正な値を渡すと ValueError になる。
+    メモリを一時使用する)。"inline"は要素ごとにその場で掃除する(GCの
+    一時ファイル/メモリを避けたい場合の退避経路。省メモリ最優先の契約であり、
+    掃除の速度自体はGCより遅い——2026-08-02 carry-forward Phase I Task2で、
+    simplify対象数が閾値を超えるとbatch_remove_deep2/unbatch_remove_deep2で
+    包む高速化を撤去した。バッチ中は複数の異なる旧サブツリーが共有する末端
+    ジオメトリを誰の呼び出しからも「外部参照あり」と誤判定し、残置させる
+    構造欠陥があったため(.superpowers/sdd/cfi-probe-report.md A節)。
+    inlineは常に非バッチのper-remove経路のみを使い、gcと出力が完全一致する
+    ことを正しさとして取る)。不正な値を渡すと ValueError になる。
 
     手順: resolve_effective → delete群のclosure展開→削除→simplify群を
     replace_representation で適用 → (consolidate=Trueなら)重複形状の共有化 → write。
@@ -566,88 +575,87 @@ def apply_operations(
     simplify_total = sum(1 for op in effective.values() if op.op == "simplify")
     simplify_done = 0
 
-    use_batch = doomed_root_ids is None and simplify_total > _SIMPLIFY_BATCH_THRESHOLD
-    if use_batch:
-        ifcopenshell.util.element.batch_remove_deep2(ifc_file)
-    try:
-        for gid, op in effective.items():
-            if op.op != "simplify":
-                continue
-            simplify_done += 1
-            if progress is not None:
-                progress("simplify", simplify_done, simplify_total)
-            if gid in deleted_set:
-                skipped.append(
-                    SkippedItem(
-                        global_id=gid,
-                        reason="削除連鎖により対象が既に削除されたためスキップ",
+    # carry-forward Phase I Task2: 対象数がどれだけ多くても常に非バッチの
+    # per-remove経路(remove_deep2 が即時に物理削除する)のみを使う。旧実装は
+    # 閾値超でbatch_remove_deep2/unbatch_remove_deep2に切り替えていたが、
+    # バッチ中は複数の異なる旧サブツリーが共有する末端ジオメトリを、どの
+    # 呼び出しからも「外部参照あり」と誤判定して誰の to_delete にも積まず
+    # 残置させる構造欠陥があった(.superpowers/sdd/cfi-probe-report.md A節。
+    # 非バッチ経路ではDATA行集合がgcとビット完全一致することを実測済み)。
+    # inlineの契約は省メモリ最優先(掃除の速度退行は受容)であり正しさを取る。
+    for gid, op in effective.items():
+        if op.op != "simplify":
+            continue
+        simplify_done += 1
+        if progress is not None:
+            progress("simplify", simplify_done, simplify_total)
+        if gid in deleted_set:
+            skipped.append(
+                SkippedItem(
+                    global_id=gid,
+                    reason="削除連鎖により対象が既に削除されたためスキップ",
+                )
+            )
+            continue
+
+        try:
+            element = ifc_file.by_guid(gid)
+        except RuntimeError:
+            skipped.append(
+                SkippedItem(global_id=gid, reason=f"要素が見つかりません(GlobalId={gid})")
+            )
+            continue
+
+        cur_method = op.params.get("method")
+        cur_ratio = op.params.get("ratio")
+
+        shared_key = None
+        if op.scope == "shared":
+            shared_key = _shared_map_key(ifc_file, element)
+            if shared_key is not None and shared_key in processed_shared_maps:
+                # 既にこのexport実行内で同じ共有マップへ「実際の書き換え」が
+                # 成功済み(フォールバックではない)。in-place編集の複合(二重
+                # 適用)を避けるため再処理しないが、この要素の幾何は共有マップ
+                # 経由で変化済みなので simplified には含める(従来どおり)。
+                #
+                # 対象を横断した"勝者"のルールは、effective(gid→Operation) を
+                # 反復する順序(Pythonのdict挿入順=最初にそのgidへ有効操作が
+                # 確定した順)で、最初にそのマップへ到達した操作のパラメータ
+                # (method/ratio)が実際に書き込まれ、後続の操作は(このgidに
+                # 対しては)何もせず simplified に積まれるだけになる。つまり
+                # 「同じ共有マップに対する複数のsimplify操作」は後続が上書き
+                # されるのではなく、先行が勝ってそれ以降は無視される(list全体
+                # のlast-wins原則である resolve_effective とは別次元の勝者
+                # 決定)。挙動そのもの(先勝ち)は変更しないが、異なる
+                # (method, ratio) で到達した場合は無視されたことを警告で
+                # 可視化する(フェーズ最終レビューI-1)。
+                prev_method, prev_ratio = processed_shared_maps[shared_key]
+                if (cur_method, cur_ratio) != (prev_method, prev_ratio):
+                    warnings.append(
+                        f"共有形状は先行の {_method_desc(prev_method, prev_ratio)} "
+                        "で処理済みのため、"
+                        f"この要素(GlobalId={gid})への "
+                        f"{_method_desc(cur_method, cur_ratio)} は適用されません"
+                        "(共有波及の先勝ち)。"
                     )
-                )
-                continue
-
-            try:
-                element = ifc_file.by_guid(gid)
-            except RuntimeError:
-                skipped.append(
-                    SkippedItem(global_id=gid, reason=f"要素が見つかりません(GlobalId={gid})")
-                )
-                continue
-
-            cur_method = op.params.get("method")
-            cur_ratio = op.params.get("ratio")
-
-            shared_key = None
-            if op.scope == "shared":
-                shared_key = _shared_map_key(ifc_file, element)
-                if shared_key is not None and shared_key in processed_shared_maps:
-                    # 既にこのexport実行内で同じ共有マップへ「実際の書き換え」が
-                    # 成功済み(フォールバックではない)。in-place編集の複合(二重
-                    # 適用)を避けるため再処理しないが、この要素の幾何は共有マップ
-                    # 経由で変化済みなので simplified には含める(従来どおり)。
-                    #
-                    # 対象を横断した"勝者"のルールは、effective(gid→Operation) を
-                    # 反復する順序(Pythonのdict挿入順=最初にそのgidへ有効操作が
-                    # 確定した順)で、最初にそのマップへ到達した操作のパラメータ
-                    # (method/ratio)が実際に書き込まれ、後続の操作は(このgidに
-                    # 対しては)何もせず simplified に積まれるだけになる。つまり
-                    # 「同じ共有マップに対する複数のsimplify操作」は後続が上書き
-                    # されるのではなく、先行が勝ってそれ以降は無視される(list全体
-                    # のlast-wins原則である resolve_effective とは別次元の勝者
-                    # 決定)。挙動そのもの(先勝ち)は変更しないが、異なる
-                    # (method, ratio) で到達した場合は無視されたことを警告で
-                    # 可視化する(フェーズ最終レビューI-1)。
-                    prev_method, prev_ratio = processed_shared_maps[shared_key]
-                    if (cur_method, cur_ratio) != (prev_method, prev_ratio):
-                        warnings.append(
-                            f"共有形状は先行の {_method_desc(prev_method, prev_ratio)} "
-                            "で処理済みのため、"
-                            f"この要素(GlobalId={gid})への "
-                            f"{_method_desc(cur_method, cur_ratio)} は適用されません"
-                            "(共有波及の先勝ち)。"
-                        )
-                    simplified.append(gid)
-                    continue
-
-            success, skip_reason, op_warnings = _apply_simplify(ifc_file, element, op, doomed_root_ids)
-            warnings.extend(op_warnings)
-            if not success:
-                skipped.append(SkippedItem(global_id=gid, reason=skip_reason))
-                warnings.append(f"簡略化をスキップしました(GlobalId={gid}): {skip_reason}")
-            else:
                 simplified.append(gid)
-                if shared_key is not None and not any(
-                    _SHARED_FALLBACK_MARKER in w for w in op_warnings
-                ):
-                    # 共有マップの in-place 書き換えが実際に成功したときだけ
-                    # 「処理済み」にマークする(フェーズ最終レビューI-2)。
-                    # フォールバック(要素個別化)時は共有マップ自体は無変化のため
-                    # マークせず、同じマップを持つ他の兄弟に適用の機会を残す。
-                    processed_shared_maps[shared_key] = (cur_method, cur_ratio)
-    finally:
-        if use_batch:
-            # unbatch は新しい file オブジェクトを返す(以降のステージは
-            # 差し替え後のオブジェクトを使う。_mass_delete と同じ制約)。
-            ifc_file = ifcopenshell.util.element.unbatch_remove_deep2(ifc_file)
+                continue
+
+        success, skip_reason, op_warnings = _apply_simplify(ifc_file, element, op, doomed_root_ids)
+        warnings.extend(op_warnings)
+        if not success:
+            skipped.append(SkippedItem(global_id=gid, reason=skip_reason))
+            warnings.append(f"簡略化をスキップしました(GlobalId={gid}): {skip_reason}")
+        else:
+            simplified.append(gid)
+            if shared_key is not None and not any(
+                _SHARED_FALLBACK_MARKER in w for w in op_warnings
+            ):
+                # 共有マップの in-place 書き換えが実際に成功したときだけ
+                # 「処理済み」にマークする(フェーズ最終レビューI-2)。
+                # フォールバック(要素個別化)時は共有マップ自体は無変化のため
+                # マークせず、同じマップを持つ他の兄弟に適用の機会を残す。
+                processed_shared_maps[shared_key] = (cur_method, cur_ratio)
     stage_seconds["simplify"] = time.monotonic() - t0
 
     t0 = time.monotonic()

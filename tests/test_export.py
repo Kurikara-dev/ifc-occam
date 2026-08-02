@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import re
 import shutil
 from pathlib import Path
 from unittest.mock import Mock
@@ -664,6 +665,81 @@ def test_apply_operations_dedups_hybrid_direct_and_mapped_share(tmp_path):
     reopened = ifcopenshell.open(out_path)
     assert _n_triangles(reopened.by_guid(gid1)) == 12
     assert _n_triangles(reopened.by_guid(gid2)) == 12
+
+
+# ---------------------------------------------------------------------------
+# Phase G 最終レビューM-1: MappedRepresentation欠落(スキーマ違反)のとき
+# _shared_map_key がAttributeErrorでexport全体を中断させないこと
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_first_representation_map_to_null(path: str) -> None:
+    """`IFCREPRESENTATIONMAP(#x,#y)` の第2引数(MappedRepresentation)を
+    `$` に書き換える(スキーマ違反を再現)。1件目にマッチした行だけを
+    書き換える。"""
+    with open(path, "rb") as fh:
+        text = fh.read().decode("utf-8")
+    new_text, n = re.subn(
+        r"(IFCREPRESENTATIONMAP\(#\d+,)#\d+(\);)", r"\1$\2", text, count=1
+    )
+    assert n == 1, "IFCREPRESENTATIONMAP行が見つからない(フィクスチャ側の変更を確認)"
+    with open(path, "wb") as fh:
+        fh.write(new_text.encode("utf-8"))
+
+
+def test_shared_simplify_on_schema_violating_mapped_representation_does_not_abort_export(
+    tmp_path,
+):
+    """MappedRepresentation=$(スキーマ違反)のIfcRepresentationMapを共有する
+    要素へ scope="shared" simplify をかけても、export全体が中断せず完走する
+    こと(Phase G最終レビューM-1)。
+
+    `_shared_map_key` は mapped分岐で
+    `items[0].MappingSource.MappedRepresentation.id()` を直接呼ぶため、
+    MappedRepresentationが$(None)のスキーマ違反ファイルではNoneに対して
+    `.id()` を呼びAttributeErrorになる。この呼び出しは要素単位の
+    try/except(`_apply_simplify`)の外にあるため、1要素の欠陥がexport
+    全体を落とす(旧実装は要素skipで完走していた=退行)。
+    """
+    f = build_two_elements_sharing_mapped_shape_ifc()
+    elem1, elem2 = f.by_type("IfcBuildingElementProxy")
+    gid1, gid2 = _gid(elem1), _gid(elem2)
+
+    src_path = _write_fixture(f, tmp_path)
+    _corrupt_first_representation_map_to_null(src_path)
+
+    # 破損後もifcopenshell.openで開けること(STEPレベルでは合法。
+    # スキーマの必須属性チェックはopen時に強制されない)を前提として確認する。
+    corrupted = ifcopenshell.open(src_path)
+    mapped_rep = (
+        corrupted.by_guid(gid1)
+        .Representation.Representations[0]
+        .Items[0]
+        .MappingSource.MappedRepresentation
+    )
+    assert mapped_rep is None
+
+    out_path = str(tmp_path / "out.ifc")
+    ops = [
+        Operation(
+            op="simplify",
+            targets=[gid1, gid2],
+            scope="shared",
+            params={"method": "bbox"},
+        )
+    ]
+
+    # 中断しないこと(修正前はAttributeErrorがここで飛ぶ=RED)。
+    report = apply_operations(src_path, ops, out_path)
+
+    # 共有実体を特定できない=専有扱いとして扱われるため、両要素は
+    # スキップされるかそれぞれ個別に処理される。いずれにせよexportは
+    # 完走し、GlobalIdの取りこぼしは無い(スキップ扱いなら理由付きで
+    # skippedに、成功なら重複なくsimplifiedに積まれる)。
+    accounted = set(report.simplified) | {s.global_id for s in report.skipped}
+    assert accounted == {gid1, gid2}
+
+    ifcopenshell.open(out_path)  # 出力自体も壊れていないこと
 
 
 # ---------------------------------------------------------------------------
@@ -1396,3 +1472,154 @@ def test_export_stamps_provenance_header_round_trips_non_ascii_source_name(tmp_p
     reopened = ifcopenshell.open(out_path)
     description = reopened.header.file_description.description
     assert any(d == f"Source: {non_ascii_source_name}" for d in description)
+
+
+# ---------------------------------------------------------------------------
+# carry-forward Phase I Task2: inline掃除のバッチ化撤去(残置の根本解消)。
+# 旧 `_SIMPLIFY_BATCH_THRESHOLD`(=100件)を超える件数のscope="shared"
+# simplifyをバッチ経路(batch_remove_deep2/unbatch_remove_deep2)に通すと、
+# 複数の異なる旧サブツリーが下位で共有する末端ジオメトリ(ここでは
+# IfcCartesianPointList3D)が、どの呼び出しからも「他グループの旧サブツリー
+# からまだ参照されている」と誤判定され、誰の to_delete にも積まれず残置する
+# (.superpowers/sdd/cfi-probe-report.md A節、根本原因・実測。バッチ回避で
+# gcとビット完全一致することを確認済み)。閾値定数は撤去対象のため、旧値+1の
+# 件数をリテラルで固定する。
+# ---------------------------------------------------------------------------
+
+
+def _build_many_shared_leaf_groups_ifc(n: int) -> tuple[ifcopenshell.file, list[str]]:
+    """n個の独立した共有マップグループを持つ合成IFC4を返す((file, gidリスト))。
+
+    各グループは自分専用の IfcRepresentationMap を持つため `_shared_map_key` の
+    鍵が全グループで異なり、dedupされず n 件とも個別に scope="shared" の
+    in-place書き換え対象になる(probeの178件中73件の異なるMappedRepresentation
+    に相当)。ただし全グループの IfcTriangulatedFaceSet は"1つの共通の
+    IfcCartesianPointList3D"を末端として共有する(probeの
+    IfcCartesianPoint/IfcDirection/IfcAxis2Placement3D共有の最小再現)。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    shared_coord_list = f.create_entity(
+        "IfcCartesianPointList3D",
+        CoordList=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 1.0)],
+    )
+
+    gids: list[str] = []
+    for i in range(n):
+        tfs = f.create_entity(
+            "IfcTriangulatedFaceSet",
+            Coordinates=shared_coord_list,
+            CoordIndex=[(1, 2, 3)],
+        )
+        mapped_representation = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body_ctx,
+            RepresentationIdentifier="Body",
+            RepresentationType="Tessellation",
+            Items=[tfs],
+        )
+        identity = f.create_entity(
+            "IfcAxis2Placement3D",
+            Location=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+        )
+        rep_map = f.create_entity(
+            "IfcRepresentationMap",
+            MappingOrigin=identity,
+            MappedRepresentation=mapped_representation,
+        )
+        element = ifcopenshell.api.run(
+            "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name=f"E{i}"
+        )
+        mapped_item = f.create_entity(
+            "IfcMappedItem",
+            MappingSource=rep_map,
+            MappingTarget=f.create_entity(
+                "IfcCartesianTransformationOperator3D",
+                Axis1=None,
+                Axis2=None,
+                LocalOrigin=f.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0, 0.0)),
+                Scale=None,
+                Axis3=None,
+            ),
+        )
+        body_rep = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body_ctx,
+            RepresentationIdentifier="Body",
+            RepresentationType="MappedRepresentation",
+            Items=[mapped_item],
+        )
+        element.Representation = f.create_entity(
+            "IfcProductDefinitionShape", Representations=[body_rep]
+        )
+        ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+        gids.append(element.GlobalId)
+
+    return f, gids
+
+
+def test_inline_shared_simplify_over_batch_threshold_matches_gc_data_lines(tmp_path):
+    """旧閾値(100件)を超えるscope="shared" simplifyをgeometry_cleanup="inline"/
+    "gc"それぞれで実行すると、出力のDATAレコード集合が完全一致する(バッチ化
+    撤去前は、inline側だけ共有末端(IfcCartesianPointList3D)が残置してRED)。"""
+    from ifc_occam.scan.reader import iter_records
+
+    n = 101  # 旧 _SIMPLIFY_BATCH_THRESHOLD(=100)超を保証する件数(リテラル固定)
+    f, gids = _build_many_shared_leaf_groups_ifc(n)
+    src_path = _write_fixture(f, tmp_path)
+
+    ops = [Operation(op="simplify", targets=gids, scope="shared", params={"method": "bbox"})]
+
+    out_gc = str(tmp_path / "out_gc.ifc")
+    out_inline = str(tmp_path / "out_inline.ifc")
+    report_gc = apply_operations(src_path, ops, out_gc, geometry_cleanup="gc")
+    report_inline = apply_operations(src_path, ops, out_inline, geometry_cleanup="inline")
+
+    assert set(report_gc.simplified) == set(gids)
+    assert set(report_inline.simplified) == set(gids)
+
+    gc_records = set(iter_records(out_gc))
+    inline_records = set(iter_records(out_inline))
+    assert inline_records == gc_records
+
+
+def test_inline_shared_simplify_over_batch_threshold_matches_gc_byte_for_byte(tmp_path):
+    """Phase I Task2(inlineバッチ化撤去)+Task3(rewrite.pyのCRLF統一)が
+    両方入ると、同一入力・同一simplify操作なら geometry_cleanup="gc" と
+    "inline" の出力ファイルはsha256完全一致になる(刻印は
+    build_provenance_lines が日付単位でしか変わらないため、同日実行なら
+    同一になる)。Task3未実装(rewrite.pyがDATA本体をLFで書く)の間は、
+    gc経路(rewrite_without経由)だけ改行がLFになり、inline経路(常時
+    ifcopenshell.file.write=CRLF)と食い違うためRED。"""
+    import hashlib
+
+    from ifc_occam.scan.reader import iter_records
+
+    n = 101  # 旧 _SIMPLIFY_BATCH_THRESHOLD(=100)超を保証する件数(リテラル固定)
+    f, gids = _build_many_shared_leaf_groups_ifc(n)
+    src_path = _write_fixture(f, tmp_path)
+
+    ops = [Operation(op="simplify", targets=gids, scope="shared", params={"method": "bbox"})]
+
+    out_gc = str(tmp_path / "out_gc2.ifc")
+    out_inline = str(tmp_path / "out_inline2.ifc")
+    apply_operations(src_path, ops, out_gc, geometry_cleanup="gc")
+    apply_operations(src_path, ops, out_inline, geometry_cleanup="inline")
+
+    # 前提(Task2成果): レコード集合そのものは既に一致しているはず。
+    assert set(iter_records(out_gc)) == set(iter_records(out_inline))
+
+    gc_hash = hashlib.sha256(Path(out_gc).read_bytes()).hexdigest()
+    inline_hash = hashlib.sha256(Path(out_inline).read_bytes()).hexdigest()
+    assert gc_hash == inline_hash

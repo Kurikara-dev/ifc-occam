@@ -727,6 +727,31 @@ def test_bytes_out_matches_actual_output_file_size(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Phase I Task3: rewrite_without 自身が書く区切り(DATA本体の各レコード後と
+# 末尾の ENDSEC;/END-ISO-10303-21;)をCRLF統一する。ヘッダは入力のverbatim
+# コピーであり本修正の対象外——このフィクスチャは ifcopenshell.file.write()
+# 産(ヘッダCRLF)なので結果として全行CRLFになるが、LF改行の入力を食わせれば
+# ヘッダLF+DATA CRLFの混在になる(テキストモードのみ・実害なし。Phase I
+# 最終レビューM-2の判定)。統一前はDATA側だけLFで、裸のLF(`\r\n`の一部で
+# ないもの)が残っていた。
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_without_output_is_fully_crlf_with_no_lone_lf(tmp_path):
+    f, src_path = _build_wall_window_fixture(tmp_path)
+    out_path = tmp_path / "out.ifc"
+    graph = scan_full_graph(src_path)
+    plan = _make_plan(drop_ids=[], patch_rel_ids=[])
+
+    rewrite_without(src_path, out_path, plan, graph, source_name="x.ifc")
+
+    out_bytes = out_path.read_bytes()
+    assert out_bytes.count(b"\n") > 0
+    # 全ての LF が直前の CR を伴う(= 裸の LF が1つも無い)ことの確認。
+    assert out_bytes.count(b"\n") == out_bytes.count(b"\r\n")
+
+
+# ---------------------------------------------------------------------------
 # 監督者による ⚠️ の引き取り(Task 4 再レビュー): BMP/非BMP の閾値そのもの
 # (U+FFFF と U+10000)と空の source_name は、実装者もレビュアも実測して
 # いなかった(分岐の `>= 0x10000` はコード読解のみで正しいと判断されていた)。

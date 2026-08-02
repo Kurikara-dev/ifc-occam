@@ -567,6 +567,12 @@ def _cleanup_items(ifc_file, old_items) -> list[str]:
     削除後に開始要素の生死を確認し、生き残っていたら参照元の型を添えて警告
     する。この警告は正常系では出ない(出たら「何かがまだ旧形状を掴んでいる」
     の合図であり、新たな同類バグの検出線になる)。
+
+    carry-forward Phase I Task2: 以前はここで `ifc_file.to_delete is not None`
+    (batch_remove_deep2 中)なら残置チェックをスキップしていたが、inline経路の
+    バッチ化を撤去したため呼び出し元(export.py)が `ifc_file.to_delete` を
+    設定することはなくなった(常に非バッチのper-remove経路)。よって当該分岐は
+    到達不能になったため削除した(.superpowers/sdd/cfi-probe-report.md A節)。
     """
     warnings: list[str] = []
     for item in old_items:
@@ -576,11 +582,6 @@ def _cleanup_items(ifc_file, old_items) -> list[str]:
             ifcopenshell.util.element.remove_deep2(ifc_file, item)
         except Exception as exc:  # noqa: BLE001 - 掃除の失敗は警告に留め、書き戻し自体は成功させる
             warnings.append(f"旧形状アイテムの掃除に失敗: {exc}")
-            continue
-        if getattr(ifc_file, "to_delete", None) is not None:
-            # batch_remove_deep2 中は削除が遅延されるため、この時点で生きて
-            # いるのは正常(unbatch でまとめて消える)。残置チェックは誤検知
-            # になるのでスキップする。
             continue
         try:
             survivor = ifc_file.by_id(item_id)

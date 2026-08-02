@@ -119,7 +119,8 @@ def main(argv: list[str] | None = None) -> None:
     cui_parser.add_argument(
         "--inline-cleanup", action="store_true",
         help="省メモリ方式で書き出す(逐次ゴミ回収)。既定の書き出し時一括ゴミ回収(GC)が"
-             "使う大きな一時メモリを避ける。 テキストモードでは効果なし",
+             "使う大きな一時メモリを避ける(掃除はGCより遅いことがある)。 "
+             "テキストモードでは効果なし",
     )
 
     args = parser.parse_args(argv)

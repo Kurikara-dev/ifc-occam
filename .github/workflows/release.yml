@@ -1,0 +1,35 @@
+# Release: v* タグのpushでWindows用exe(PyInstaller onedir)をビルドし、
+# GitHub Releaseに添付する。スモーク(--help)が通らなければ添付しない。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Test
+        run: pytest -q
+      - name: Build exe
+        run: pyinstaller packaging/build.spec --noconfirm
+      - name: Smoke test
+        run: dist/ifc_occam/ifc_occam.exe --help
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/ifc_occam -DestinationPath "ifc-occam-windows-${{ github.ref_name }}.zip"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ifc-occam-windows-*.zip
+          generate_release_notes: true

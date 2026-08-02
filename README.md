@@ -2,6 +2,8 @@
 
 **English** | [日本語](README.ja.md)
 
+[![CI](https://github.com/Kurikara-dev/ifc-occam/actions/workflows/ci.yml/badge.svg)](https://github.com/Kurikara-dev/ifc-occam/actions/workflows/ci.yml)
+
 A workbench for cutting oversized IFC (ISO 16739) models down to a size that ordinary BIM tools can actually open. You decide what goes — **by IFC class, not element by element** — and the tool writes a smaller derivative file. Your original file is never modified.
 
 ![A torus decimated in stages; the silhouette survives](docs/images/decimate-steps.png)
@@ -49,7 +51,7 @@ Add `".[dev]"` instead of `.` if you also want the test dependencies, then run `
 
 If installation fails, it is almost always `ifcopenshell`: it ships platform- and Python-version-specific wheels, so a mismatch there is the usual cause. This project is developed against ifcopenshell 0.8.5.
 
-On Windows you can skip the command line entirely once the virtual environment exists: **double-click `start.bat`** to launch the GUI. (`start-exe.bat` runs a PyInstaller build from `dist/` if you have made one; there are no prebuilt binaries in releases yet.)
+On Windows you can skip the command line entirely once the virtual environment exists: **double-click `start.bat`** to launch the GUI. (`start-exe.bat` runs a PyInstaller build from `dist/` — either one you built yourself or a Windows binary from [Releases](https://github.com/Kurikara-dev/ifc-occam/releases), unpacked so that `dist\ifc_occam\ifc_occam.exe` exists.)
 
 ## Which mode do I want?
 
@@ -102,7 +104,7 @@ Simplification commands propagate across shared geometry by default — reducing
 
 `--scan-only` prints the ranking and exits, which is the fast way to size up a model you have never seen.
 
-`--inline-cleanup` writes the output in a low-memory mode: instead of the default one-shot garbage collection at write time, which temporarily needs several times the model's size in RAM, old geometry is reclaimed piece by piece as each shape is simplified. It is the same switch as the GUI's 省メモリ checkbox. It keeps the same elements, geometry and GlobalIds, though it does not reclaim quite as thoroughly as the one-shot GC — with many simplifications the output can end up a few percent larger — and it has no effect in text mode, which never opens the model in the first place.
+`--inline-cleanup` writes the output in a low-memory mode: instead of the default one-shot garbage collection at write time, which temporarily needs several times the model's size in RAM, old geometry is reclaimed piece by piece as each shape is simplified. It is the same switch as the GUI's 省メモリ checkbox. It keeps the same elements, geometry and GlobalIds, and for the same input and the same operations its output matches the one-shot GC's byte for byte, as long as shape consolidation is off (its default) — consolidation picks shared-shape representatives in a non-deterministic order, so with it on the two outputs are equivalent but not byte-identical. An earlier release could leave a few percent of stale geometry behind in this mode, which is why older notes mention a size difference, but that gap is closed; the piece-by-piece reclamation can make the cleanup stage slower than the one-shot GC. It has no effect in text mode, which never opens the model in the first place.
 
 ### Text mode: for models you cannot open
 
@@ -132,7 +134,7 @@ Numbers below are measured, not estimated.
 - **Text mode can leave a small residue.** Two structural approximations remain — cycles among dead records are not reclaimed, and relationship records queued for patching are counted as alive — so the record count is not guaranteed to match the full-open path. In practice, after the annotation-pinning and residue-reclamation fixes, a re-measurement on a 380,000-record model produced the same record count on both paths: a 0-record difference (it was +0.24% before the fixes). An `IfcPresentationLayerWithStyle` assignment is the remaining known case that still pins deleted geometry. Surviving elements and geometry match the full-open path exactly.
 - **Text mode's cascade equivalence is verified on synthetic models, not real ones.** The real model available for testing contains no openings or fillings at all, so the voids-and-fillings and aggregation cascades are pinned by purpose-built fixtures instead. Both agree exactly with the full-open path; neither has met a real building model.
 - **Simplify cleanup runs as a write-time sweep.** Exports that simplified geometry write a temporary `.gc-tmp` "fat" file next to the output — roughly the same size as the *input* model, not the (often much smaller) output — and briefly need roughly **1.6× the fat file's size in RAM** for the reference-graph scan that removes the replaced geometry (the same scan as text mode's; it used to cost ~4.8×). Measured on a 305 MB model (456 elements): the sweep itself took about 2 minutes (119.9 s); a 20-element probe on the same model measured 79.8 s, so the cost depends only weakly on element count. If a run is killed mid-sweep, the `.gc-tmp` file can be left behind next to the output; it is safe to delete.
-- **No release binaries yet**, and no CI.
+- **CI covers the synthetic-fixture suite only.** GitHub Actions runs the test suite on Windows and Linux, but the real-model integration tests skip there — the models they need are not in the repository, so they run only on machines that have the data. Tagged releases (`v*`) build a Windows binary automatically; check [Releases](https://github.com/Kurikara-dev/ifc-occam/releases) for what has actually been published.
 
 ## Disclaimer
 
