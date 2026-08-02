@@ -17,11 +17,10 @@ concurrency:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    # Windowsのみ。ubuntu-latestは初回運用でifcopenshell(manylinux)の幾何経路が
+    # segfaultすることを確認した(2026-08-02、テスト1件失敗+SIGSEGV)。本プロジェクト
+    # の公式サポートはWindowsのみ(README)のため、Linux CIは原因解明までは張らない。
+    runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
