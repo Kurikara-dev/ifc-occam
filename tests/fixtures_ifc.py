@@ -1537,6 +1537,77 @@ def build_two_elements_with_shared_type_ifc():
     return f, type_obj, elements
 
 
+def build_single_element_diagonal_elongated_brep_ifc() -> ifcopenshell.file:
+    """要素1つ、Body表現が IfcFacetedBrep の細長い直方体(長さ10×幅高さ1、
+    8頂点12面)を、XZ平面内で45度回転させたローカル座標で持つ合成IFC4を返す。
+
+    core/simplify.py の obb_mesh の主用途(_rotated_cylinder_verts、Task1)と
+    同じ「斜め45度の細長い形状ならOBBがAABBより明確に締まる」ことを、IFC
+    書き戻し込みでcore/export.pyのmethod="obb"のE2Eテスト用に実証する
+    (Task2)。回転はローカル頂点そのものに適用する(ObjectPlacementを回すと
+    _current_mesh がローカル座標のみを返すため、bbox/obbの計算に反映されない)。
+    """
+    f = ifcopenshell.file(schema="IFC4")
+    ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="P")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    ctx = ifcopenshell.api.run("context.add_context", f, context_type="Model")
+    body_ctx = ifcopenshell.api.run(
+        "context.add_context",
+        f,
+        context_type="Model",
+        context_identifier="Body",
+        target_view="MODEL_VIEW",
+        parent=ctx,
+    )
+
+    # 軸平行の細長い直方体(長さ10・幅高さ1)を組んだ後、XZ平面内で45度回転する
+    # (core/simplify.py _rotated_cylinder_verts と同じ回転軸)。
+    base_coords = np.array(
+        [
+            [-5.0, -0.5, -0.5], [5.0, -0.5, -0.5], [5.0, 0.5, -0.5], [-5.0, 0.5, -0.5],
+            [-5.0, -0.5, 0.5], [5.0, -0.5, 0.5], [5.0, 0.5, 0.5], [-5.0, 0.5, 0.5],
+        ],
+        dtype=np.float64,
+    )
+    c, s = np.cos(np.pi / 4), np.sin(np.pi / 4)
+    rot = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+    coords = base_coords @ rot.T
+
+    points = [
+        f.create_entity("IfcCartesianPoint", Coordinates=tuple(float(v) for v in row))
+        for row in coords
+    ]
+    face_indices = [
+        (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+        (0, 5, 4), (0, 1, 5), (1, 6, 5), (1, 2, 6),
+        (2, 7, 6), (2, 3, 7), (3, 4, 7), (3, 0, 4),
+    ]
+    faces = []
+    for idx in face_indices:
+        loop = f.create_entity("IfcPolyLoop", Polygon=[points[i] for i in idx])
+        bound = f.create_entity("IfcFaceOuterBound", Bound=loop, Orientation=True)
+        faces.append(f.create_entity("IfcFace", Bounds=[bound]))
+    shell = f.create_entity("IfcClosedShell", CfsFaces=faces)
+    brep = f.create_entity("IfcFacetedBrep", Outer=shell)
+
+    body_rep = f.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=body_ctx,
+        RepresentationIdentifier="Body",
+        RepresentationType="Brep",
+        Items=[brep],
+    )
+    element = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingElementProxy", name="E1"
+    )
+    element.Representation = f.create_entity(
+        "IfcProductDefinitionShape", Representations=[body_rep]
+    )
+    ifcopenshell.api.run("geometry.edit_object_placement", f, product=element)
+
+    return f
+
+
 def attach_layer_assignment(f, targets, name: str = "レイヤーA"):
     """targets(IfcRepresentation / IfcRepresentationItem のリスト)を
     AssignedItems に持つ IfcPresentationLayerAssignment を1つ作って返す。

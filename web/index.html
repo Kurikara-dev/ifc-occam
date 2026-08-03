@@ -71,6 +71,7 @@
           <div id="op-simplify-row">
             <select id="op-simplify-method">
               <option value="bbox">bbox</option>
+              <option value="obb">OBB(向き付きbbox)</option>
               <option value="convex_hull">凸包</option>
               <option value="decimate">間引き</option>
             </select>
@@ -88,6 +89,7 @@
           <div id="simplify-desc"></div>
           <div id="simplify-ratio-desc" style="display:none;">0.05〜0.95 の範囲で指定します。</div>
           <div id="simplify-estimate"></div>
+          <div id="simplify-advice" style="display:none;"></div>
           <button id="op-keep-button">残す</button>
         </div>
 

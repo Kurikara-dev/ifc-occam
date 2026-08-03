@@ -14,6 +14,7 @@ from ifc_occam.core.simplify import (
     count_shared_elements,
     decimate_mesh,
     get_shared_element_gids,
+    obb_mesh,
     replace_representation,
 )
 from tests.fixtures_ifc import (
@@ -84,6 +85,111 @@ def test_bbox_mesh_all_12_triangles_wound_outward():
         centroid = (p0 + p1 + p2) / 3.0
         outward = centroid - center
         assert np.dot(normal, outward) > 0, f"三角形 {tri} の法線が内向き"
+
+
+# ---------------------------------------------------------------------------
+# 純粋関数: obb_mesh
+# ---------------------------------------------------------------------------
+
+
+def _rotated_cylinder_verts():
+    """斜め45度に傾けた細長い円柱の頂点群(OBBが効く形状の代表)。"""
+    theta = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    circle = np.stack([np.cos(theta) * 0.1, np.sin(theta) * 0.1], axis=1)
+    verts = []
+    for z in (0.0, 10.0):
+        for x, y in circle:
+            verts.append([x, y, z])
+    v = np.array(verts, dtype=np.float64)
+    # Z軸の周りではなく、XZ面内で45度回転して斜材にする
+    c, s = np.cos(np.pi / 4), np.sin(np.pi / 4)
+    rot = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+    return v @ rot.T
+
+
+def _mesh_volume(verts, faces):
+    """符号付き体積(発散定理)。正=外向き面。"""
+    tri = verts[faces]
+    return float(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
+
+
+def _box_volume_from_verts(verts):
+    ext = verts.max(axis=0) - verts.min(axis=0)
+    return float(np.prod(ext))
+
+
+def test_obb_mesh_斜め円柱で体積がAABBより大幅に縮む():
+    v = _rotated_cylinder_verts()
+    obb_verts, obb_faces = obb_mesh(v)
+    aabb_verts, _ = bbox_mesh(v)
+    assert obb_faces.shape == (12, 3)
+    assert obb_verts.shape == (8, 3)
+    # 長さ10・半径0.1の45度斜材: AABB体積≈10.2、OBB体積≈0.283。1/10未満を要求
+    assert abs(_mesh_volume(obb_verts, obb_faces)) < _box_volume_from_verts(aabb_verts) * 0.1
+
+
+def test_obb_mesh_全頂点が箱の内側に入る():
+    v = _rotated_cylinder_verts()
+    obb_verts, _ = obb_mesh(v)
+    # 箱の8頂点からフレームを復元して包含判定する代わりに、
+    # 「各頂点は8頂点の凸結合の中」を凸包の平面群で判定する
+    from scipy.spatial import ConvexHull as _CH
+    hull = _CH(obb_verts)
+    eps = 1e-9 + np.abs(v).max() * 1e-12
+    for eq in hull.equations:
+        assert (v @ eq[:3] + eq[3] <= eps).all()
+
+
+def test_obb_mesh_面の向きが外向き():
+    v = _rotated_cylinder_verts()
+    obb_verts, obb_faces = obb_mesh(v)
+    assert _mesh_volume(obb_verts, obb_faces) > 0
+
+
+def test_obb_mesh_軸平行入力はAABBと同一():
+    rng = np.random.default_rng(7)
+    v = rng.uniform(0.0, 1.0, size=(50, 3))
+    v = np.concatenate([v, [[0, 0, 0], [1, 1, 1]]])  # 角を確定させる
+    obb_verts, obb_faces = obb_mesh(v)
+    aabb_verts, aabb_faces = bbox_mesh(v)
+    # 一様乱数の雲はどの回転でも締まらないのでAABBフォールバックが選ばれる
+    assert np.array_equal(obb_verts, aabb_verts)
+    assert np.array_equal(obb_faces, aabb_faces)
+
+
+def test_obb_mesh_決定性_同一入力で同一出力():
+    v = _rotated_cylinder_verts()
+    a_verts, a_faces = obb_mesh(v)
+    b_verts, b_faces = obb_mesh(v)
+    assert np.array_equal(a_verts, b_verts)
+    assert np.array_equal(a_faces, b_faces)
+
+
+def test_obb_mesh_体積は常にAABB以下():
+    rng = np.random.default_rng(11)
+    for _ in range(20):
+        n = int(rng.integers(4, 200))
+        v = rng.normal(size=(n, 3)) * rng.uniform(0.1, 5.0, size=3)
+        obb_verts, obb_faces = obb_mesh(v)
+        aabb_verts, _ = bbox_mesh(v)
+        # OBBの実体積はメッシュの符号付き体積で測る(頂点のAABBで測ると
+        # 回転した箱を過大評価して常に成立する無意味な検査になる)
+        assert abs(_mesh_volume(obb_verts, obb_faces)) <= (
+            _box_volume_from_verts(aabb_verts) * (1.0 + 1e-9))
+
+
+def test_obb_mesh_退化入力はAABBフォールバックで例外なし():
+    cases = [
+        np.array([[0.0, 0.0, 0.0]]),                              # 1点
+        np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),             # 2点(共線)
+        np.array([[float(i), float(i), float(i)] for i in range(10)]),  # 共線10点
+        np.array([[float(i % 3), float(i // 3), 0.0] for i in range(9)]),  # 共面
+    ]
+    for v in cases:
+        obb_verts, obb_faces = obb_mesh(v)
+        aabb_verts, aabb_faces = bbox_mesh(v)
+        assert np.array_equal(obb_faces, aabb_faces)
+        assert obb_verts.shape == (8, 3)
 
 
 # ---------------------------------------------------------------------------

@@ -155,6 +155,11 @@ def test_validate_operations_bbox_and_convex_hull_do_not_require_ratio():
     assert validate_operations(ops, known) == []
 
 
+def test_validate_operations_obbは有効なmethod():
+    op = Operation(op="simplify", targets=["gid1"], params={"method": "obb"})
+    assert validate_operations([op], {"gid1"}) == []
+
+
 def test_validate_operations_accumulates_multiple_warnings():
     known = {"G1"}
     ops = [

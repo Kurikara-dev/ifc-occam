@@ -8,6 +8,8 @@ core/export.py の責務)。
 対話コマンド一覧(ifc_occam_cui_requirements.md §5、cui-design.md §6):
     delete <クラス名>                            クラス全要素を削除対象に
     bbox <クラス名> [element|shared]             クラス全要素をbbox化対象に
+    obb <クラス名> [element|shared]              クラス全要素をOBB軽量化対象に
+                                                  (向き付きbbox)
     hull <クラス名> [element|shared]             クラス全要素を凸包化対象に
     decimate <クラス名> <ratio> [element|shared] クラス全要素を間引き対象に
                                                   (ratio: 0.05-0.95)。bbox/hull/
@@ -37,6 +39,7 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 
+from ifc_occam.core.advisor import advise_simplify
 from ifc_occam.core.ops import Operation
 from ifc_occam.scan.aggregate import ScanResult
 
@@ -56,12 +59,21 @@ _CANDIDATE_LIMIT = 10
 #: Intent.op(simplify系) → core.ops.Operation の params["method"] 変換表
 #: (cui-design.md §6: "bbox/hull/decimate → simplify(method=..., scope=intent.scope)"、
 #: 既定 "shared"。docs/plans/2026-07-31-cui-shared-scope.md)。
-_SIMPLIFY_METHOD_BY_OP = {"bbox": "bbox", "hull": "convex_hull", "decimate": "decimate"}
+_SIMPLIFY_METHOD_BY_OP = {
+    "bbox": "bbox", "hull": "convex_hull", "decimate": "decimate", "obb": "obb",
+}
 
-_SET_OP_LABELS = {"delete": "削除", "bbox": "bbox軽量化", "hull": "凸包化"}
+_SET_OP_LABELS = {"delete": "削除", "bbox": "bbox軽量化", "hull": "凸包化", "obb": "OBB軽量化"}
 
 #: simplify系コマンドの scope 表示ラベル(GUIの操作リストと同じ語彙)。
 _SCOPE_LABELS = {"shared": "共有波及", "element": "個別"}
+
+#: Intent.op(simplify系) → core.advisor.advise_simplify の method 変換表
+#: (delete/keepは対象外 = 判定文を出さない、task-4-brief.md Step4)。
+_ADVISOR_METHOD_BY_OP = {"bbox": "bbox", "hull": "convex_hull", "obb": "obb", "decimate": "decimate"}
+
+#: CUIの注意行の接頭辞(task-4-brief.md Step4)。
+_ADVICE_PREFIX = "注意: "
 
 
 def _display_width(text: str) -> int:
@@ -98,7 +110,7 @@ class Intent:
     delete/keep では無視される。
     """
 
-    op: str  # "delete" | "bbox" | "hull" | "decimate" | "keep"
+    op: str  # "delete" | "bbox" | "hull" | "decimate" | "obb" | "keep"
     ifc_class: str  # スキャン時の大文字クラス名
     ratio: float | None = None
     scope: str = "shared"
@@ -134,6 +146,8 @@ class CuiSession:
             return self._command_set(args, op="bbox")
         if verb == "hull":
             return self._command_set(args, op="hull")
+        if verb == "obb":
+            return self._command_set(args, op="obb")
         if verb == "decimate":
             return self._command_decimate(args)
         if verb == "keep":
@@ -329,6 +343,36 @@ class CuiSession:
         return f"不明なクラスです: {cls} (候補なし)"
 
     # ------------------------------------------------------------------
+    # 内部ヘルパー: 適正判定(advisor.py連携、task-4-brief.md Step4)
+    # ------------------------------------------------------------------
+
+    def _avg_faces_per_element(self, ifc_class: str) -> float | None:
+        """そのクラスの軽量スキャン統計(render_rankingが使っているのと同じ行データ)
+        から 推定Face数[展開] / 要素数 を返す。データが無ければ(クラスがscan.stats
+        に無い、または要素数0で除算不能)None を返す。"""
+        for s in self._scan.stats:
+            if s.ifc_class == ifc_class:
+                if s.element_count == 0:
+                    return None
+                return s.est_faces_expanded / s.element_count
+        return None
+
+    def _append_advice(self, message: str, ifc_class: str, op: str) -> str:
+        """確認メッセージの末尾に、advise_simplifyが返す注意文を「注意: 」接頭辞付きの
+        行として連結する。CUIはサンプル実測(hull_triangle_ratio/obb_volume_ratio)を
+        持たないため、triangle_source=None・avg_triangles_per_shapeのみ渡す
+        (発火し得るのはdecimateの低密度警告のみ)。delete/keepはop対象外
+        (_ADVISOR_METHOD_BY_OPに無い)なので何も付かない。"""
+        method = _ADVISOR_METHOD_BY_OP.get(op)
+        if method is None:
+            return message
+        avg = self._avg_faces_per_element(ifc_class)
+        advice_messages = advise_simplify(method, avg_triangles_per_shape=avg)
+        if not advice_messages:
+            return message
+        return "\n".join([message, *(f"{_ADVICE_PREFIX}{m}" for m in advice_messages)])
+
+    # ------------------------------------------------------------------
     # 内部ヘルパー: 各コマンドの実装
     # ------------------------------------------------------------------
 
@@ -350,12 +394,14 @@ class CuiSession:
             if scope is None:
                 return f"不明な指定です: {args[1]}({usage})"
             self._intents[cls] = Intent(op=op, ifc_class=cls, scope=scope)
-            return (
+            message = (
                 f"{cls} {count}要素を{_SET_OP_LABELS[op]}対象に追加しました"
                 f"({_SCOPE_LABELS[scope]})。"
             )
+            return self._append_advice(message, cls, op)
         self._intents[cls] = Intent(op=op, ifc_class=cls)
-        return f"{cls} {count}要素を{_SET_OP_LABELS[op]}対象に追加しました。"
+        message = f"{cls} {count}要素を{_SET_OP_LABELS[op]}対象に追加しました。"
+        return self._append_advice(message, cls, op)
 
     def _command_decimate(self, args: list[str]) -> str:
         usage = "使い方: decimate <クラス名> <ratio> [element|shared]"
@@ -379,10 +425,11 @@ class CuiSession:
         self._intents[cls] = Intent(op="decimate", ifc_class=cls, ratio=ratio, scope=scope)
         count = self._element_counts[cls]
         percent = ratio * 100
-        return (
+        message = (
             f"{cls} {count}要素を間引き(残{percent:.0f}%)対象に追加しました"
             f"({_SCOPE_LABELS[scope]})。"
         )
+        return self._append_advice(message, cls, "decimate")
 
     def _command_keep(self, args: list[str]) -> str:
         if len(args) != 1:

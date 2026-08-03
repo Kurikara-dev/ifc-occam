@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 _VALID_OPS = {"delete", "simplify", "keep"}
 _VALID_SCOPES = {"element", "shared"}
-_VALID_SIMPLIFY_METHODS = {"bbox", "convex_hull", "decimate"}
+_VALID_SIMPLIFY_METHODS = {"bbox", "convex_hull", "decimate", "obb"}
 
 
 @dataclass

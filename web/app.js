@@ -77,6 +77,7 @@ const opSimplifyButton = document.getElementById("op-simplify-button");
 const simplifyDesc = document.getElementById("simplify-desc");
 const simplifyRatioDesc = document.getElementById("simplify-ratio-desc");
 const simplifyEstimate = document.getElementById("simplify-estimate");
+const simplifyAdvice = document.getElementById("simplify-advice");
 const opKeepButton = document.getElementById("op-keep-button");
 const opsPanelTitle = document.getElementById("ops-panel-title");
 const opsPanelList = document.getElementById("ops-panel-list");
@@ -117,7 +118,7 @@ const listPanels = {
 // プリセット適用モーダルで不正なルールをエラー行として弾くために使う)。
 const VALID_OPS = new Set(["delete", "simplify", "keep"]);
 const VALID_SCOPES = new Set(["element", "shared"]);
-const VALID_SIMPLIFY_METHODS = new Set(["bbox", "convex_hull", "decimate"]);
+const VALID_SIMPLIFY_METHODS = new Set(["bbox", "obb", "convex_hull", "decimate"]);
 
 /**
  * プリセットルールのop辞書(resolve応答のrule.op)が有効か判定する。
@@ -166,6 +167,11 @@ let selectionNoticeTimer = null;
 // onModelReadyで構築し、renderSelectionでは各クラス/レイヤー自身の要素数分だけを見る。
 let classIndex = new Map(); // ifc_class -> Set(global_id)
 let layerIndex = new Map(); // layer -> Set(global_id)
+// クラス別の適正判定文(OBB+適正判定フェーズ Task5)。renderDiagnosticsで
+// diagnostics.class_stats各行のadviceフィールド({method: [文...]})を
+// ifc_class をキーに束ね直す。JS側に判定ルールは複製しない(サーバの
+// advisor.pyが唯一の判定ロジック)。
+let adviceByClass = new Map(); // ifc_class -> {method: [文...]}
 // 操作リストの有効操作(resolve_effective相当)。GUI改修Task8:
 // repaintViewerColorsが選択変更・操作変更のどちらからも常にこの最新値を読み、
 // viewer.repaintColorsで全要素を1パスで塗り直す(差分反映方式は廃止した)。
@@ -619,6 +625,14 @@ function renderDiagnostics(diagnostics) {
   `;
 
   const stats = diagnostics.class_stats || [];
+
+  // 適正判定文をクラス名で束ね直す(OBB+適正判定フェーズ Task5)。
+  // updateSimplifyExplanationがadviceForSelectionへ渡す際の参照元。
+  adviceByClass = new Map();
+  for (const s of stats) {
+    adviceByClass.set(s.ifc_class, s.advice ?? {});
+  }
+
   const rows = stats.map((s) => ({
     key: s.ifc_class,
     cells: {
@@ -1474,6 +1488,7 @@ const SIMPLIFY_METHOD_DESCRIPTIONS = {
     "形の外側を輪ゴムで包んだような形に置き換えます。くぼみは埋まりますが、おおよその姿は残ります。",
   decimate:
     "三角形の数を減らして形を近似します。0.3 なら元の約30%まで減らします。数字が小さいほど軽く、粗くなります。",
+  obb: "形を、部材の向きに沿って回転した直方体1個に置き換えます。bboxと同じ軽さで、斜めの部材でも箱が形に沿います。",
 };
 
 // 凸包は事前に正確な三角形数を出せない(推測値を出さない — 監督者裁定2)。verbatim。
@@ -1496,7 +1511,7 @@ const CONVEX_HULL_ESTIMATE_UNAVAILABLE =
  */
 function estimateSimplified({ method, elementCount, triangles, ratio }) {
   if (!(elementCount > 0)) return null;
-  if (method === "bbox") {
+  if (method === "bbox" || method === "obb") {
     return { before: triangles, after: elementCount * 12 };
   }
   if (method === "decimate") {
@@ -1511,11 +1526,67 @@ function estimateSimplified({ method, elementCount, triangles, ratio }) {
 }
 
 /**
+ * 選択中クラス集合×現在の手法から、適正判定の注意文を集める純粋関数
+ * (OBB+適正判定フェーズ Task5)。DOMには触れない。判定ルール自体は
+ * サーバの advisor.py が唯一の実装で、ここはその結果を選択に合わせて
+ * 束ね直すだけ(JS側にルールを複製しない)。
+ *
+ * selectedClasses に同じクラスが複数回出ても構わない(呼び出し側で
+ * 重複除去済みでなくてよい)。文言の重複除去は「同一文字列が初出した
+ * ときのみ残す」方式: 複数クラスから同じ文が来ても1回にまとめ、順序は
+ * selectedClasses を先頭から見て最初に出現した位置を保つ。
+ * @param {Map<string, Record<string, string[]>>} adviceByClass ifc_class -> {method: [文...]}
+ * @param {string[]} selectedClasses 選択中要素のifc_class(出現順)
+ * @param {string} method
+ * @returns {string[]} 重複除去済みの注意文(出現順)
+ */
+function adviceForSelection(adviceByClass, selectedClasses, method) {
+  const seen = new Set();
+  const result = [];
+  for (const cls of selectedClasses) {
+    const sentences = adviceByClass.get(cls)?.[method];
+    if (!sentences) continue;
+    for (const sentence of sentences) {
+      if (seen.has(sentence)) continue;
+      seen.add(sentence);
+      result.push(sentence);
+    }
+  }
+  return result;
+}
+
+/**
+ * #simplify-advice を選択中要素のクラス集合×現在の手法に合わせて更新する。
+ * 該当する注意文が無ければ(選択0件を含む)非表示にする。1文=1行で表示する。
+ * @param {Set<string>} selected 選択中のglobal_id集合
+ * @param {string} method
+ */
+function renderSimplifyAdvice(selected, method) {
+  const selectedClasses = [];
+  const seenClasses = new Set();
+  for (const gid of selected) {
+    const el = gidToElement.get(gid);
+    if (!el || seenClasses.has(el.ifc_class)) continue;
+    seenClasses.add(el.ifc_class);
+    selectedClasses.push(el.ifc_class);
+  }
+  const sentences = adviceForSelection(adviceByClass, selectedClasses, method);
+  if (sentences.length === 0) {
+    simplifyAdvice.innerHTML = "";
+    simplifyAdvice.style.display = "none";
+    return;
+  }
+  simplifyAdvice.innerHTML = sentences.map((s) => `<div>${escapeHtml(s)}</div>`).join("");
+  simplifyAdvice.style.display = "block";
+}
+
+/**
  * #simplify-desc(手法説明)・#simplify-ratio-desc(ratio欄の説明)・
- * #simplify-estimate(効果の目安)を、現在の選択・手法・ratioに合わせて
- * 更新する。選択・手法・ratioのいずれかが変わったら必ず呼ぶこと
- * (監督者裁定7)。DOMを読み書きする側であり、estimateSimplified自体は
- * 呼ぶだけで計算ロジックは持たない。
+ * #simplify-estimate(効果の目安)・#simplify-advice(適正判定の注意)を、
+ * 現在の選択・手法・ratioに合わせて更新する。選択・手法・ratioのいずれかが
+ * 変わったら必ず呼ぶこと(監督者裁定7)。DOMを読み書きする側であり、
+ * estimateSimplified/adviceForSelection自体は呼ぶだけで計算ロジックは
+ * 持たない。
  */
 function updateSimplifyExplanation() {
   const method = opSimplifyMethod.value;
@@ -1523,6 +1594,8 @@ function updateSimplifyExplanation() {
   simplifyRatioDesc.style.display = method === "decimate" ? "block" : "none";
 
   const selected = selectionModel.selected;
+  renderSimplifyAdvice(selected, method);
+
   if (selected.size === 0) {
     // 監督者裁定3: 選択0件のときは効果の目安を出さない(説明文だけ出す)。
     simplifyEstimate.textContent = "";
@@ -2468,6 +2541,11 @@ function runSelftest() {
     120
   );
   check(
+    "estimateSimplified(obb): 要素数10→120三角形(bboxと同じ確定値)",
+    estimateSimplified({ method: "obb", elementCount: 10, triangles: 5000 })?.after,
+    120,
+  );
+  check(
     "estimateSimplified(decimate): round(5000*0.3)=1500",
     estimateSimplified({ method: "decimate", elementCount: 10, triangles: 5000, ratio: 0.3 })?.after,
     1500
@@ -2483,7 +2561,63 @@ function runSelftest() {
     null
   );
 
-  console.log(`[selftest] estimateSimplified: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
+  console.log(`[selftest] estimateSimplified: 5件の境界ケースを含む合計 ${passed}/${total} passed`);
+
+  // --- adviceForSelection(OBB+適正判定フェーズ Task5・literalアサーション) ---
+  // 文字列配列の順序付き完全一致を確認するローカルヘルパ(passed/totalはcheckと共有)。
+  function checkStrArr(label, actual, expected) {
+    total++;
+    const ok =
+      Array.isArray(actual) &&
+      actual.length === expected.length &&
+      actual.every((s, i) => s === expected[i]);
+    console.assert(ok, `[selftest] ${label}: expected [${expected}], got [${actual}]`);
+    if (ok) passed++;
+  }
+
+  const adviceFixture = new Map([
+    [
+      "IfcBeam",
+      {
+        decimate: ["低密度メッシュのため間引きは効きにくいことがあります。"],
+        obb: [],
+      },
+    ],
+    [
+      "IfcSlab",
+      {
+        decimate: [
+          "低密度メッシュのため間引きは効きにくいことがあります。",
+          "三角形化して書き戻すためファイルサイズは増えることがあります。",
+        ],
+      },
+    ],
+  ]);
+  checkStrArr(
+    "adviceForSelection(2クラスで同一文が重複→初出のみ残し出現順を保つ)",
+    adviceForSelection(adviceFixture, ["IfcSlab", "IfcBeam"], "decimate"),
+    [
+      "低密度メッシュのため間引きは効きにくいことがあります。",
+      "三角形化して書き戻すためファイルサイズは増えることがあります。",
+    ]
+  );
+  checkStrArr(
+    "adviceForSelection(該当methodの文が無いクラスのみ→空配列)",
+    adviceForSelection(adviceFixture, ["IfcBeam"], "obb"),
+    []
+  );
+  checkStrArr(
+    "adviceForSelection(adviceByClassに無いクラス→無視して空配列)",
+    adviceForSelection(adviceFixture, ["IfcUnknown"], "decimate"),
+    []
+  );
+  checkStrArr(
+    "adviceForSelection(選択クラス0件→空配列)",
+    adviceForSelection(adviceFixture, [], "decimate"),
+    []
+  );
+
+  console.log(`[selftest] adviceForSelection: 4件の境界ケースを含む合計 ${passed}/${total} passed`);
 
   // --- isClickNotDrag(GUI改修Task8 brief手順6・監督者裁定の必須アサーション) ---
   // 視点操作(ドラッグ)と選択/背景クリックを区別する閾値: 5px未満かつ400ms未満。

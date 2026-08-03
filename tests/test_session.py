@@ -95,6 +95,14 @@ def test_bbox_known_class_adds_intent():
     assert session.intents() == [Intent(op="bbox", ifc_class="IFCPLATE")]
 
 
+def test_obb_known_class_adds_intent():
+    session = CuiSession(_basic_scan())
+    msg = session.command("obb IFCPLATE")
+    assert "IFCPLATE" in msg
+    assert "8" in msg
+    assert session.intents() == [Intent(op="obb", ifc_class="IFCPLATE")]
+
+
 def test_hull_known_class_adds_intent():
     session = CuiSession(_basic_scan())
     msg = session.command("hull IFCMEMBER")
@@ -382,6 +390,13 @@ def test_render_intents_label_for_bbox_matches_existing_vocabulary():
     assert "bbox軽量化" in rendered
 
 
+def test_render_intents_label_for_obb_matches_existing_vocabulary():
+    session = CuiSession(_basic_scan())
+    session.command("obb IFCPLATE")
+    rendered = session.render_intents()
+    assert "OBB軽量化" in rendered
+
+
 def test_render_intents_label_for_hull_is_japanese():
     session = CuiSession(_basic_scan())
     session.command("hull IFCMEMBER")
@@ -628,6 +643,23 @@ def test_to_operations_bbox_maps_to_simplify_method_bbox():
     ]
 
 
+def test_to_operations_obb_maps_to_simplify_method_obb():
+    """obb も末尾にscopeキーワードを指定しなければ既定"shared"になる
+    (bbox/hull/decimateと同じ配線、Task2)。"""
+    scan = _basic_scan()
+    session = CuiSession(scan)
+    session.command("obb IFCPLATE")
+    ops = session.to_operations()
+    assert ops == [
+        Operation(
+            op="simplify",
+            targets=scan.elements["IFCPLATE"],
+            scope="shared",
+            params={"method": "obb"},
+        )
+    ]
+
+
 def test_to_operations_hull_maps_to_simplify_method_convex_hull():
     """hull も既定"shared"(docs/plans/2026-07-31-cui-shared-scope.md)。"""
     scan = _basic_scan()
@@ -775,10 +807,27 @@ def test_simplify_commands_default_to_shared_scope(session):
     assert ops[0].scope == "shared"
 
 
+def test_obb_command_defaults_to_shared_scope(session):
+    """obbもbbox/hull/decimateと同じく既定で共有波及になる(Task2)。"""
+    msg = session.command("obb IfcWall")
+    assert msg == "IFCWALL 2要素をOBB軽量化対象に追加しました(共有波及)。"
+    ops = session.to_operations()
+    assert ops[0].scope == "shared"
+
+
 def test_element_keyword_opts_out_to_per_element(session):
-    """末尾の element キーワードで従来の個別化に切り替わる。"""
+    """末尾の element キーワードで従来の個別化に切り替わる。
+
+    OBB+適正判定フェーズ Task4: このfixtureのIFCWALLは平均10三角形/形状
+    (avg_triangles_per_shape=20/2=10.0<500)のため、decimateの低密度警告が
+    確認メッセージの末尾に「注意: 」接頭辞付きの行として追記される。
+    """
     msg = session.command("decimate IfcWall 0.3 element")
-    assert msg == "IFCWALL 2要素を間引き(残30%)対象に追加しました(個別)。"
+    assert msg == (
+        "IFCWALL 2要素を間引き(残30%)対象に追加しました(個別)。\n"
+        "注意: 平均10三角形/形状の粗いメッシュのため、"
+        "間引きは指定した率まで削れないことがあります。"
+    )
     ops = session.to_operations()
     assert ops[0].scope == "element"
 
@@ -786,9 +835,14 @@ def test_element_keyword_opts_out_to_per_element(session):
 def test_element_keyword_is_case_insensitive(session):
     """docstringが明記する大文字小文字不問を固定する(フェーズ最終レビューM-4、
     レビュー時は手動確認のみだった)。`decimate <クラス> 0.1 ELEMENT` の
-    ような全大文字のscope指定も受理されること。"""
+    ような全大文字のscope指定も受理されること(付随するdecimate低密度警告は
+    test_element_keyword_opts_out_to_per_elementと同じ理由)。"""
     msg = session.command("decimate IfcWall 0.1 ELEMENT")
-    assert msg == "IFCWALL 2要素を間引き(残10%)対象に追加しました(個別)。"
+    assert msg == (
+        "IFCWALL 2要素を間引き(残10%)対象に追加しました(個別)。\n"
+        "注意: 平均10三角形/形状の粗いメッシュのため、"
+        "間引きは指定した率まで削れないことがあります。"
+    )
     ops = session.to_operations()
     assert ops[0].scope == "element"
 
@@ -822,3 +876,32 @@ def test_delete_and_keep_operations_keep_element_scope(session):
     """delete/keep の Operation.scope は従来どおり "element" のまま(実質未使用)。"""
     session.command("delete IfcWall")
     assert session.to_operations()[0].scope == "element"
+
+
+# --- 適正判定(advisor.py連携)の注意行(OBB+適正判定フェーズ Task4) ---
+
+
+def test_decimate_on_low_density_class_appends_advice_line(session):
+    """平均三角形数/形状が閾値未満のクラスにdecimateすると、確認メッセージの末尾に
+    「注意: 」接頭辞付きの警告行が追記される(IFCWALLはavg=20/2=10.0<500)。"""
+    msg = session.command("decimate IfcWall 0.3")
+    lines = msg.splitlines()
+    assert len(lines) == 2
+    assert lines[1] == (
+        "注意: 平均10三角形/形状の粗いメッシュのため、"
+        "間引きは指定した率まで削れないことがあります。"
+    )
+
+
+def test_bbox_does_not_show_obb_volume_ratio_advice_because_cui_has_no_sample_metrics():
+    """CUIはサーバのようなサンプル実測(obb_volume_ratio)を持たないため、bboxの
+    確認メッセージには「注意: 」行が一切付かない(advise_simplifyへ
+    obb_volume_ratio/hull_triangle_ratioを渡していないため、bbox/hullの規則は
+    常に判定不能=沈黙)。"""
+    scan = _scan(
+        stats=[_stats("IFCPLATE", element_count=3, expanded=3000, unique=3000)],
+        elements={"IFCPLATE": ["P0", "P1", "P2"]},
+    )
+    msg = CuiSession(scan).command("bbox IFCPLATE")
+    assert "\n" not in msg
+    assert "注意:" not in msg

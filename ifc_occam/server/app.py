@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ifc_occam.core.advisor import advise_simplify, sample_class_geometry_metrics
 from ifc_occam.core.cascade import compute_delete_closure
 from ifc_occam.core.diagnose import aggregate_by_class
 from ifc_occam.core.duplicates import find_duplicates
@@ -154,15 +155,22 @@ def _run_load(state: AppState, path: str) -> None:
         groups = find_duplicates(model.shapes)
         t_duplicates = time.monotonic()
 
+        geometry_metrics = sample_class_geometry_metrics(model)
+        t_advisor = time.monotonic()
+
         payload = build_mesh_payload(model)
         t_meshpack = time.monotonic()
 
         message = (
             f"extract {t_extract - t0:.1f}s / diagnose {t_diagnose - t_extract:.1f}s / "
-            f"duplicates {t_duplicates - t_diagnose:.1f}s / meshpack {t_meshpack - t_duplicates:.1f}s"
+            f"duplicates {t_duplicates - t_diagnose:.1f}s / advisor {t_advisor - t_duplicates:.1f}s / "
+            f"meshpack {t_meshpack - t_advisor:.1f}s"
         )
         logger.info("load完了: %s", message)
-        state.set_ready(ifc_file, path, model, stats, groups, warnings, payload, message)
+        state.set_ready(
+            ifc_file, path, model, stats, groups, warnings, payload, message,
+            geometry_metrics=geometry_metrics,
+        )
     except Exception as exc:  # noqa: BLE001 - サーバは生き続ける、原因を message に格納
         state.set_error(str(exc))
 
@@ -224,8 +232,52 @@ def _dataclass_dict_plain_int(obj) -> dict:
     return {k: _plain_int(v) for k, v in dataclasses.asdict(obj).items()}
 
 
-def _class_stats_dict(stats) -> dict:
-    return _dataclass_dict_plain_int(stats)
+_ADVISOR_METHODS: tuple[str, ...] = ("bbox", "convex_hull", "decimate", "obb")
+
+
+def _triangle_source_by_class(model) -> dict[str, str | None]:
+    """ifc_class → advise_simplify用のtriangle_source("tessellation"|"other"|None)。
+
+    そのクラスの要素の representation_types の和集合に "Tessellation" が含まれれば
+    "tessellation"、和集合が空なら None、それ以外は "other"(task-4-brief.md Step3)。
+    """
+    rep_types_by_class: dict[str, set[str]] = {}
+    for elem in model.elements:
+        rep_types_by_class.setdefault(elem.ifc_class, set()).update(elem.representation_types)
+
+    result: dict[str, str | None] = {}
+    for cls, rep_types in rep_types_by_class.items():
+        if not rep_types:
+            result[cls] = None
+        elif "Tessellation" in rep_types:
+            result[cls] = "tessellation"
+        else:
+            result[cls] = "other"
+    return result
+
+
+def _class_stats_dict(
+    stats,
+    triangle_source: str | None,
+    geometry_metrics: dict[str, dict[str, float]],
+) -> dict:
+    d = _dataclass_dict_plain_int(stats)
+    avg_triangles_per_shape = (
+        None if stats.unique_shape_count == 0
+        else stats.total_triangles / stats.unique_shape_count
+    )
+    class_metrics = geometry_metrics.get(stats.ifc_class, {})
+    d["advice"] = {
+        method: advise_simplify(
+            method,
+            avg_triangles_per_shape=avg_triangles_per_shape,
+            triangle_source=triangle_source,
+            hull_triangle_ratio=class_metrics.get("hull_triangle_ratio"),
+            obb_volume_ratio=class_metrics.get("obb_volume_ratio"),
+        )
+        for method in _ADVISOR_METHODS
+    }
+    return d
 
 
 def _layer_stats_dict(stats) -> dict:
@@ -355,15 +407,20 @@ def create_app(presets_path: str | Path | None = None, root: Path | None = None)
             stats = state.stats
             groups = state.groups
             warnings = state.warnings
+            geometry_metrics = state.geometry_metrics or {}
 
         total_triangles = sum(_plain_int(s.total_triangles) for s in stats)
         gids_by_shape = _element_gids_by_shape(model)
         layer_stats = aggregate_by_layer(model)
+        triangle_source_by_class = _triangle_source_by_class(model)
         return {
             "schema": model.schema,
             "element_count": len(model.elements),
             "total_triangles": total_triangles,
-            "class_stats": [_class_stats_dict(s) for s in stats],
+            "class_stats": [
+                _class_stats_dict(s, triangle_source_by_class.get(s.ifc_class), geometry_metrics)
+                for s in stats
+            ],
             "duplicate_groups": [_duplicate_group_dict(g, gids_by_shape) for g in groups],
             "warnings": list(warnings),
             "layers": _unique_sorted_layers(model),

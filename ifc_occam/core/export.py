@@ -45,6 +45,7 @@ from ifc_occam.core.simplify import (
     bbox_mesh,
     convex_hull_mesh,
     decimate_mesh,
+    obb_mesh,
     replace_representation,
 )
 from ifc_occam.textops.gc import GcReport, gc_rewrite
@@ -93,7 +94,9 @@ class ExportReport:
 #: (carry-forward Phase M「操作表記の統一」、CF-A最終レビューM-1: 同一操作の
 #: 表記がCUI操作リスト/この先勝ち警告/GUI操作リストの3系統で並存していた)。
 #: 独自の訳語を増やさないため、ここに無いmethodは日本語化せず素通しする。
-_METHOD_LABELS = {"bbox": "bbox軽量化", "convex_hull": "凸包化", "decimate": "間引き"}
+_METHOD_LABELS = {
+    "bbox": "bbox軽量化", "convex_hull": "凸包化", "decimate": "間引き", "obb": "OBB軽量化",
+}
 
 
 def _method_desc(method: str | None, ratio: float | None) -> str:
@@ -432,6 +435,8 @@ def _apply_simplify(
         elif method == "decimate":
             ratio = op.params.get("ratio")
             new_verts, new_faces = decimate_mesh(verts, faces, ratio)
+        elif method == "obb":
+            new_verts, new_faces = obb_mesh(verts)
         else:
             return False, f"不正な simplify method です: {method!r}", []
 

@@ -90,8 +90,26 @@ def test_diagnostics_after_ready_contains_expected_fields(client):
     assert class_names == {"IfcWall", "IfcDoor"}
     for c in body["class_stats"]:
         for key, val in c.items():
-            if key != "ifc_class":
+            if key not in ("ifc_class", "advice"):
                 assert isinstance(val, int), f"{key} is not plain int: {type(val)}"
+
+    # OBB+適正判定フェーズ Task4: 各クラス行に4手法分のadvice(文字列リスト)キーが付く。
+    for c in body["class_stats"]:
+        assert set(c["advice"].keys()) == {"bbox", "convex_hull", "decimate", "obb"}
+        for messages in c["advice"].values():
+            assert isinstance(messages, list)
+            assert all(isinstance(m, str) for m in messages)
+
+    # _synthetic_model: IfcWall/IfcDoorともshape s1(4三角形)参照、representation_types
+    # は"SweptSolid"(Tessellationではない) -> avg_triangles_per_shape=4.0<500で
+    # decimateの低密度警告、かつtriangle_source="other"で三角形化書き戻し警告の
+    # 両方が発火する(literal番人)。
+    by_class = {c["ifc_class"]: c for c in body["class_stats"]}
+    assert by_class["IfcWall"]["advice"]["decimate"] == [
+        "平均4三角形/形状の粗いメッシュのため、間引きは指定した率まで削れないことがあります。",
+        "三角形化して書き戻すため、三角形数が減ってもファイルサイズは増えることがあります。"
+        "サイズ削減が目的なら OBB/bbox か削除を検討してください。",
+    ]
 
     assert body["duplicate_groups"] == []
 

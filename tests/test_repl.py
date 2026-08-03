@@ -1702,6 +1702,26 @@ def test_confirm2_prints_spillover_disclosure(tmp_path, capsys, monkeypatch):
     assert "IfcBuildingElementProxy: 1" in out
 
 
+def test_確認プレビューにOBB軽量化が出る(monkeypatch, capsys):
+    """確認2プレビューのラベル(Task2)。_SIMPLIFY_PREVIEW_LABELS がobbを
+    OBB軽量化に対応させ、実際の確認2表示にもそのラベルが出ることを固定する。"""
+    assert repl._SIMPLIFY_PREVIEW_LABELS["obb"] == "OBB軽量化"
+
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _preview_and_confirm2
+    from tests.fixtures_ifc import build_two_consumers_mapped_child_styled_brep_ifc
+
+    f = build_two_consumers_mapped_child_styled_brep_ifc()
+    elem1, _elem2 = f.by_type("IfcBuildingElementProxy")
+    ops = [Operation(op="simplify", targets=[elem1.GlobalId], scope="element",
+                     params={"method": "obb"})]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+
+    assert _preview_and_confirm2(f, ops) is True
+    out = capsys.readouterr().out
+    assert "OBB軽量化 1件" in out
+
+
 def test_shared_spillover_counts_extra_excluded_removes_cascade_deleted_sibling(tmp_path):
     """extra_excluded に渡した GlobalId は波及開示から除かれる
     (フェーズ最終レビューM-7、_shared_spillover_counts単体)。"""
@@ -1786,6 +1806,13 @@ def test_help_text_documents_element_shared_scope_and_shared_default():
     element オプトアウトの存在を知る唯一の手段であるこの文言を固定する。"""
     assert "[element|shared]" in repl._HELP_TEXT
     assert "※ 簡略化は既定で共有波及" in repl._HELP_TEXT
+
+
+def test_help_text_documents_obb_command():
+    """helpテキストのbbox行の直後にobbコマンドの日本語ラベル併記行が
+    追加されている(Task2、CF-A最終レビューM-1と同じ表記形式)。"""
+    assert "obb <クラス名> [element|shared]" in repl._HELP_TEXT
+    assert "OBB軽量化(obb)" in repl._HELP_TEXT
 
 
 def test_format_spillover_line_truncates_to_top_five_with_rest_count():

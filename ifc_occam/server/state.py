@@ -34,6 +34,10 @@ class AppState:
     groups: list[DuplicateGroup] | None = None
     warnings: list[str] | None = None
     payload: bytes | None = None
+    geometry_metrics: dict[str, dict[str, float]] | None = None
+    """ifc_class → サンプル実測(hull_triangle_ratio/obb_volume_ratio、advisor.py
+    sample_class_geometry_metrics)。load時に一度だけ計算し、診断応答の毎回の
+    advice付与で再利用する(OBB+適正判定フェーズ Task4)。"""
     operations: list[Operation] = field(default_factory=list)
     export_result: dict | None = None
     _load_started_at: float | None = field(default=None, repr=False)
@@ -58,6 +62,7 @@ class AppState:
         warnings: list[str],
         payload: bytes,
         message: str = "",
+        geometry_metrics: dict[str, dict[str, float]] | None = None,
     ) -> None:
         with self.lock:
             self.state = "ready"
@@ -69,6 +74,7 @@ class AppState:
             self.warnings = warnings
             self.payload = payload
             self.message = message
+            self.geometry_metrics = geometry_metrics if geometry_metrics is not None else {}
             self.operations = []
             self.export_result = None
 

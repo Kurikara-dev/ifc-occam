@@ -12,6 +12,7 @@ import ifcopenshell
 import ifcopenshell.api
 import ifcopenshell.geom
 import ifcopenshell.util.element
+import numpy as np
 import pytest
 
 from ifc_occam import __version__
@@ -23,12 +24,14 @@ from ifc_occam.core.export import (
     verify_no_dangling,
 )
 from ifc_occam.core.ops import Operation
+from ifc_occam.core.simplify import bbox_mesh
 from tests.fixtures_ifc import (
     build_hybrid_direct_and_mapped_share_ifc,
     build_ifc2x3_single_element_ifc,
     build_many_minimal_products_ifc,
     build_many_walls_with_openings_ifc,
     build_n_translated_copies_ifc,
+    build_single_element_diagonal_elongated_brep_ifc,
     build_three_elements_sharing_mapped_shape_ifc,
     build_three_translated_copies_ifc,
     build_two_elements_sharing_mapped_shape_ifc,
@@ -175,6 +178,49 @@ def test_simplify_bbox_on_real_element_reduces_to_12_triangles(tmp_path, small_i
     # 原本は非破壊
     original = ifcopenshell.open(str(small_ifc_path))
     assert original.by_guid(target_gid) is not None
+
+
+def _mesh_volume(verts, faces):
+    """符号付き体積(発散定理)。tests/test_simplify.pyの_mesh_volumeと同じ計算式。"""
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    tri = verts[faces]
+    return float(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
+
+
+def test_simplify_obbは斜め形状で12面かつAABBより小さい箱を書き戻す(tmp_path):
+    f = build_single_element_diagonal_elongated_brep_ifc()
+    element = f.by_type("IfcBuildingElementProxy")[0]
+    target_gid = element.GlobalId
+
+    settings = ifcopenshell.geom.settings()
+    settings.set("weld-vertices", True)
+    shape = ifcopenshell.geom.create_shape(settings, element)
+    orig_verts = np.array(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
+    aabb_verts, _ = bbox_mesh(orig_verts)
+    aabb_volume = float(np.prod(aabb_verts.max(axis=0) - aabb_verts.min(axis=0)))
+
+    src_path = _write_fixture(f, tmp_path)
+    out_path = str(tmp_path / "out.ifc")
+    ops = [Operation(op="simplify", targets=[target_gid], params={"method": "obb"})]
+    report = apply_operations(src_path, ops, out_path)
+
+    assert report.simplified == [target_gid]
+    assert report.deleted == []
+
+    reopened = ifcopenshell.open(out_path)
+    element2 = reopened.by_guid(target_gid)
+    assert _n_triangles(element2) == 12
+
+    shape2 = ifcopenshell.geom.create_shape(settings, element2)
+    obb_verts = np.array(shape2.geometry.verts, dtype=np.float64).reshape(-1, 3)
+    obb_faces = np.array(shape2.geometry.faces, dtype=np.int64).reshape(-1, 3)
+    obb_volume = abs(_mesh_volume(obb_verts, obb_faces))
+
+    # 斜め45度の細長い直方体(長さ10・幅高さ1、真の体積10)ならOBBが選ばれ、
+    # 軸平行のAABB箱(体積約60.5)より明確に小さくなる(export.pyのobb分岐が
+    # bbox_meshへの誤配線に差し替わっていないことのミューテーション番人)。
+    assert obb_volume < aabb_volume * 0.5
 
 
 # ---------------------------------------------------------------------------

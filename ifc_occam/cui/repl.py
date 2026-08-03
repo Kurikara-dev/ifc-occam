@@ -121,7 +121,9 @@ _STAGE_SECONDS_LABELS = {
 
 #: Operation(op="simplify").params["method"] → 確認2プレビュー表示用ラベル。
 #: session.py の _SET_OP_LABELS/_op_label と同じ語彙(bbox軽量化/凸包化/間引き)に揃える。
-_SIMPLIFY_PREVIEW_LABELS = {"bbox": "bbox軽量化", "convex_hull": "凸包化", "decimate": "間引き"}
+_SIMPLIFY_PREVIEW_LABELS = {
+    "bbox": "bbox軽量化", "convex_hull": "凸包化", "decimate": "間引き", "obb": "OBB軽量化",
+}
 
 _INTRO_HINT = "操作を入力してください (h でヘルプ):"
 
@@ -137,6 +139,7 @@ _HELP_TEXT = """\
 === コマンド一覧 ===
   delete <クラス名>             クラス全要素を削除対象に追加する
   bbox <クラス名> [element|shared]     クラス全要素をbbox軽量化(bbox)対象に追加する(既定: 共有波及)
+  obb <クラス名> [element|shared]      クラス全要素をOBB軽量化(obb)対象に追加する(既定: 共有波及。部材の向きに沿って回転した直方体に置き換える(bboxの向き付き版))
   hull <クラス名> [element|shared]     クラス全要素を凸包化(convex_hull)対象に追加する(既定: 共有波及)
   decimate <クラス名> <ratio> [element|shared]   クラス全要素を間引き(decimate)対象に追加する(ratio: 0.05-0.95、既定: 共有波及)
   keep <クラス名>               操作指定を解除し、保持対象として明示する
