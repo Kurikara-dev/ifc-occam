@@ -12,6 +12,8 @@ A workbench for cutting oversized IFC (ISO 16739) models down to a size that ord
 
 > **Two things to know before you read further.** The user interface — both the web UI and the interactive command loop — is **Japanese only**; the code, comments, and design notes are Japanese too. Development and testing happen on Windows. Everything else below still applies, but if neither of those works for you, this probably isn't the tool you want.
 
+**Not a developer?** There is a no-command-line walkthrough — download the zip from [Releases](https://github.com/Kurikara-dev/ifc-occam/releases/latest), double-click, done — in the [Quickstart guide](docs/quickstart.md) (Japanese, like the UI). The README below is aimed at developers.
+
 ## The problem
 
 IFC files from detail-heavy workflows — steel fabrication is the usual culprit — accumulate bolts, welds, small fittings, and plates until one model is hundreds of megabytes or several gigabytes. General-purpose BIM tools stall or fail to open them at all.
@@ -150,7 +152,7 @@ The GUI covers its intended feature set. The CUI covers scanning, class-level op
 
 ## More documentation
 
-[docs/testing-guide.md](docs/testing-guide.md) is a hands-on walkthrough written for non-developers (Japanese). Some docstrings refer to internal design documents that are not part of this distribution; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Two documents target non-developers (both Japanese): [docs/quickstart.md](docs/quickstart.md) starts from the Releases zip with no command line involved, and [docs/testing-guide.md](docs/testing-guide.md) is a hands-on walkthrough of the GUI. Some docstrings refer to internal design documents that are not part of this distribution; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

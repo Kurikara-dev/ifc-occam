@@ -12,6 +12,8 @@
 
 > 先に断っておきます。このツールが出力するのは**参照用の派生ファイル**で、設計や施工の正本にはなりません。消した要素は出力から戻りません。判断は必ず元ファイルで行ってください。詳しくは[免責](#免責)に書きました。
 
+**コマンド操作をせずに使いたい方は [クイックスタート](docs/quickstart.md) へ。** [Releases](https://github.com/Kurikara-dev/ifc-occam/releases/latest) の zip をダウンロードしてダブルクリックするだけの手順を、順を追って説明しています。以下の README は開発者向けです。
+
 ## 何のためのツールか
 
 鉄骨のような細かい部材を持つワークフローから出てくる IFC は、ボルトや溶接や小さな金物が積み上がって、1モデルで数百MBから数GBに達します。この規模になると汎用の BIM ツールは開くのに失敗するか、開いても実用的な速度で動きません。
@@ -52,7 +54,7 @@ pip install -e .
 
 仮想環境ができていれば、あとはコマンドを打たなくても動きます。**`start.bat` をダブルクリック**すれば GUI が起動します (`start-exe.bat` は `dist/` にある PyInstaller ビルドの exe を起動します。自分でビルドしたものでも、[Releases](https://github.com/Kurikara-dev/ifc-occam/releases) の Windows バイナリを `dist\ifc_occam\ifc_occam.exe` の形に展開したものでも動きます)。
 
-非開発者向けの操作手引きは [docs/testing-guide.md](docs/testing-guide.md) にあります。初めて触るならこちらから読む方が早いはずです。
+非開発者向けには2つの文書があります。初めて触るなら、Releases の zip から始める [docs/quickstart.md](docs/quickstart.md) を先に読んでください。画面の細かい操作は [docs/testing-guide.md](docs/testing-guide.md) にあります。
 
 ## どのモードを使うか
 
