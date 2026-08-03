@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from ifc_occam.core.advisor import advise_simplify, sample_class_geometry_metrics
+from ifc_occam.core.advisor import (
+    advise_simplify,
+    metrics_from_shapes,
+    sample_class_geometry_metrics,
+)
 from ifc_occam.core.types import ElementInfo, ModelData, ShapeInfo
 
 # 直方体(8頂点12面)の面配列。ifc_occam.core.simplify._BBOX_LOCAL_FACES と同一トポロジ。
@@ -246,3 +250,23 @@ def test_sample_class_geometry_metrics_picks_lowest_shape_ids_deterministically(
 
     metrics = sample_class_geometry_metrics(model, per_class=1)
     assert metrics["IFCWALL"]["hull_triangle_ratio"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# metrics_from_shapes (sample_class_geometry_metricsから抽出した公開関数、CUI確認2用)
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_from_shapes_thin_diagonal_box_has_low_obb_volume_ratio():
+    """細長い箱を45度傾けたShapeInfo列: OBBは元の向きに沿うため体積がAABBの半分未満に縮む。
+    sample_class_geometry_metrics側のテストと同じ形状をShapeInfoの列として直接渡す。"""
+    verts = _box_verts((0.1, 0.1, 10.0))
+    centered = verts - verts.mean(axis=0)
+    rotated = centered @ _rotation_y(np.pi / 4).T + verts.mean(axis=0)
+
+    metrics = metrics_from_shapes([ShapeInfo("s1", rotated, _BOX_FACES)])
+    assert metrics["obb_volume_ratio"] < 0.5
+
+
+def test_metrics_from_shapes_empty_input_returns_empty_dict():
+    assert metrics_from_shapes([]) == {}

@@ -11,9 +11,9 @@ from __future__ import annotations
 import numpy as np
 
 from ifc_occam.core.simplify import bbox_mesh, convex_hull_mesh, obb_mesh
-from ifc_occam.core.types import ModelData
+from ifc_occam.core.types import ModelData, ShapeInfo
 
-__all__ = ["advise_simplify", "sample_class_geometry_metrics"]
+__all__ = ["advise_simplify", "metrics_from_shapes", "sample_class_geometry_metrics"]
 
 # ---------------------------------------------------------------------------
 # 判定閾値(実測根拠は各定数のdocstringに記載。task-4-brief.md 記載の値)
@@ -82,6 +82,57 @@ def _mesh_volume(verts: np.ndarray, faces: np.ndarray) -> float:
     return float(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
 
 
+def metrics_from_shapes(shapes: list[ShapeInfo]) -> dict[str, float]:
+    """ShapeInfoの列から {"hull_triangle_ratio": x, "obb_volume_ratio": y} を計算する。
+
+    sample_class_geometry_metrics の内側(shape群→メトリクス変換)を公開関数として
+    抽出したもの(CUI確認2でのサンプル実測がModelData/shape_idを持たず、
+    create_shapeで直接得たShapeInfoの列を渡したいため、Task4-CUIで公開化)。
+
+    hull_triangle_ratio = Σ(凸包後tri)/Σ(元tri)(渡された列全体での集計比)。
+    obb_volume_ratio = 平均(OBB実体積/AABB体積)(形状ごとの比の平均)。
+    OBB実体積は obb_mesh の返り値verts/facesから符号付きメッシュ体積(発散定理)の
+    絶対値で測る。AABB体積が0(平面形状)の形状はobb_volume_ratio計算から
+    スキップする(分母ゼロ)。凸包・OBBが例外を出す形状もその計測からスキップし、
+    分母に入れない。測れる指標が1つもなければ空dictを返す(スキップ規則は
+    sample_class_geometry_metrics と同一)。
+    """
+    hull_tri_sum = 0
+    orig_tri_sum = 0
+    obb_ratios: list[float] = []
+
+    for shape in shapes:
+        verts = shape.vertices
+        faces = shape.faces
+
+        try:
+            _hull_verts, hull_faces = convex_hull_mesh(verts)
+        except Exception:  # noqa: BLE001 - 退化形状はサンプルからスキップする
+            pass
+        else:
+            orig_tri_sum += len(faces)
+            hull_tri_sum += len(hull_faces)
+
+        aabb_verts, _aabb_faces = bbox_mesh(verts)
+        aabb_ext = aabb_verts.max(axis=0) - aabb_verts.min(axis=0)
+        aabb_vol = float(np.prod(aabb_ext))
+        if aabb_vol <= 0.0:
+            continue  # 平面形状(AABB体積0)はobb_volume_ratioの計測をスキップ
+        try:
+            obb_verts, obb_faces = obb_mesh(verts)
+        except Exception:  # noqa: BLE001 - 退化形状はサンプルからスキップする
+            continue
+        obb_vol = abs(_mesh_volume(obb_verts, obb_faces))
+        obb_ratios.append(obb_vol / aabb_vol)
+
+    metrics: dict[str, float] = {}
+    if orig_tri_sum > 0:
+        metrics["hull_triangle_ratio"] = hull_tri_sum / orig_tri_sum
+    if obb_ratios:
+        metrics["obb_volume_ratio"] = sum(obb_ratios) / len(obb_ratios)
+    return metrics
+
+
 def sample_class_geometry_metrics(
     model: ModelData, per_class: int = 20
 ) -> dict[str, dict[str, float]]:
@@ -90,13 +141,8 @@ def sample_class_geometry_metrics(
     決定性: クラスごとに要素が参照するshape_idを集めて昇順ソートし、先頭per_class件を
     実測する(挿入順・スレッド到着順に依存しない)。同一形状が同クラス複数要素から
     参照されても1回だけ測る(shape_id集合を使うため自然に重複除去される)。
-
-    hull_triangle_ratio = Σ(凸包後tri)/Σ(元tri)(サンプル全体での集計比)。
-    obb_volume_ratio = 平均(OBB実体積/AABB体積)(サンプル形状ごとの比の平均)。
-    OBB実体積は obb_mesh の返り値verts/facesから符号付きメッシュ体積(発散定理)の
-    絶対値で測る。AABB体積が0(平面形状)のサンプルはobb_volume_ratio計算から
-    スキップする(分母ゼロ)。凸包・OBBが例外を出す形状もその計測からスキップし、
-    分母に入れない。1形状も測れなければそのクラスのメトリクス自体を省く。
+    実際のメトリクス計算は metrics_from_shapes に委譲する(計算ロジックの二重化を
+    避ける)。1形状も測れなければそのクラスのメトリクス自体を省く。
     """
     shape_ids_by_class: dict[str, set[str]] = {}
     for elem in model.elements:
@@ -107,43 +153,9 @@ def sample_class_geometry_metrics(
     result: dict[str, dict[str, float]] = {}
     for ifc_class, shape_id_set in shape_ids_by_class.items():
         sample_ids = sorted(shape_id_set)[:per_class]
+        shapes = [model.shapes[sid] for sid in sample_ids if sid in model.shapes]
 
-        hull_tri_sum = 0
-        orig_tri_sum = 0
-        obb_ratios: list[float] = []
-
-        for shape_id in sample_ids:
-            shape = model.shapes.get(shape_id)
-            if shape is None:
-                continue
-            verts = shape.vertices
-            faces = shape.faces
-
-            try:
-                _hull_verts, hull_faces = convex_hull_mesh(verts)
-            except Exception:  # noqa: BLE001 - 退化形状はサンプルからスキップする
-                pass
-            else:
-                orig_tri_sum += len(faces)
-                hull_tri_sum += len(hull_faces)
-
-            aabb_verts, _aabb_faces = bbox_mesh(verts)
-            aabb_ext = aabb_verts.max(axis=0) - aabb_verts.min(axis=0)
-            aabb_vol = float(np.prod(aabb_ext))
-            if aabb_vol <= 0.0:
-                continue  # 平面形状(AABB体積0)はobb_volume_ratioの計測をスキップ
-            try:
-                obb_verts, obb_faces = obb_mesh(verts)
-            except Exception:  # noqa: BLE001 - 退化形状はサンプルからスキップする
-                continue
-            obb_vol = abs(_mesh_volume(obb_verts, obb_faces))
-            obb_ratios.append(obb_vol / aabb_vol)
-
-        metrics: dict[str, float] = {}
-        if orig_tri_sum > 0:
-            metrics["hull_triangle_ratio"] = hull_tri_sum / orig_tri_sum
-        if obb_ratios:
-            metrics["obb_volume_ratio"] = sum(obb_ratios) / len(obb_ratios)
+        metrics = metrics_from_shapes(shapes)
         if metrics:
             result[ifc_class] = metrics
 

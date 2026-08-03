@@ -1833,3 +1833,75 @@ def test_format_spillover_line_truncates_to_top_five_with_rest_count():
         "共有波及: 操作で指定していない 45要素 の形状も対象になります"
         "(IfcWall: 10, IfcSlab: 9, IfcBeam: 8, IfcColumn: 7, IfcDoor: 6, ...他1クラス)。"
     )
+
+
+# --- 確認2のGUI同等適正判定(サンプル実測フル判定、CUI-advisor Task) ---
+#
+# GUIはロード時の実測でhull_triangle_ratio/obb_volume_ratioも判定できるが、
+# CUIのコマンド応答時点(session.py._append_advice)は軽量スキャンしか無く
+# avg_triangles_per_shapeの規則しか発火しない。確認2はフルオープン済みなので
+# _confirm2_advisories(repl.py)がここで初めてGUI同等の4規則フル判定を出す。
+
+
+def test_confirm2_shows_hull_near_convex_advisory_for_cube_class(monkeypatch, capsys):
+    """立方体形状のクラスにhullを指定すると、サンプル実測(凸包後も12/12=100%残存)
+    による「ほぼ凸の形状です」の注意(advisor.py 規則3、閾値0.6以上で発火)が出る。
+    % 値は実測して固定した(このfixtureは軸平行の単位立方体2つ)。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _preview_and_confirm2
+    from tests.fixtures_ifc import build_two_translated_child_styled_cubes_ifc
+
+    f = build_two_translated_child_styled_cubes_ifc()
+    gids = [e.GlobalId for e in f.by_type("IfcBuildingElementProxy")]
+    ops = [
+        Operation(op="simplify", targets=gids, scope="element", params={"method": "convex_hull"})
+    ]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+
+    assert _preview_and_confirm2(f, ops) is True
+    out = capsys.readouterr().out
+    assert (
+        "注意(IFCBUILDINGELEMENTPROXY / 凸包化): ほぼ凸の形状です"
+        "(サンプル判定: 凸包後も三角形の100%が残ります)。"
+        "凸包の削減効果は小さい見込みです。"
+    ) in out
+
+
+def test_confirm2_shows_obb_recommend_advisory_for_diagonal_class(monkeypatch, capsys):
+    """斜め45度の細長い形状のクラスにbboxを指定すると、サンプル実測(OBB体積が
+    AABBの17%に縮む)による「OBB(向き付きbbox)の方が形に沿います」の注意
+    (advisor.py 規則4、閾値0.5以下で発火)が出る。% 値は実測して固定した。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _preview_and_confirm2
+    from tests.fixtures_ifc import build_single_element_diagonal_elongated_brep_ifc
+
+    f = build_single_element_diagonal_elongated_brep_ifc()
+    gids = [e.GlobalId for e in f.by_type("IfcBuildingElementProxy")]
+    ops = [Operation(op="simplify", targets=gids, scope="element", params={"method": "bbox"})]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+
+    assert _preview_and_confirm2(f, ops) is True
+    out = capsys.readouterr().out
+    assert (
+        "注意(IFCBUILDINGELEMENTPROXY / bbox軽量化): 部材が座標軸に対して斜めです"
+        "(サンプル判定: OBBなら箱の体積が平均17%に縮みます)。"
+        "OBB(向き付きbbox)の方が形に沿います。"
+    ) in out
+
+
+def test_confirm2_no_advisory_line_for_diagonal_class_with_obb(monkeypatch, capsys):
+    """同じ斜め形状のクラスでも method="obb" なら、bbox専用の規則4
+    (advise_simplifyのmethod制限)は発火しない。そのクラスの「注意(」行が
+    確認2に一切出ないことを固定する。"""
+    from ifc_occam.core.ops import Operation
+    from ifc_occam.cui.repl import _preview_and_confirm2
+    from tests.fixtures_ifc import build_single_element_diagonal_elongated_brep_ifc
+
+    f = build_single_element_diagonal_elongated_brep_ifc()
+    gids = [e.GlobalId for e in f.by_type("IfcBuildingElementProxy")]
+    ops = [Operation(op="simplify", targets=gids, scope="element", params={"method": "obb"})]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+
+    assert _preview_and_confirm2(f, ops) is True
+    out = capsys.readouterr().out
+    assert "注意(" not in out

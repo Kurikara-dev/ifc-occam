@@ -62,11 +62,19 @@ from collections.abc import Callable
 from pathlib import Path
 
 import ifcopenshell
+import ifcopenshell.geom
 
+from ifc_occam.core.advisor import advise_simplify, metrics_from_shapes
 from ifc_occam.core.cascade import compute_delete_closure
 # 共有マップの識別はexport.pyのsimplifyループと同じ関数で行う(定義の二重化でズレるより私的importの方がまし)。
 from ifc_occam.core.export import ExportReport, _shared_map_key, apply_operations
-from ifc_occam.core.extract import extract_elements_light
+# _analyze_representation/_shape_from_geometry は extract.py 内部ヘルパだが、
+# 確認2のサンプル実測がその変換ロジックを二重化しないよう再利用する(要件2)。
+from ifc_occam.core.extract import (
+    _analyze_representation,
+    _shape_from_geometry,
+    extract_elements_light,
+)
 from ifc_occam.core.paths import refers_to_same_file
 from ifc_occam.core.simplify import get_shared_element_gids
 from ifc_occam.cui.session import CuiSession, Intent
@@ -124,6 +132,11 @@ _STAGE_SECONDS_LABELS = {
 _SIMPLIFY_PREVIEW_LABELS = {
     "bbox": "bbox軽量化", "convex_hull": "凸包化", "decimate": "間引き", "obb": "OBB軽量化",
 }
+
+#: 確認2の適正判定サンプル実測(_confirm2_advisories)1グループあたりの実測件数上限。
+#: 実測79ms/形状(create_shape)なので20件×グループ数でも数秒に収まる
+#: (Task4-CUI要件2、閾値ガード不要と裁定済み)。
+_ADVISOR_SAMPLE_SIZE = 20
 
 _INTRO_HINT = "操作を入力してください (h でヘルプ):"
 
@@ -635,6 +648,101 @@ def _shared_spillover_counts(
     return spillover
 
 
+def _confirm2_advisories(ifc_file, operations) -> list[str]:
+    """確認2でのGUI同等の適正判定を、実ファイルのサンプル実測で組み立てる。
+
+    背景(要件2、GUI同等化): GUIはロード時に実ファイルをフルオープンしており
+    サンプル実測(hull_triangle_ratio/obb_volume_ratio等)を持てるが、CUIは
+    コマンド応答時点では軽量スキャン(メッシュを持たない)しか使えず
+    advise_simplify の一部の規則(ほぼ凸警告・OBB推奨)が常にNoneで沈黙する。
+    確認2はフルオープン済み(_preview_and_confirm2)なので、ここで初めて
+    実メッシュのサンプル実測が可能になる。
+
+    グループ化: simplify操作の対象GlobalId(実ファイルに存在するものだけ)を
+    (element.is_a().upper(), method) でまとめる。同一グループが複数の
+    Operation(例: scope違い)に分かれていても対象は合流する。
+
+    決定性: 各グループのサンプルはgid昇順で先頭 `_ADVISOR_SAMPLE_SIZE` 件に
+    固定する(挿入順・辞書順のブレを排除)。グループの処理順もキー(クラス名,
+    method)の昇順に固定し、出力行の順序を安定させる。
+
+    メッシュ化に失敗した要素はそのサンプルからスキップする(advisor.py側の
+    退化形状スキップと同じ方針)。triangle_source は
+    extract.py._analyze_representation を再利用して representation_types の
+    和集合から導く(サーバ側 app.py._triangle_source_by_class と同じ意味論)。
+
+    戻り値は「注意(クラス名 / ラベル): 文」の行のリスト。同一行は初出のみ残す。
+    """
+    real_gids = {gid for gid, _cls, _name in extract_elements_light(ifc_file)}
+
+    targets_by_group: dict[tuple[str, str], set[str]] = {}
+    for op in operations:
+        if op.op != "simplify":
+            continue
+        method = op.params.get("method")
+        for gid in op.targets:
+            if gid not in real_gids:
+                continue
+            try:
+                element = ifc_file.by_guid(gid)
+            except RuntimeError:
+                continue
+            key = (element.is_a().upper(), method)
+            targets_by_group.setdefault(key, set()).add(gid)
+
+    if not targets_by_group:
+        return []
+
+    settings = ifcopenshell.geom.settings()
+    settings.set("weld-vertices", True)
+    settings.set("apply-default-materials", False)
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for ifc_class, method in sorted(targets_by_group):
+        sample_gids = sorted(targets_by_group[(ifc_class, method)])[:_ADVISOR_SAMPLE_SIZE]
+
+        shapes = []
+        rep_types: set[str] = set()
+        for gid in sample_gids:
+            element = ifc_file.by_guid(gid)
+            types, _is_mapped, _layer = _analyze_representation(
+                getattr(element, "Representation", None)
+            )
+            rep_types.update(types)
+            try:
+                shape = ifcopenshell.geom.create_shape(settings, element)
+            except Exception:  # noqa: BLE001 - 幾何化できない要素はサンプルからスキップする
+                continue
+            shapes.append(_shape_from_geometry(shape.geometry))
+
+        avg_triangles_per_shape = (
+            None if not shapes else sum(s.triangle_count for s in shapes) / len(shapes)
+        )
+        if not rep_types:
+            triangle_source = None
+        elif "Tessellation" in rep_types:
+            triangle_source = "tessellation"
+        else:
+            triangle_source = "other"
+
+        metrics = metrics_from_shapes(shapes)
+        label = _SIMPLIFY_PREVIEW_LABELS.get(method, str(method))
+        for msg in advise_simplify(
+            method,
+            avg_triangles_per_shape=avg_triangles_per_shape,
+            triangle_source=triangle_source,
+            hull_triangle_ratio=metrics.get("hull_triangle_ratio"),
+            obb_volume_ratio=metrics.get("obb_volume_ratio"),
+        ):
+            line = f"注意({ifc_class} / {label}): {msg}"
+            if line not in seen:
+                seen.add(line)
+                lines.append(line)
+
+    return lines
+
+
 def _preview_and_confirm2(ifc_file, operations) -> bool:
     """フルオープン後の実ファイル突合・削除連鎖プレビュー・確認2(手順2)。
     確認2の答えが y/yes なら True。"""
@@ -689,6 +797,11 @@ def _preview_and_confirm2(ifc_file, operations) -> bool:
     )
     if spillover:
         print(_format_spillover_line(spillover))
+
+    # GUI同等の適正判定(要件2): フルオープン済みのこの時点で初めて実メッシュの
+    # サンプル実測が可能になるため、確認2でだけ4規則フルの注意を出す。
+    for line in _confirm2_advisories(ifc_file, operations):
+        print(line)
 
     return _confirm("実行しますか? (y/N): ")
 
