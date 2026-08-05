@@ -81,6 +81,10 @@ A rough guide to picking a method:
 
 Decimation and convex hull both re-triangulate the geometry on write-out, so file size can go *up* even as the triangle count goes down. When the selected class and method line up with one of these patterns, both the GUI and the CUI surface a note without blocking the operation — it's advisory, based on sampled measurements, and stays silent when it cannot judge.
 
+![One set of shapes under OBB, convex hull, and decimation; each method preserves a different amount of the original form](docs/images/method-comparison.jpg)
+
+*The rule of thumb above, shown on one set of shapes. Rounded forms like spheres and equipment keep their silhouette under decimation; plates and steel sections come out of an OBB as near-identical boxes.*
+
 ![The GUI: class ranking on the left, 3D view on the right](docs/images/gui-overview.png)
 
 *Just after loading. The sidebar ranks classes by triangle count; the 3D view is coloured per class.*
